@@ -70,10 +70,10 @@ create index idx_hosts_status on hosts(status);
 -- tasks: the durable work queue. This is what survives agents disappearing.
 -- Status machine (enforced in API code + check constraint):
 --   queued -> claimed | cancelled
---   claimed -> running | failed | cancelled
---   running -> completed | failed | awaiting_approval | cancelled
+--   claimed -> running | failed | retrying | cancelled
+--   running -> completed | failed | retrying | awaiting_approval | cancelled
 --   awaiting_approval -> queued (approved) | cancelled (rejected)
---   retrying -> queued
+--   retrying -> queued            (sweeper moves it back after a retryable failure)
 --   completed | failed | cancelled are terminal
 -- ----------------------------------------------------------------------------
 create table tasks (
@@ -95,6 +95,9 @@ create table tasks (
     attempts        integer not null default 0,
     max_attempts    integer not null default 3,
     claimed_by      uuid references hosts(id) on delete set null,
+    lease_expires_at timestamptz,                             -- claim lease; the sweeper requeues
+                                                             -- claimed/running tasks past their lease
+    last_progress_at timestamptz,                             -- last claim or progress report
     created_at      timestamptz not null default now(),
     started_at      timestamptz,
     completed_at    timestamptz,
@@ -104,6 +107,8 @@ create index idx_tasks_status_priority on tasks(status, priority desc, created_a
 create index idx_tasks_assigned_to on tasks(assigned_to);
 create index idx_tasks_created_by on tasks(created_by);
 create index idx_tasks_type on tasks(type);
+create index idx_tasks_lease on tasks(lease_expires_at)
+  where status in ('claimed','running');
 
 -- ----------------------------------------------------------------------------
 -- projects: deployable applications owned by agents
@@ -148,12 +153,16 @@ create table deployments (
     project_id     uuid not null references projects(id) on delete cascade,
     host_id        uuid not null references hosts(id) on delete cascade,
     version        text not null,
+    mode           text not null default 'automatic'          -- 'automatic' | 'manual'
+                   check (mode in ('automatic','manual')),
+    artifact_id    uuid references artifacts(id) on delete set null,
     status         text not null default 'requested'
                    check (status in ('requested','approved','building','starting',
                                      'healthcheck','running','failed','rolled_back',
                                      'stopped','stopping')),
     container_ids  jsonb not null default '[]'::jsonb,
-    ports          jsonb not null default '{}'::jsonb,
+    ports          jsonb not null default '{}'::jsonb,        -- written from the deploy task's
+                                                             -- result.ports on completion
     domains        jsonb not null default '[]'::jsonb,
     health_status  text,                                      -- 'healthy' | 'unhealthy' | 'unknown'
     rollback_of    uuid references deployments(id) on delete set null,
@@ -164,6 +173,23 @@ create table deployments (
 create index idx_deployments_host on deployments(host_id);
 create index idx_deployments_project on deployments(project_id);
 create index idx_deployments_status on deployments(status);
+
+-- ----------------------------------------------------------------------------
+-- port_allocations: fixed host ports reserved for deployments.
+-- unique(host_id, port) so two deployments on the same host can never claim
+-- the same port. Allocations are created in the POST /v1/deployments
+-- transaction when a host_port is requested, and released when the
+-- deployment reaches a terminal state (failed | rolled_back | stopped) or
+-- is superseded by a newer deployment of the same project+host.
+-- ----------------------------------------------------------------------------
+create table port_allocations (
+    host_id       uuid not null references hosts(id) on delete cascade,
+    port          integer not null check (port > 0 and port < 65536),
+    deployment_id uuid not null references deployments(id) on delete cascade,
+    allocated_at  timestamptz not null default now(),
+    primary key (host_id, port)
+);
+create index idx_port_allocations_deployment on port_allocations(deployment_id);
 
 -- ----------------------------------------------------------------------------
 -- events: APPEND-ONLY journal. This is the system's memory.
