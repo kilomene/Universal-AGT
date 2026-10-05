@@ -92,6 +92,8 @@ def cmd_deploy(args):
     host_id = None
     if args.host:
         host_id = _resolve_host_id(c, args.host)
+    if args.host_port is not None and host_id is None:
+        raise SystemExit("error: --host-port requires --host — a port can only be reserved on a specific host")
 
     created = c.create_deployment(
         project_id=project_id,
@@ -99,6 +101,7 @@ def cmd_deploy(args):
         host_id=host_id,
         artifact_id=artifact_id,
         mode=args.mode or "automatic",
+        host_port=args.host_port,
     )
     _emit(args, created)
 
@@ -298,12 +301,17 @@ def cmd_projects(args):
     elif args.action == "update":
         if not args.project:
             raise SystemExit("error: projects update requires --project <id>")
-        if not args.configuration:
-            raise SystemExit("error: projects update requires --configuration '{...}'")
+        if args.configuration is None and args.repository is None and args.runtime is None:
+            raise SystemExit("error: projects update requires at least one of "
+                             "--configuration, --repository, --runtime")
         _emit(args, _project_row(c.update_project(
-            args.project, _parse_json_arg(args.configuration, "--configuration"))))
+            args.project,
+            _parse_json_arg(args.configuration, "--configuration") if args.configuration else None,
+            repository=args.repository,
+            runtime=args.runtime,
+        )))
     else:  # list
-        projects = c.list_projects(limit=args.limit)
+        projects = c.list_projects()
         rows = projects.get("projects", []) if isinstance(projects, dict) else projects
         _emit(args, [{"id": p.get("id"), "name": p.get("name"), "runtime": p.get("runtime"),
                       "created": p.get("created_at")} for p in rows])
@@ -375,6 +383,9 @@ def build_parser():
     d.add_argument("--mode", choices=["automatic", "manual"], default="automatic",
                    help="automatic (default) or manual (awaiting approval)")
     d.add_argument("--artifact", default=None, help="local file to upload as the artifact first")
+    d.add_argument("--host-port", type=int, default=None, dest="host_port",
+                   help="fixed host port to reserve for this deployment "
+                        "(requires --host; 409 if already allocated)")
 
     l = sub.add_parser("logs", help="fetch logs for a deployment")
     l.add_argument("--deployment", required=True, help="deployment id")
@@ -426,12 +437,11 @@ def build_parser():
                     help="project action (default: list)")
     pr.add_argument("--name", default=None, help="project name (create)")
     pr.add_argument("--owner", default=None, help="project owner (create)")
-    pr.add_argument("--repository", default=None, help="source repository URL (create)")
-    pr.add_argument("--runtime", default=None, help="runtime label, e.g. docker (create)")
+    pr.add_argument("--repository", default=None, help="source repository URL (create/update)")
+    pr.add_argument("--runtime", default=None, help="runtime label, e.g. docker (create/update)")
     pr.add_argument("--configuration", default=None,
                     help="project configuration as JSON, e.g. '{\"env\": {...}}' (create/update)")
     pr.add_argument("--project", default=None, help="project id (get/update)")
-    pr.add_argument("--limit", type=int, default=None, help="max rows (list)")
 
     dp = sub.add_parser("deployments", help="list deployments")
     dp.add_argument("action", nargs="?", default="list", choices=["list"],
