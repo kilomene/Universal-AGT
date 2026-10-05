@@ -290,6 +290,38 @@ def verify_host_port_free(docker, host_port: int, log=None) -> None:
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Minimum secret-value length the log scrubbers redact. Shorter values are
+# skipped: redacting 1-3 char strings would mangle ordinary log text with
+# false positives. Mirrors executor.dispatcher.SecretScrubber semantics.
+_SCRUB_MIN_LEN = 4
+
+
+def _chain_secret_scrubber(prev_scrub, values):
+    """Return a scrub function that also redacts the given secret values.
+
+    The dispatcher's SecretScrubber only knows payload-carried secrets and
+    the host token; API-fetched project secrets (pulled mid-deploy) must be
+    registered too, or a failing `docker run` — DockerError embeds the full
+    `-e KEY=value` argv — would land in the task log, the progress error
+    and the task.failed event in plaintext.
+    """
+    vals = sorted(
+        {str(v) for v in (values or []) if v and len(str(v)) >= _SCRUB_MIN_LEN},
+        key=len,
+        reverse=True,
+    )
+    if not vals:
+        return prev_scrub
+
+    def scrub(text):
+        if not isinstance(text, str):
+            text = str(text)
+        for value in vals:
+            text = text.replace(value, "***")
+        return prev_scrub(text)
+
+    return scrub
+
 
 def sanitize_env(env: dict, log=None) -> dict:
     """Coerce env to string values, drop keys docker would reject."""
@@ -427,6 +459,16 @@ def deploy(ctx, task: dict) -> dict:
                 f"payload secrets only")
     secret_env = sanitize_env({**fetched_secrets, **payload_secrets}, log=log)
     run_env = {**manifest_env, **secret_env}  # secrets override manifest env
+    # W11: register the API-fetched secret values with the active log
+    # scrubber. The dispatcher built its scrubber before this handler ran,
+    # so it only covers payload-carried secrets + the host token; these
+    # pulled values flow into docker argv and container-log tails from here
+    # on and must be redacted everywhere too. The dispatcher restores
+    # ctx.scrub after the task, so this chaining cannot leak across tasks.
+    # (Deliberately not restored on raise paths: the dispatcher's failure
+    # logging must keep redacting these values as well.)
+    if fetched_secrets:
+        ctx.scrub = _chain_secret_scrubber(ctx.scrub, fetched_secrets.values())
 
     # -- 3. host resource check (admission control on RESERVED resources) ----
     # allocated = sum of reservations from running deployments' manifests
