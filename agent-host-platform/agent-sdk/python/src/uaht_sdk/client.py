@@ -100,8 +100,8 @@ class UahtClient:
     def _put(self, path, body=None):
         return self._request("PUT", path, body=body)
 
-    def _delete(self, path):
-        return self._request("DELETE", path)
+    def _delete(self, path, body=None):
+        return self._request("DELETE", path, body=body)
 
     # -- §3.1 Agents --------------------------------------------------
     def register_agent(self, name, type=None, capabilities=None, permissions=None):
@@ -267,6 +267,16 @@ class UahtClient:
 
     def rollback_deployment(self, deployment_id):
         return self._post(f"/deployments/{deployment_id}/rollback", {})
+
+    # -- §3.10 Domains --------------------------------------------------
+    def add_domain(self, deployment_id, hostname):
+        return self._post("/domains", {"deployment_id": deployment_id, "hostname": hostname})
+
+    def list_domains(self, deployment_id):
+        return self._get("/domains", {"deployment_id": deployment_id})
+
+    def remove_domain(self, deployment_id, hostname):
+        return self._delete("/domains", {"deployment_id": deployment_id, "hostname": hostname})
 
     # -- §3.6 Services -------------------------------------------------
     def list_services(self, host_id=None):
