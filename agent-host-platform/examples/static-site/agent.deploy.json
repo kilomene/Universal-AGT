@@ -1,0 +1,1 @@
+{"build":{"context":".","dockerfile":"Dockerfile"},"name":"static-site","resources":{"cpu":"0.25","memory":"128m"},"restart":"unless-stopped","runtime":"docker","service":{"healthcheck":"/","port":80}}
