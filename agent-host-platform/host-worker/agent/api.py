@@ -21,6 +21,22 @@ class WorkerAPIError(Exception):
     """Raised when the control plane cannot be reached or rejects a call."""
 
 
+def _transport(action: str, fn):
+    """Run an HTTP call, converting transport failures (DNS, refused,
+    reset, timeout — anything below the HTTP layer) into WorkerAPIError.
+
+    This gives every network failure mode a single typed error carrying
+    the action that failed, so the retry/backoff loops key on one
+    exception family instead of WorkerAPIError-vs-requests internals.
+    """
+    try:
+        return fn()
+    except WorkerAPIError:
+        raise
+    except requests.RequestException as exc:
+        raise WorkerAPIError(f"{action} failed: transport error: {exc}") from exc
+
+
 class RotationError(WorkerAPIError):
     """Raised when host-token rotation cannot be completed safely.
 
@@ -124,7 +140,7 @@ class ControlPlaneClient:
     # -- §3.3 worker endpoints -------------------------------------------
     def register_host(self, name: str, capabilities: list,
                       worker_version: str, host_type: str = "persistent-linux-host") -> dict:
-        resp = self.session.post(
+        resp = _transport("host registration", lambda: self.session.post(
             self._url("/v1/hosts/register"),
             data=json.dumps({
                 "name": name,
@@ -133,17 +149,17 @@ class ControlPlaneClient:
                 "worker_version": worker_version,
             }),
             timeout=REQUEST_TIMEOUT,
-        )
+        ))
         if resp.status_code != 201:
             self._raise(resp, "host registration")
         return resp.json()
 
     def heartbeat(self, host_id: str, payload: dict) -> dict:
-        resp = self.session.post(
+        resp = _transport("heartbeat", lambda: self.session.post(
             self._url(f"/v1/hosts/{host_id}/heartbeat"),
             data=json.dumps(payload),
             timeout=REQUEST_TIMEOUT,
-        )
+        ))
         if resp.status_code != 200:
             self._raise(resp, "heartbeat")
         return resp.json()
@@ -151,10 +167,10 @@ class ControlPlaneClient:
     def claim_task(self, host_id: str, capabilities: list, wait: int) -> Optional[dict]:
         """Long-poll for a task. Returns the task dict, or None on 204."""
         req = build_claim_request(self.base_url, self._token, host_id, capabilities, wait)
-        resp = self.session.request(
+        resp = _transport("task claim", lambda: self.session.request(
             req["method"], req["url"], data=json.dumps(req["body"]),
             timeout=req["timeout"],
-        )
+        ))
         if resp.status_code == 204:
             return None
         if resp.status_code != 200:
@@ -163,11 +179,11 @@ class ControlPlaneClient:
         return body.get("task")
 
     def progress(self, task_id: str, payload: dict) -> dict:
-        resp = self.session.post(
+        resp = _transport(f"progress for task {task_id}", lambda: self.session.post(
             self._url(f"/v1/worker/tasks/{task_id}/progress"),
             data=json.dumps(payload),
             timeout=REQUEST_TIMEOUT,
-        )
+        ))
         if resp.status_code != 200:
             self._raise(resp, f"progress for task {task_id}")
         return resp.json()
@@ -178,19 +194,38 @@ class ControlPlaneClient:
         """Stream GET /v1/artifacts/:id/download to dest_path. Returns dest_path."""
         tmp_path = dest_path + ".part"
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
-        with self.session.get(
+        get = _transport(f"artifact {artifact_id} download", lambda: self.session.get(
             self._url(f"/v1/artifacts/{artifact_id}/download"),
             stream=True,
             timeout=REQUEST_TIMEOUT,
-        ) as resp:
+        ))
+        with get as resp:
             if resp.status_code != 200:
                 self._raise(resp, f"artifact {artifact_id} download")
             received = 0
-            with open(tmp_path, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 256):
-                    if chunk:
-                        fh.write(chunk)
-                        received += len(chunk)
+            try:
+                with open(tmp_path, "wb") as fh:
+                    try:
+                        for chunk in resp.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                fh.write(chunk)
+                                received += len(chunk)
+                    except requests.RequestException as exc:
+                        raise WorkerAPIError(
+                            f"artifact {artifact_id} download failed: "
+                            f"transport error: {exc}"
+                        ) from exc
+            except Exception:
+                # A truncated/reset transfer must never leave a partial file
+                # behind: the next attempt starts clean (it re-creates
+                # tmp_path) and os.replace only ever promotes a complete,
+                # size-verified download. Re-raise unchanged so the caller's
+                # retry/backoff policy sees the original failure.
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
         if expected_size is not None and received != expected_size:
             os.remove(tmp_path)
             raise WorkerAPIError(
@@ -206,10 +241,10 @@ class ControlPlaneClient:
         headers = {"Content-Type": "application/octet-stream",
                    "Content-Length": str(size)}
         with open(file_path, "rb") as fh:
-            resp = self.session.put(
+            resp = _transport(f"artifact {artifact_id} upload", lambda: self.session.put(
                 self._url(f"/v1/artifacts/{artifact_id}/content"),
                 data=fh, headers=headers, timeout=max(REQUEST_TIMEOUT, size // 65536 + 60),
-            )
+            ))
         if resp.status_code not in (200, 201):
             self._raise(resp, f"artifact {artifact_id} upload")
         return resp.json()
@@ -219,10 +254,10 @@ class ControlPlaneClient:
         actively deploying (GET /v1/worker/projects/:id/secrets, host
         token). The server only serves them when this host has a
         claimed/active task or deployment for the project."""
-        resp = self.session.get(
+        resp = _transport(f"project {project_id} secrets", lambda: self.session.get(
             self._url(f"/v1/worker/projects/{project_id}/secrets"),
             timeout=REQUEST_TIMEOUT,
-        )
+        ))
         if resp.status_code == 403:
             return {}  # no active work for this project: no secrets
         if resp.status_code != 200:
@@ -236,10 +271,10 @@ class ControlPlaneClient:
         """List domain entries on this host's live deployments
         (GET /v1/worker/domains, host token). Used by the ingress route
         sync to map hostnames -> local container ports."""
-        resp = self.session.get(
+        resp = _transport("host domains", lambda: self.session.get(
             self._url("/v1/worker/domains"),
             timeout=REQUEST_TIMEOUT,
-        )
+        ))
         if resp.status_code != 200:
             self._raise(resp, "host domains")
         return resp.json()
@@ -266,11 +301,11 @@ class ControlPlaneClient:
         the worker: the caller can retry with the old token. The plaintext
         token is never logged.
         """
-        resp = self.session.post(
+        resp = _transport("host token rotation", lambda: self.session.post(
             self._url(f"/v1/hosts/{host_id}/rotate-token"),
             data=json.dumps({"grace_seconds": int(grace_seconds)}),
             timeout=REQUEST_TIMEOUT,
-        )
+        ))
         if resp.status_code != 200:
             self._raise(resp, "host token rotation")
         body = resp.json() or {}
@@ -280,11 +315,11 @@ class ControlPlaneClient:
                 "host token rotation failed: server did not return a host_token"
             )
         # Verify the new token authenticates before adopting it.
-        verify = self.session.get(
+        verify = _transport("host token rotation verify", lambda: self.session.get(
             self._url("/v1/worker/domains"),
             headers={"Authorization": f"Bearer {new_token}"},
             timeout=REQUEST_TIMEOUT,
-        )
+        ))
         if verify.status_code != 200:
             raise RotationError(
                 "host token rotation failed: the new token did not "
