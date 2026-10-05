@@ -144,7 +144,13 @@ def cmd_logs(args):
             logs = (cur.get("result") or {}).get("logs", "") if isinstance(cur.get("result"), dict) else ""
             chunk = logs[last_len:]
             if chunk:
-                print(chunk, end="" if chunk.endswith("\n") else "\n")
+                if args.json:
+                    # One JSON object per line: every stdout line stays
+                    # machine-parseable while the stream is open.
+                    print(json.dumps({"task_id": task["id"], "status": cur.get("status"),
+                                      "chunk": chunk}, default=str))
+                else:
+                    print(chunk, end="" if chunk.endswith("\n") else "\n")
                 last_len = len(logs)
             if cur.get("status") in {"completed", "failed", "cancelled"}:
                 break
