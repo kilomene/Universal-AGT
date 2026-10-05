@@ -119,6 +119,9 @@ class TaskDispatcher:
         try:
             try:
                 handler = policy.get_handler(task_type)
+                # Security rejections for disallowed payload fields happen
+                # here too (TaskRejected => failed, nothing executed).
+                policy.reject_disallowed_fields(task_type, task)
             except policy.TaskRejected as exc:
                 self.ctx.log(task_id, f"REJECTED: {exc}")
                 self._report(task_id, status, "failed",
