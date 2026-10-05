@@ -53,8 +53,10 @@ secretsRouter.post('/', requireAgent, requirePermission('manage_secrets'), async
        RETURNING id, project_id, name, created_at, updated_at`,
       [projectId, name.trim(), encrypted],
     );
+    // W11: secret rotation/change emits `secret.changed` — the payload
+    // carries the name only; the value is never written to the journal.
     await appendEvent(pool, {
-      type: 'secret.updated',
+      type: 'secret.changed',
       actor_type: 'agent',
       actor_id: req.auth!.name,
       payload: { project_id: projectId, name: name.trim() },
@@ -110,11 +112,12 @@ secretsRouter.delete('/:name', requireAgent, requirePermission('manage_secrets')
       next(new HttpError(404, 'not_found', 'secret not found'));
       return;
     }
+    // W11: deletion emits `secret.deleted` — name only, never the value.
     await appendEvent(pool, {
-      type: 'secret.updated',
+      type: 'secret.deleted',
       actor_type: 'agent',
       actor_id: req.auth!.name,
-      payload: { project_id: projectId, name: req.params.name, deleted: true },
+      payload: { project_id: projectId, name: req.params.name },
     });
     res.status(204).end();
   } catch (err) {
