@@ -132,6 +132,22 @@ The dashboard (served by the control plane at `/`) shows the host's
 status, resource bars, worker version and last-seen time in its Hosts
 panel.
 
+## Boot behavior
+
+On every (re)start the worker reconciles its local deployment registry
+against actual Docker state **before** it starts claiming tasks: stopped
+containers are started, missing containers are recreated from their stored
+spec (image, ports, non-secret env), and the summary is reported on the
+next heartbeat. A corrupt `state.json` is quarantined aside, never fatal.
+
+Also know: control-plane outages don't hot-spin the worker — heartbeat and
+claim failures back off exponentially (5s → 300s cap, jittered) until the
+plane is reachable again; and a container that restarts
+`WORKER_CRASH_LOOP_THRESHOLD` times (default 5) inside
+`WORKER_CRASH_LOOP_WINDOW_S` (default 300s) is stopped and flagged
+(`crash_loop`) rather than restarted forever — redeploy or clear the flag
+to recover it.
+
 ## Updating
 
 The worker self-updates: the control plane advertises the current worker
