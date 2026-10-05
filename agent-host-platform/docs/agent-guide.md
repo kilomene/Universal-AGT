@@ -1,7 +1,7 @@
 # Agent guide — deploying through Universal AGT
 
 This guide is for any agent (LLM-driven, scripted, or a human using the
-`uagt` CLI). The flow is the same in every SDK because every SDK implements
+`agent-host` CLI). The flow is the same in every SDK because every SDK implements
 [`../agent-sdk/protocol/PROTOCOL.md`](../agent-sdk/protocol/PROTOCOL.md):
 **register → create project → upload artifact → deploy → poll status**.
 
@@ -11,13 +11,18 @@ create the task, disconnect, come back later, read the result.
 ## 1. Register and get an API key
 
 One-time. The key is shown **once** — store it in your agent's secret
-storage (never in code, tickets, or chat logs).
+storage (never in code, tickets, or chat logs). If the control plane has
+`UAHT_PROVISIONING_TOKEN` set (production always does), you must also send
+header `X-Provisioning-Token: <the operator's token>` — get the value from
+whoever runs the control plane; without it registration 403s after the
+bootstrap registration.
 
 ```bash
 export UAGT_CP="https://control-plane.example.com"
 
 curl -s -X POST $UAGT_CP/v1/agents/register \
   -H 'Content-Type: application/json' \
+  -H "X-Provisioning-Token: <operator-provided>" \
   -d '{"name": "my-builder-agent", "type": "ci",
        "capabilities": ["docker"],
        "permissions": {"deploy": true, "read_status": true,
@@ -104,9 +109,9 @@ host claim the task.
 
 - `"mode": "automatic"` (default): the task goes `queued → claimed →
   running → completed|failed` with no human in the loop.
-- `"mode": "manual"`: the task parks in `awaiting_approval` after being
-  picked up. An approver (an agent/human with the `approve_deployments`
-  permission) runs:
+- `"mode": "manual"`: the task is **created** in `awaiting_approval` — no
+  worker can claim it until then. An approver (an agent/human with the
+  `approve_deployments` permission) runs:
 
 ```bash
 curl -s -X POST $UAGT_CP/v1/tasks/<task-id>/approve \
