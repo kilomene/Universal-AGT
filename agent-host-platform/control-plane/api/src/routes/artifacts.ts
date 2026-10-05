@@ -346,7 +346,10 @@ artifactsRouter.get('/:id/download', async (req, res, next) => {
     }
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Length', String(fileStat.size));
-    res.setHeader('Content-Disposition', `attachment; filename="${artifact.filename}"`);
+    // W5: filename is basename'd at init, but strip any residual quoting
+    // or control characters before reflecting it into the header.
+    const safeFilename = String(artifact.filename).replace(/["\\\r\n]/g, '_');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
     createReadStream(filePath).pipe(res);
   } catch (err) {
     next(err);
