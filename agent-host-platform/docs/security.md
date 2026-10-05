@@ -26,11 +26,12 @@ Two bearer-token credential kinds, both sent as
   open (bootstrap mode); afterwards registration returns 403 until the
   operator sets the token. In production (`NODE_ENV=production`) the
   server refuses to start without `UAHT_PROVISIONING_TOKEN`.
-  Two provisioning tokens — don't confuse them: `UAHT_PROVISIONING_TOKEN`
-  gates *agent* registration (`X-Provisioning-Token` header); `PROVISIONING_TOKEN`
-  is the *host* bootstrap bearer for hands-off first-boot
-  `POST /v1/hosts/register` (alternatively, an agent token with the `deploy`
-  permission can register hosts).
+  One provisioning token, two uses — don't confuse the *uses* with two
+  *tokens*: the single `UAHT_PROVISIONING_TOKEN` gates *agent* registration
+  (`X-Provisioning-Token` header) **and** *host* bootstrap registration
+  (`Authorization: Bearer` on `POST /v1/hosts/register`, hands-off first
+  boot). Alternatively, an agent token with the `deploy` permission can
+  register hosts.
 - Credentials rotate without downtime: `POST /v1/agents/me/rotate` and
   `POST /v1/hosts/:id/rotate-token` issue a new credential, invalidate the
   old one immediately, and emit `agent.key_rotated` / `host.token_rotated`.
