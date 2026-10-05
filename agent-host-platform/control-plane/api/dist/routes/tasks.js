@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TASK_TYPES = exports.tasksRouter = void 0;
+exports.permissionForTaskType = permissionForTaskType;
 const express_1 = require("express");
 const pool_1 = require("../db/pool");
 const errors_1 = require("../lib/errors");
@@ -10,7 +11,7 @@ const stateMachine_1 = require("../lib/stateMachine");
 const auth_1 = require("../middleware/auth");
 const _helpers_1 = require("./_helpers");
 exports.tasksRouter = (0, express_1.Router)();
-// PROTOCOL §3.2 — the 17 allowed task types.
+// PROTOCOL §3.2 — the 18 allowed task types.
 exports.TASK_TYPES = [
     'deploy',
     'restart',
@@ -29,11 +30,40 @@ exports.TASK_TYPES = [
     'artifact-download',
     'artifact-upload',
     'system-info',
+    'ingress-sync',
 ];
+// Exported for the security test-suite: every type in TASK_TYPES must map
+// to an explicit permission here, and unknown types must stay closed.
 function permissionForTaskType(type) {
-    // Deploying new code is the privileged action; everything else is at
-    // minimum a status read. (restart/stop/remove gates live on services.)
-    return type === 'deploy' ? 'deploy' : 'read_status';
+    // Per-type permission map (PROTOCOL §3.2, tightened 2026-10-05 — see the
+    // PROTOCOL changelog). Mutating a deployment needs the matching service
+    // permission; creating build/run work needs deploy; reads need read_status.
+    switch (type) {
+        case 'deploy':
+        case 'remove':
+        case 'rollback':
+        case 'build':
+        case 'docker-build':
+        case 'docker-run':
+        case 'docker-compose':
+        case 'environment-update':
+        case 'artifact-upload':
+        case 'ingress-sync':
+            return 'deploy';
+        case 'restart':
+        case 'start':
+            return 'restart';
+        case 'stop':
+            return 'stop';
+        case 'logs':
+        case 'status':
+        case 'healthcheck':
+        case 'system-info':
+        case 'artifact-download':
+            return 'read_status';
+        default:
+            return 'deploy'; // defensive: unknown types are never open
+    }
 }
 async function getTask(pool, id) {
     const { rows } = await pool.query('SELECT * FROM tasks WHERE id = $1', [id]);
@@ -99,17 +129,39 @@ exports.tasksRouter.post('/', auth_1.requireAgent, async (req, res, next) => {
             }
         }
         const status = taskMode === 'manual' ? 'awaiting_approval' : 'queued';
-        const { rows } = await pool.query(`INSERT INTO tasks (idempotency_key, created_by, assigned_to, type, status, priority, payload)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`, [
-            typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null,
-            auth.id,
-            host_id ?? null,
-            type,
-            status,
-            prio,
-            JSON.stringify(payload ?? {}),
-        ]);
-        const task = rows[0];
+        let task;
+        try {
+            const { rows } = await pool.query(`INSERT INTO tasks (idempotency_key, created_by, assigned_to, type, status, priority, payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`, [
+                typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null,
+                auth.id,
+                host_id ?? null,
+                type,
+                status,
+                prio,
+                JSON.stringify(payload ?? {}),
+            ]);
+            task = rows[0];
+        }
+        catch (err) {
+            // Idempotency race: two requests with the same key passed the
+            // pre-check concurrently. Re-read and replay/409 instead of 500 —
+            // the same behavior POST /v1/deployments already has.
+            if (err.code === '23505' && typeof idempotency_key === 'string' && idempotency_key) {
+                const existing = await (0, idempotency_1.findTaskByIdempotencyKey)(pool, idempotency_key);
+                if (existing) {
+                    const decision = (0, idempotency_1.decideIdempotency)({ body: (0, idempotency_1.taskIdempotencyBody)(existing) }, (0, idempotency_1.taskIdempotencyBody)({ type, payload }));
+                    if (decision === 'replay') {
+                        const raced = await getTask(pool, existing.id);
+                        res.status(200).json({ task: raced, idempotent_replay: true });
+                        return;
+                    }
+                    (0, errors_1.sendError)(res, 409, 'conflict', 'idempotency key already used with a different payload');
+                    return;
+                }
+            }
+            throw err;
+        }
         await (0, events_1.appendEvent)(pool, {
             type: 'task.created',
             actor_type: 'agent',
@@ -192,7 +244,10 @@ exports.tasksRouter.get('/:id', auth_1.requireAgent, (0, auth_1.requirePermissio
     }
 });
 // POST /v1/tasks/:id/cancel — uses the state machine; terminal states -> 409.
-exports.tasksRouter.post('/:id/cancel', auth_1.requireAgent, (0, auth_1.requirePermission)('read_status'), async (req, res, next) => {
+// Permission (tightened 2026-10-05, see PROTOCOL changelog): the `deploy`
+// permission, or the agent that created the task. Cancelling someone else's
+// deployment task is a mutating action, not a status read.
+exports.tasksRouter.post('/:id/cancel', auth_1.requireAgent, async (req, res, next) => {
     try {
         if (!(0, _helpers_1.isUuid)(req.params.id)) {
             (0, errors_1.sendError)(res, 400, 'bad_request', 'id must be a UUID');
@@ -202,6 +257,12 @@ exports.tasksRouter.post('/:id/cancel', auth_1.requireAgent, (0, auth_1.requireP
         const task = await getTask(pool, req.params.id);
         if (!task) {
             next(new errors_1.HttpError(404, 'not_found', 'task not found'));
+            return;
+        }
+        const auth = req.auth;
+        const isCreator = task.created_by !== null && task.created_by === auth.id;
+        if (auth.permissions?.['deploy'] !== true && !isCreator) {
+            (0, errors_1.sendError)(res, 403, 'forbidden', 'missing permission: deploy (or be the task creator)');
             return;
         }
         if (!(0, stateMachine_1.canTransitionTask)(task.status, 'cancelled')) {
