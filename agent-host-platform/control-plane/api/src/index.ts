@@ -6,6 +6,7 @@ import { closePool, getPool } from './db/pool';
 import { runMigrations } from './db/migrate';
 import { sendError } from './lib/errors';
 import { startEventBus, stopEventBus } from './lib/events';
+import { startHostSweeper } from './lib/hostSweeper';
 import { logger } from './lib/log';
 import { agentsRouter } from './routes/agents';
 import { artifactsRouter, uploadArtifactContent } from './routes/artifacts';
@@ -102,6 +103,7 @@ async function main(): Promise<void> {
   const applied = await runMigrations(pool);
   if (applied.length) logger.info('migrations applied at startup', { applied });
   await startEventBus(pool);
+  const stopHostSweeper = startHostSweeper(pool);
 
   const port = Number(process.env.PORT ?? 3000);
   const server = createApp().listen(port, () => {
@@ -111,6 +113,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info('shutting down', { signal });
     server.close();
+    stopHostSweeper();
     await stopEventBus().catch(() => {});
     await closePool().catch(() => {});
     process.exit(0);
