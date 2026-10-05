@@ -110,10 +110,14 @@ export function requirePermission(name: string) {
 }
 
 // Provisioning bootstrap for POST /v1/hosts/register: either a matching
-// PROVISIONING_TOKEN bearer, or an agent token with the deploy permission.
+// UAHT_PROVISIONING_TOKEN bearer, or an agent token with the deploy permission.
 // (Choice documented in README: env token for hands-off bootstrap.)
+// W3 (2026-10-05): ONE canonical provisioning-token name. The same token that
+// gates agent registration (X-Provisioning-Token header) also gates host
+// bootstrap registration (Authorization: Bearer). The old unprefixed name
+// is gone — see docs/CONFIG.md.
 export function provisioningOrDeploy(req: Request, _res: Response, next: NextFunction): void {
-  const expected = process.env.PROVISIONING_TOKEN;
+  const expected = process.env.UAHT_PROVISIONING_TOKEN;
   const token = parseBearer(req);
   if (expected && token && verifyToken(token, sha256Hex(expected))) {
     return next();
