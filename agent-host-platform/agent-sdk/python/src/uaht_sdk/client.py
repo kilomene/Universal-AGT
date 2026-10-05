@@ -1,0 +1,388 @@
+"""uaht_sdk — Python client for the Universal Agent-to-Persistent-Host
+Deployment System control plane (wire protocol v1).
+
+Requires Python >= 3.10, depends only on ``requests``.
+Implements protocol §1 (auth), §2 (idempotency + error shape),
+§3 (endpoints) and §3.8 (SSE stream).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import time
+from typing import Any, Callable, Dict, Iterator, Optional
+
+import requests
+
+from .errors import UahtError
+from .sse import iter_sse_events
+
+TERMINAL_TASK_STATES = frozenset({"completed", "failed", "cancelled"})
+
+
+class UahtClient:
+    """Agent-facing control-plane client (agent API key, §1)."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        session: Optional[requests.Session] = None,
+        user_agent: str = "uaht-sdk/1.0.0",
+    ):
+        if not base_url:
+            raise TypeError("base_url is required")
+        if not api_key:
+            raise TypeError("api_key is required")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.session = session or requests.Session()
+        self.user_agent = user_agent
+
+    # -- internals ----------------------------------------------------
+    def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.api_key}", "User-Agent": self.user_agent}
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Any = None,
+        params: Optional[Dict[str, Any]] = None,
+        stream: bool = False,
+    ) -> Any:
+        url = f"{self.base_url}/v1{path}"
+        if params:
+            params = {k: v for k, v in params.items() if v is not None}
+        try:
+            resp = self.session.request(
+                method,
+                url,
+                headers=self._headers({"Content-Type": "application/json"} if body is not None else None),
+                json=body,
+                params=params,
+                stream=stream,
+            )
+        except requests.RequestException as exc:
+            raise UahtError("connection_error", f"request failed: {exc}") from exc
+
+        if resp.status_code == 204:
+            return None
+        data = None
+        text = resp.text
+        if text:
+            try:
+                data = resp.json()
+            except ValueError:
+                raise UahtError("bad_response", "server returned non-JSON body", resp.status_code, text) from None
+        if not resp.ok:
+            err = data.get("error", {}) if isinstance(data, dict) else {}
+            raise UahtError(
+                err.get("code", "unknown_error"),
+                err.get("message", f"request failed with status {resp.status_code}"),
+                resp.status_code,
+                data,
+            )
+        return data
+
+    def _get(self, path, params=None):
+        return self._request("GET", path, params=params)
+
+    def _post(self, path, body=None, params=None):
+        return self._request("POST", path, body=body, params=params)
+
+    def _put(self, path, body=None):
+        return self._request("PUT", path, body=body)
+
+    def _delete(self, path):
+        return self._request("DELETE", path)
+
+    # -- §3.1 Agents --------------------------------------------------
+    def register_agent(self, name, type=None, capabilities=None, permissions=None):
+        return self._post(
+            "/agents/register",
+            {"name": name, "type": type, "capabilities": capabilities, "permissions": permissions},
+        )
+
+    def me(self):
+        return self._get("/agents/me")
+
+    # -- §3.2 Tasks ---------------------------------------------------
+    def create_task(self, type, payload=None, idempotency_key=None, priority=None, host_id=None, mode=None):
+        return self._post(
+            "/tasks",
+            {
+                "type": type,
+                "payload": payload or {},
+                "idempotency_key": idempotency_key,
+                "priority": priority,
+                "host_id": host_id,
+                "mode": mode,
+            },
+        )
+
+    def get_task(self, task_id):
+        return self._get(f"/tasks/{task_id}")
+
+    def list_tasks(self, status=None, type=None, host_id=None, limit=None, cursor=None):
+        return self._get("/tasks", {"status": status, "type": type, "host_id": host_id, "limit": limit, "cursor": cursor})
+
+    def cancel_task(self, task_id):
+        return self._post(f"/tasks/{task_id}/cancel", {})
+
+    def approve_task(self, task_id):
+        return self._post(f"/tasks/{task_id}/approve", {})
+
+    def reject_task(self, task_id):
+        return self._post(f"/tasks/{task_id}/reject", {})
+
+    # -- §3.4 Hosts ---------------------------------------------------
+    def list_hosts(self):
+        return self._get("/hosts")
+
+    def get_host(self, host_id):
+        return self._get(f"/hosts/{host_id}")
+
+    # -- §3.5 Projects & artifacts ------------------------------------
+    def create_project(self, name, owner=None, repository=None, runtime=None, configuration=None):
+        return self._post(
+            "/projects",
+            {"name": name, "owner": owner, "repository": repository, "runtime": runtime, "configuration": configuration},
+        )
+
+    def list_projects(self, limit=None, cursor=None):
+        return self._get("/projects", {"limit": limit, "cursor": cursor})
+
+    def get_project(self, project_id):
+        return self._get(f"/projects/{project_id}")
+
+    def update_project(self, project_id, configuration):
+        return self._put(f"/projects/{project_id}", {"configuration": configuration})
+
+    def list_artifacts(self, project_id=None, limit=None, cursor=None):
+        return self._get("/artifacts", {"project_id": project_id, "limit": limit, "cursor": cursor})
+
+    def get_artifact(self, artifact_id):
+        return self._get(f"/artifacts/{artifact_id}")
+
+    def init_artifact(self, project_id, file_path, version, filename=None):
+        """Register an artifact (§3.5 step 1), computing sha256 client-side."""
+        size = os.path.getsize(file_path)
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        return self._post(
+            "/artifacts/init",
+            {
+                "project_id": project_id,
+                "filename": filename or os.path.basename(file_path),
+                "size": size,
+                "checksum": f"sha256:{digest.hexdigest()}",
+                "version": version,
+            },
+        )
+
+    def upload_artifact(self, upload_url, file_path):
+        """Stream raw bytes to the upload URL (§3.5 step 2, octet-stream)."""
+        try:
+            with open(file_path, "rb") as fh:
+                resp = self.session.request(
+                    "PUT",
+                    f"{self.base_url}{upload_url}",
+                    headers=self._headers({"Content-Type": "application/octet-stream"}),
+                    data=fh,
+                )
+        except requests.RequestException as exc:
+            raise UahtError("connection_error", f"upload failed: {exc}") from exc
+        if not resp.ok:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            err = data.get("error", {}) if isinstance(data, dict) else {}
+            raise UahtError(
+                err.get("code", "unknown_error"),
+                err.get("message", f"artifact upload failed with status {resp.status_code}"),
+                resp.status_code,
+                data,
+            )
+        return True
+
+    def download_artifact(self, artifact_id, file_path):
+        """Stream an artifact's bytes to a local file."""
+        url = f"{self.base_url}/v1/artifacts/{artifact_id}/download"
+        try:
+            resp = self.session.request("GET", url, headers=self._headers(), stream=True)
+        except requests.RequestException as exc:
+            raise UahtError("connection_error", f"download failed: {exc}") from exc
+        try:
+            if not resp.ok:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = None
+                err = data.get("error", {}) if isinstance(data, dict) else {}
+                raise UahtError(
+                    err.get("code", "unknown_error"),
+                    err.get("message", f"artifact download failed with status {resp.status_code}"),
+                    resp.status_code,
+                    data,
+                )
+            with open(file_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    fh.write(chunk)
+        finally:
+            resp.close()
+        return file_path
+
+    # -- §3.6 Deployments ----------------------------------------------
+    def create_deployment(self, project_id, version, host_id=None, artifact_id=None, mode=None, idempotency_key=None):
+        return self._post(
+            "/deployments",
+            {
+                "project_id": project_id,
+                "version": version,
+                "host_id": host_id,
+                "artifact_id": artifact_id,
+                "mode": mode,
+                "idempotency_key": idempotency_key,
+            },
+        )
+
+    def get_deployment(self, deployment_id):
+        return self._get(f"/deployments/{deployment_id}")
+
+    def list_deployments(self, project_id=None, host_id=None, status=None, limit=None, cursor=None):
+        return self._get(
+            "/deployments",
+            {"project_id": project_id, "host_id": host_id, "status": status, "limit": limit, "cursor": cursor},
+        )
+
+    def rollback_deployment(self, deployment_id):
+        return self._post(f"/deployments/{deployment_id}/rollback", {})
+
+    # -- §3.6 Services -------------------------------------------------
+    def list_services(self, host_id=None):
+        return self._get("/services", {"host_id": host_id})
+
+    def restart_service(self, service_id):
+        return self._post(f"/services/{service_id}/restart", {})
+
+    def stop_service(self, service_id):
+        return self._post(f"/services/{service_id}/stop", {})
+
+    def start_service(self, service_id):
+        return self._post(f"/services/{service_id}/start", {})
+
+    # -- §3.7 Secrets --------------------------------------------------
+    def set_secret(self, project_id, name, value):
+        return self._post(f"/projects/{project_id}/secrets", {"name": name, "value": value})
+
+    def list_secrets(self, project_id):
+        return self._get(f"/projects/{project_id}/secrets")
+
+    def delete_secret(self, project_id, name):
+        from urllib.parse import quote
+
+        return self._delete(f"/projects/{project_id}/secrets/{quote(name, safe='')}")
+
+    # -- §3.8 Events ---------------------------------------------------
+    def list_events(self, type=None, since=None, limit=None, cursor=None):
+        return self._get("/events", {"type": type, "since": since, "limit": limit, "cursor": cursor})
+
+    def stream_events(self, since=None, on_event: Optional[Callable[[Dict], None]] = None) -> Iterator[Dict]:
+        """Yield live event dicts from the SSE stream (§3.8)."""
+        url = f"{self.base_url}/v1/events/stream"
+        params = {"since": since} if since else None
+        try:
+            resp = self.session.request(
+                "GET",
+                url,
+                headers=self._headers({"Accept": "text/event-stream"}),
+                params=params,
+                stream=True,
+            )
+        except requests.RequestException as exc:
+            raise UahtError("connection_error", f"event stream failed: {exc}") from exc
+        if not resp.ok:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = resp.text or None
+            raise UahtError("stream_error", f"event stream failed with status {resp.status_code}", resp.status_code, data)
+        try:
+            for event in iter_sse_events(resp):
+                if on_event:
+                    on_event(event)
+                yield event
+        except requests.RequestException as exc:
+            raise UahtError("stream_error", f"event stream interrupted: {exc}") from exc
+        finally:
+            resp.close()
+
+    # -- §3.9 Misc -----------------------------------------------------
+    def health(self):
+        return self._get("/health")
+
+    # -- convenience ---------------------------------------------------
+    def deploy(
+        self,
+        project,
+        version,
+        host=None,
+        artifact_id=None,
+        mode=None,
+        wait=False,
+        poll_interval=3.0,
+        timeout=600.0,
+    ):
+        """Resolve project (and host) names to ids, create a deployment, and
+        optionally wait until the backing task reaches a terminal state.
+
+        Returns ``(deployment, task)``.
+        """
+        if not project:
+            raise TypeError("project (name) is required")
+        if not version:
+            raise TypeError("version is required")
+
+        rows = self.list_projects().get("projects", []) or []
+        match = next((p for p in rows if p.get("name") == project or p.get("id") == project), None)
+        if not match:
+            raise UahtError("not_found", f'project "{project}" not found')
+
+        host_id = None
+        if host:
+            hrows = self.list_hosts().get("hosts", []) or []
+            hmatch = next((h for h in hrows if h.get("name") == host or h.get("id") == host), None)
+            if not hmatch:
+                raise UahtError("not_found", f'host "{host}" not found')
+            host_id = hmatch["id"]
+
+        created = self.create_deployment(
+            project_id=match["id"], version=version, host_id=host_id, artifact_id=artifact_id, mode=mode
+        )
+        deployment = created.get("deployment", created)
+        task = created.get("task")
+
+        if wait and task and task.get("id"):
+            started = time.monotonic()
+            while True:
+                cur = self.get_task(task["id"])
+                task = cur.get("task", cur)
+                if task.get("status") in TERMINAL_TASK_STATES:
+                    break
+                if time.monotonic() - started > timeout:
+                    raise UahtError("timeout", f"deploy wait timed out after {timeout}s")
+                time.sleep(poll_interval)
+            dep = self.get_deployment(deployment["id"])
+            deployment = dep.get("deployment", dep)
+
+        return deployment, task
