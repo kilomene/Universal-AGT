@@ -4,7 +4,7 @@ import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { generateHostToken } from '../lib/tokens';
-import { provisioningOrDeploy, requireAgent, requirePermission } from '../middleware/auth';
+import { provisioningOrDeploy, requireAgent, requireHost, requirePermission } from '../middleware/auth';
 import { publicHost } from './_helpers';
 
 export const hostsRouter = Router();
@@ -57,6 +57,41 @@ hostsRouter.post('/register', provisioningOrDeploy, async (req, res, next) => {
       }
       throw err;
     }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /v1/hosts/:id/rotate-token — HOST token only, and the token must
+// belong to the host in the path. Returns the NEW host token (shown once);
+// the old token stops working immediately. Emits host.token_rotated.
+// (The host_id in the URL is validated as a UUID by the DB lookup; a
+// non-existent id can never match req.auth.id, so it 403s like a mismatch.)
+hostsRouter.post('/:id/rotate-token', requireHost, async (req, res, next) => {
+  try {
+    if (req.params.id !== req.auth!.id) {
+      sendError(res, 403, 'forbidden', 'host token does not belong to this host');
+      return;
+    }
+    const pool = getPool();
+    const { token, hash } = generateHostToken();
+    const { rowCount } = await pool.query(
+      `UPDATE hosts SET token_hash = $2, updated_at = now() WHERE id = $1`,
+      [req.auth!.id, hash],
+    );
+    if (!rowCount) {
+      next(new HttpError(404, 'not_found', 'host not found'));
+      return;
+    }
+    await appendEvent(pool, {
+      type: 'host.token_rotated',
+      actor_type: 'host',
+      actor_id: req.auth!.name,
+      host_id: req.auth!.id,
+      payload: {},
+    });
+    logger.info('host token rotated', { host: req.auth!.name });
+    res.json({ host_token: token });
   } catch (err) {
     next(err);
   }
