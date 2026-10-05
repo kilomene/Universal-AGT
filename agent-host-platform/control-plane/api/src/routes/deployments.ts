@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { Router } from 'express';
+import { Router, type Response } from 'express';
 import type { Pool } from 'pg';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
@@ -23,6 +23,53 @@ async function latestTaskForDeployment(pool: Pool, deployment: Record<string, an
     [deployment.task_id, deployment.id],
   );
   return rows[0] ?? null;
+}
+
+// Resolve an existing deployment row for an idempotency key into the
+// replay/conflict response. Returns true when it responded (the caller
+// must return), false when no row exists for the key.
+//
+// Used in two places: the pre-transaction fast path, and the 23505 catch
+// after the INSERT — two requests racing with the same key can both miss
+// the fast path; the loser then replays the winner's row instead of
+// failing with a generic conflict (spec §42: exactly one deployment).
+async function resolveIdempotencyReplay(
+  pool: Pool,
+  res: Response,
+  idempotencyKey: string,
+  incomingBody: unknown,
+): Promise<boolean> {
+  const { rows } = await pool.query(
+    'SELECT * FROM deployments WHERE idempotency_key = $1',
+    [idempotencyKey],
+  );
+  const existing = rows[0];
+  if (!existing) return false;
+  // host_port is part of the compared body: it lives in the port
+  // registry, not on the deployment row.
+  const alloc = (
+    await pool.query('SELECT port FROM port_allocations WHERE deployment_id = $1', [existing.id])
+  ).rows[0];
+  const decision = decideIdempotency(
+    {
+      body: deploymentIdempotencyBody({
+        project_id: existing.project_id,
+        host_id: existing.host_id,
+        version: existing.version,
+        artifact_id: existing.artifact_id,
+        mode: existing.mode,
+        host_port: alloc ? alloc.port : null,
+      }),
+    },
+    incomingBody,
+  );
+  if (decision === 'replay') {
+    const task = await latestTaskForDeployment(pool, existing);
+    res.status(200).json({ deployment: existing, task, idempotent_replay: true });
+    return true;
+  }
+  sendError(res, 409, 'conflict', 'idempotency key already used with different deployment parameters');
+  return true;
 }
 
 // POST /v1/deployments — creates a deployment row (status requested) AND a
@@ -123,33 +170,7 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     });
 
     if (typeof idempotency_key === 'string' && idempotency_key) {
-      const { rows } = await pool.query('SELECT * FROM deployments WHERE idempotency_key = $1', [idempotency_key]);
-      const existing = rows[0];
-      if (existing) {
-        // host_port is part of the compared body: it lives in the port
-        // registry, not on the deployment row.
-        const alloc = (
-          await pool.query('SELECT port FROM port_allocations WHERE deployment_id = $1', [existing.id])
-        ).rows[0];
-        const decision = decideIdempotency(
-          {
-            body: deploymentIdempotencyBody({
-              project_id: existing.project_id,
-              host_id: existing.host_id,
-              version: existing.version,
-              artifact_id: existing.artifact_id,
-              mode: existing.mode,
-              host_port: alloc ? alloc.port : null,
-            }),
-          },
-          incomingBody,
-        );
-        if (decision === 'replay') {
-          const task = await latestTaskForDeployment(pool, existing);
-          res.status(200).json({ deployment: existing, task, idempotent_replay: true });
-          return;
-        }
-        sendError(res, 409, 'conflict', 'idempotency key already used with different deployment parameters');
+      if (await resolveIdempotencyReplay(pool, res, idempotency_key, incomingBody)) {
         return;
       }
     }
@@ -224,6 +245,20 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     } catch (err) {
       await client.query('ROLLBACK');
       if ((err as { code?: string }).code === '23505') {
+        // Idempotency race: a concurrent request with the same key passed
+        // the pre-check and won the INSERT first (same handling POST
+        // /v1/tasks already has). Re-read the winner and replay/conflict
+        // instead of 409-ing a duplicate request — the deployment still
+        // exists exactly once either way.
+        if (typeof idempotency_key === 'string' && idempotency_key) {
+          try {
+            if (await resolveIdempotencyReplay(pool, res, idempotency_key, incomingBody)) {
+              return;
+            }
+          } catch {
+            // fall through to the generic conflict below
+          }
+        }
         sendError(res, 409, 'conflict', 'a deployment of this project+host+version already exists');
         return;
       }
