@@ -223,6 +223,127 @@ def cmd_events(args):
                       "created": e.get("created_at")} for e in rows])
 
 
+def _parse_json_arg(value, what):
+    """Parse a CLI argument as JSON, exiting with a clear error if invalid."""
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        raise SystemExit(f"error: {what} must be valid JSON")
+
+
+def _parse_permissions(value):
+    """Accept a JSON object ('{"deploy": true}') or a comma-separated list
+    of permission names (each granted true)."""
+    if value is None:
+        return None
+    v = value.strip()
+    if v.startswith("{"):
+        perms = _parse_json_arg(v, "--permissions")
+        if not isinstance(perms, dict):
+            raise SystemExit("error: --permissions JSON must be an object")
+        return perms
+    return {p.strip(): True for p in v.split(",") if p.strip()}
+
+
+def cmd_agents(args):
+    c = _client(args)
+    if args.action == "register":
+        if not args.name:
+            raise SystemExit("error: agents register requires --name")
+        capabilities = [s.strip() for s in args.capabilities.split(",") if s.strip()] if args.capabilities else None
+        resp = c.register_agent(
+            name=args.name,
+            type=args.type,
+            capabilities=capabilities,
+            permissions=_parse_permissions(args.permissions),
+        )
+        agent = resp.get("agent", {}) if isinstance(resp, dict) else {}
+        row = dict(agent) if isinstance(agent, dict) else {}
+        row["api_key"] = resp.get("api_key") if isinstance(resp, dict) else None
+        _emit(args, row)
+    else:  # me
+        resp = c.me()
+        _emit(args, resp.get("agent", resp) if isinstance(resp, dict) else resp)
+
+
+def _project_row(resp):
+    """Unwrap the {project: {...}} envelope so tables show fields, not a blob."""
+    if isinstance(resp, dict):
+        project = resp.get("project", resp)
+        return project if isinstance(project, dict) else resp
+    return resp
+
+
+def cmd_projects(args):
+    c = _client(args)
+    if args.action == "create":
+        if not args.name:
+            raise SystemExit("error: projects create requires --name")
+        configuration = _parse_json_arg(args.configuration, "--configuration") if args.configuration else None
+        _emit(args, _project_row(c.create_project(
+            name=args.name, owner=args.owner, repository=args.repository,
+            runtime=args.runtime, configuration=configuration,
+        )))
+    elif args.action == "get":
+        if not args.project:
+            raise SystemExit("error: projects get requires --project <id>")
+        _emit(args, _project_row(c.get_project(args.project)))
+    elif args.action == "update":
+        if not args.project:
+            raise SystemExit("error: projects update requires --project <id>")
+        if not args.configuration:
+            raise SystemExit("error: projects update requires --configuration '{...}'")
+        _emit(args, _project_row(c.update_project(
+            args.project, _parse_json_arg(args.configuration, "--configuration"))))
+    else:  # list
+        projects = c.list_projects(limit=args.limit)
+        rows = projects.get("projects", []) if isinstance(projects, dict) else projects
+        _emit(args, [{"id": p.get("id"), "name": p.get("name"), "runtime": p.get("runtime"),
+                      "created": p.get("created_at")} for p in rows])
+
+
+def cmd_deployments(args):
+    c = _client(args)
+    deployments = c.list_deployments(project_id=args.project, host_id=args.host, status=args.status)
+    rows = deployments.get("deployments", []) if isinstance(deployments, dict) else deployments
+    _emit(args, [{"id": d.get("id"), "project": d.get("project_id"), "version": d.get("version"),
+                  "host": d.get("host_id"), "status": d.get("status"),
+                  "health": d.get("health_status")} for d in rows])
+
+
+def cmd_approve(args):
+    c = _client(args)
+    _emit(args, c.approve_task(args.task))
+
+
+def cmd_reject(args):
+    c = _client(args)
+    _emit(args, c.reject_task(args.task))
+
+
+def cmd_cancel(args):
+    c = _client(args)
+    _emit(args, c.cancel_task(args.task))
+
+
+def cmd_secrets(args):
+    if not args.project:
+        raise SystemExit("error: secrets requires --project <id>")
+    c = _client(args)
+    if args.action == "set":
+        if not args.name or args.value is None:
+            raise SystemExit("error: secrets set requires --project, --name and --value")
+        _emit(args, c.set_secret(args.project, args.name, args.value))
+    elif args.action == "delete":
+        if not args.name:
+            raise SystemExit("error: secrets delete requires --name")
+        _emit(args, c.delete_secret(args.project, args.name))
+    else:  # list
+        secrets = c.list_secrets(args.project)
+        rows = secrets.get("secrets", []) if isinstance(secrets, dict) else secrets
+        _emit(args, [{"name": s.get("name"), "created": s.get("created_at")} for s in rows])
+
+
 # -- argparse ----------------------------------------------------------
 
 def build_parser():
@@ -277,6 +398,51 @@ def build_parser():
 
     e = sub.add_parser("events", help="show the append-only event journal")
     e.add_argument("--follow", action="store_true", help="follow the live SSE stream")
+
+    ag = sub.add_parser("agents", help="register an agent or show your own agent row")
+    ag.add_argument("action", nargs="?", default="me", choices=["register", "me"],
+                    help="register a new agent (default shows your own row)")
+    ag.add_argument("--name", default=None, help="agent name (register)")
+    ag.add_argument("--type", default=None, help="agent type label, e.g. ci, human (register)")
+    ag.add_argument("--capabilities", default=None,
+                    help="comma-separated capabilities, e.g. docker,compose (register)")
+    ag.add_argument("--permissions", default=None,
+                    help='permissions as JSON object, e.g. \'{"deploy": true}\', '
+                         'or comma-separated names (register)')
+
+    pr = sub.add_parser("projects", help="manage projects")
+    pr.add_argument("action", nargs="?", default="list", choices=["create", "list", "get", "update"],
+                    help="project action (default: list)")
+    pr.add_argument("--name", default=None, help="project name (create)")
+    pr.add_argument("--owner", default=None, help="project owner (create)")
+    pr.add_argument("--repository", default=None, help="source repository URL (create)")
+    pr.add_argument("--runtime", default=None, help="runtime label, e.g. docker (create)")
+    pr.add_argument("--configuration", default=None,
+                    help="project configuration as JSON, e.g. '{\"env\": {...}}' (create/update)")
+    pr.add_argument("--project", default=None, help="project id (get/update)")
+    pr.add_argument("--limit", type=int, default=None, help="max rows (list)")
+
+    dp = sub.add_parser("deployments", help="list deployments")
+    dp.add_argument("action", nargs="?", default="list", choices=["list"],
+                    help="deployment action (default: list)")
+    dp.add_argument("--project", default=None, help="filter by project id")
+    dp.add_argument("--host", default=None, help="filter by host id")
+    dp.add_argument("--status", default=None, help="filter by deployment status")
+
+    for name, help_text in [
+        ("approve", "approve a task waiting in awaiting_approval"),
+        ("reject", "reject a task waiting in awaiting_approval"),
+        ("cancel", "cancel a task that has not reached a terminal state"),
+    ]:
+        c = sub.add_parser(name, help=help_text)
+        c.add_argument("--task", required=True, help="task id")
+
+    se = sub.add_parser("secrets", help="manage per-project secrets (names only are ever listed)")
+    se.add_argument("action", nargs="?", default="list", choices=["set", "list", "delete"],
+                    help="secret action (default: list)")
+    se.add_argument("--project", default=None, help="project id")
+    se.add_argument("--name", default=None, help="secret name (set/delete)")
+    se.add_argument("--value", default=None, help="secret value (set)")
     return p
 
 
@@ -297,6 +463,13 @@ def main(argv=None):
             "domains": cmd_domains,
             "tasks": cmd_tasks,
             "events": cmd_events,
+            "agents": cmd_agents,
+            "projects": cmd_projects,
+            "deployments": cmd_deployments,
+            "approve": cmd_approve,
+            "reject": cmd_reject,
+            "cancel": cmd_cancel,
+            "secrets": cmd_secrets,
         }[args.command](args)
     except UahtError as err:
         print(f"error [{err.code}]: {err.message}", file=sys.stderr)
