@@ -60,7 +60,7 @@ Content-Type: `application/json` everywhere unless noted.
       non-terminal deployments.
     - Worker config (all optional, off by default): `WORKER_INGRESS_ENABLED`,
       `WORKER_INGRESS_PROVIDER` (`cloudflare-tunnel`), and the tunnel token
-      via `UAHT_TUNNEL_TOKEN` env (never in the repo, never logged).
+      via `WORKER_TUNNEL_TOKEN` env (never in the repo, never logged).
   - Worker-side (no other REST changes): new `host-worker/ingress/` package
     with the provider-neutral `IngressProvider` interface (`name`,
     `setup`, `add_route`, `remove_route`, `sync_routes`, `status`,
