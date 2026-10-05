@@ -55,15 +55,17 @@ select * from schema_migrations order by version;  -- 001…005 present
 ## 2. Environment variables (control plane)
 
 Copy `control-plane/api/.env.example` to `.env` and fill it in. Every
-variable below is read by the code (defaults shown):
+variable below is read by the code (defaults shown). The canonical
+reference for every configuration name in the system — including the
+`UAHT_*` installer-input → `WORKER_*` worker-runtime mapping — is
+[`docs/CONFIG.md`](CONFIG.md): one name per concept.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | — (required) | Postgres connection string (Supabase pooler URI works) |
 | `PORT` | `3000` | API listen port |
 | `DATA_ENCRYPTION_KEY` | — (required for secrets) | 64 hex chars (`openssl rand -hex 32`); AES-256-GCM key for project secrets. **Back it up — changing it invalidates stored secrets.** |
-| `UAHT_PROVISIONING_TOKEN` | — | Gates `POST /v1/agents/register` via the `X-Provisioning-Token` header (constant-time compare). **Required to boot in production** (`NODE_ENV=production` refuses to start without it). Unset = bootstrap mode: only the very first registration is open, then 403. |
-| `PROVISIONING_TOKEN` | — | Optional host-bootstrap bearer: `POST /v1/hosts/register` with `Authorization: Bearer <PROVISIONING_TOKEN>` needs no agent account (hands-off first boot). Alternatively an agent key with `deploy` can register hosts. |
+| `UAHT_PROVISIONING_TOKEN` | — | **The** provisioning token (one name, one token — see `docs/CONFIG.md`). Gates `POST /v1/agents/register` via the `X-Provisioning-Token` header (constant-time compare) **and** `POST /v1/hosts/register` via `Authorization: Bearer <token>` (hands-off first-boot provisioning; alternatively an agent key with `deploy` can register hosts). **Required to boot in production** — the startup validator (`src/lib/config.ts`) refuses to start without it. Unset in development = bootstrap mode: only the very first agent registration is open, then 403. |
 | `ARTIFACT_MAX_BYTES` | `524288000` (500 MB) | Wire cap for artifact uploads (bytes). Enforced on `Content-Length` upfront, per-chunk while streaming, and on declared `size` at init → `413 payload_too_large`. |
 | `ARTIFACT_DIR` | `./data/artifacts` | Where uploaded artifact bytes are stored (created if missing) |
 | `LOG_DIR` | `./data/logs` | Where per-task worker log chunks are appended |
@@ -78,7 +80,7 @@ variable below is read by the code (defaults shown):
 | `TASK_CLAIM_LEASE_S` | `600` | Claim lease: a task in `claimed`/`running` with no progress past this is requeued (attempt counted) or failed when the retry budget is exhausted / the type isn't retry-safe. Refreshed on every progress report. |
 | `PG_POOL_MAX` | `10` | Postgres pool size |
 | `LOG_LEVEL` | `info` | — |
-| `NODE_ENV` | — | Set `production`: the API **refuses to boot** without `UAHT_PROVISIONING_TOKEN` |
+| `NODE_ENV` | — | `development` relaxes **only** the `UAHT_PROVISIONING_TOKEN` check (agent-registration bootstrap mode). Anything else (including unset) = strict production: the startup validator **refuses to boot** without `DATABASE_URL`, `DATA_ENCRYPTION_KEY` (64 hex), and `UAHT_PROVISIONING_TOKEN` |
 | `CLOUDFLARE_API_TOKEN` | — | Scoped **Zone → DNS → Edit** on your zone (direct + tunnel modes) |
 | `CLOUDFLARE_ZONE_ID` | — | Zone id for the DNS records |
 | `PUBLIC_INGRESS_HOSTNAME` | — | Direct mode: CNAME target `hostname → PUBLIC_INGRESS_HOSTNAME` (your own ingress in front of the host) |
@@ -93,7 +95,9 @@ Worker-side variables live in the host's `worker.env`
 `WORKER_CRASH_LOOP_THRESHOLD` (5) / `WORKER_CRASH_LOOP_WINDOW_S` (300s),
 `DEPLOY_KEEP_GENERATIONS` (2), `WORKER_UPDATE_HEALTH_TIMEOUT_S` (120s),
 and the optional ingress trio `WORKER_INGRESS_ENABLED` /
-`WORKER_INGRESS_PROVIDER=cloudflare-tunnel` / `UAHT_TUNNEL_TOKEN`.
+`WORKER_INGRESS_PROVIDER=cloudflare-tunnel` / `WORKER_TUNNEL_TOKEN`
+(the installer accepts this last one as `UAHT_TUNNEL_TOKEN`; see
+`docs/CONFIG.md` for the full operator-input → runtime mapping).
 
 ## 3. Control-plane deployment
 
@@ -303,8 +307,8 @@ Full story: [`cloudflare.md`](cloudflare.md).
    `TUNNEL_INGRESS_HOSTNAME=<tunnel-id>.cfargotunnel.com`.
 4. Host `worker.env`: `WORKER_INGRESS_ENABLED=true`,
    `WORKER_INGRESS_PROVIDER=cloudflare-tunnel`,
-   `UAHT_TUNNEL_TOKEN=<tunnel token>` — or pass `UAHT_INGRESS_ENABLED=1
-   UAHT_TUNNEL_TOKEN=...` to `install-host.sh` at install time.
+   `WORKER_TUNNEL_TOKEN=<redacted>
+   (installer input: `UAHT_TUNNEL_TOKEN`).
 5. `agent-host domains add --deployment <id> --hostname api.example.com --ingress tunnel`
    → CNAME created, `ingress-sync` queued, worker writes the route table.
 
