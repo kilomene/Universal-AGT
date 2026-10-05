@@ -16,6 +16,7 @@ const log_1 = require("./lib/log");
 const agents_1 = require("./routes/agents");
 const artifacts_1 = require("./routes/artifacts");
 const deployments_1 = require("./routes/deployments");
+const domains_1 = require("./routes/domains");
 const events_2 = require("./routes/events");
 const health_1 = require("./routes/health");
 const hosts_1 = require("./routes/hosts");
@@ -64,6 +65,7 @@ function createApp() {
     v1.use('/projects', projects_1.projectsRouter);
     v1.use('/artifacts', artifacts_1.artifactsRouter);
     v1.use('/deployments', deployments_1.deploymentsRouter);
+    v1.use('/domains', domains_1.domainsRouter);
     v1.use('/services', services_1.servicesRouter);
     v1.use('/events', events_2.eventsRouter);
     app.use('/v1', v1);
