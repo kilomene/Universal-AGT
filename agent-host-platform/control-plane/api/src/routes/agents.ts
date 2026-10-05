@@ -5,6 +5,7 @@ import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { generateAgentKey, sha256Hex, verifyToken } from '../lib/tokens';
 import { requireAgent } from '../middleware/auth';
+import { rotationRateLimit } from '../middleware/rateLimit';
 import { publicAgent } from './_helpers';
 
 export const agentsRouter = Router();
@@ -125,8 +126,9 @@ agentsRouter.get('/me', requireAgent, async (req, res, next) => {
 // POST /v1/agents/me/rotate — rotate the caller's own API key. Returns the
 // NEW key (shown once); the old key stops working immediately. Emits
 // agent.key_rotated. Backwards compatible: keys that never rotate keep
-// working exactly as before.
-agentsRouter.post('/me/rotate', requireAgent, async (req, res, next) => {
+// working exactly as before. A stricter rotation rate-limit bucket applies
+// on top of the general API limit (see rotationRateLimit).
+agentsRouter.post('/me/rotate', requireAgent, rotationRateLimit, async (req, res, next) => {
   try {
     const pool = getPool();
     const { token, hash } = generateAgentKey();
