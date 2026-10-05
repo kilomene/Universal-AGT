@@ -1,6 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.artifactsRouter = void 0;
+exports.artifactMaxBytes = artifactMaxBytes;
+exports.hostMayDownloadArtifact = hostMayDownloadArtifact;
 exports.artifactDir = artifactDir;
 exports.uploadArtifactContent = uploadArtifactContent;
 const crypto_1 = require("crypto");
@@ -16,6 +18,24 @@ const log_1 = require("../lib/log");
 const auth_1 = require("../middleware/auth");
 const _helpers_1 = require("./_helpers");
 exports.artifactsRouter = (0, express_1.Router)();
+const DEFAULT_ARTIFACT_MAX_BYTES = 500 * 1024 * 1024; // 500MB
+// Wire size cap for artifact uploads (2026-10-05). Env-configurable via
+// ARTIFACT_MAX_BYTES; falls back to the 500MB default on missing/invalid.
+function artifactMaxBytes() {
+    const raw = Number(process.env.ARTIFACT_MAX_BYTES);
+    if (Number.isFinite(raw) && raw > 0)
+        return Math.floor(raw);
+    return DEFAULT_ARTIFACT_MAX_BYTES;
+}
+// Host download scoping (2026-10-05): a host may download only artifacts
+// referenced by tasks it claimed (payload.artifact_id). Agents keep their
+// read_status access; every other host gets 403.
+async function hostMayDownloadArtifact(pool, hostId, artifactId) {
+    const { rows } = await pool.query(`SELECT 1 FROM tasks
+      WHERE claimed_by = $1 AND payload->>'artifact_id' = $2
+      LIMIT 1`, [hostId, artifactId]);
+    return rows.length > 0;
+}
 function repoRoot() {
     return (0, path_1.resolve)(__dirname, '..', '..', '..', '..');
 }
@@ -48,6 +68,12 @@ exports.artifactsRouter.post('/init', auth_1.requireAgent, (0, auth_1.requirePer
         }
         if (typeof version !== 'string' || !version) {
             (0, errors_1.sendError)(res, 400, 'bad_request', 'version is required');
+            return;
+        }
+        // Wire size cap, enforced again on the actual byte stream (2026-10-05).
+        const maxBytes = artifactMaxBytes();
+        if (size > maxBytes) {
+            (0, errors_1.sendError)(res, 413, 'payload_too_large', `declared size ${size} exceeds the artifact cap of ${maxBytes} bytes`);
             return;
         }
         const pool = (0, pool_1.getPool)();
@@ -86,6 +112,15 @@ async function uploadArtifactContent(req, res, next) {
             (0, errors_1.sendError)(res, 400, 'bad_request', 'id must be a UUID');
             return;
         }
+        // Wire size cap (2026-10-05): reject upfront on a truthful
+        // Content-Length BEFORE touching the DB or disk — the old code
+        // streamed the whole body before verifying size.
+        const maxBytes = artifactMaxBytes();
+        const declaredLen = Number(req.headers['content-length']);
+        if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+            (0, errors_1.sendError)(res, 413, 'payload_too_large', `content-length ${declaredLen} exceeds the artifact cap of ${maxBytes} bytes`);
+            return;
+        }
         const pool = (0, pool_1.getPool)();
         const { rows } = await pool.query('SELECT * FROM artifacts WHERE id = $1', [id]);
         const artifact = rows[0];
@@ -97,6 +132,8 @@ async function uploadArtifactContent(req, res, next) {
             (0, errors_1.sendError)(res, 409, 'conflict', 'artifact content already uploaded');
             return;
         }
+        // Hard stream cap for liars (Content-Length understated or chunked):
+        // enforced per-chunk below while writing.
         const dir = artifactDir();
         await (0, promises_1.mkdir)((0, path_1.join)(dir, id), { recursive: true });
         const dest = (0, path_1.join)(dir, artifact.storage_path);
@@ -110,22 +147,56 @@ async function uploadArtifactContent(req, res, next) {
         const hash = (0, crypto_1.createHash)('sha256');
         let received = 0;
         let streamError = null;
+        let capExceeded = false;
         await new Promise((resolvePromise, rejectPromise) => {
             const out = (0, fs_1.createWriteStream)(dest);
-            req.on('data', (chunk) => {
+            let settled = false;
+            const settle = (err) => {
+                if (settled)
+                    return;
+                settled = true;
+                if (err)
+                    rejectPromise(err);
+                else
+                    resolvePromise();
+            };
+            const onData = (chunk) => {
                 received += chunk.length;
+                if (received > maxBytes) {
+                    // Cap hit: stop writing to disk, detach the pipe, and drain the
+                    // rest of the body quietly so the socket stays healthy enough
+                    // to carry the 413 response below. The partial file is removed
+                    // after the promise settles.
+                    capExceeded = true;
+                    req.unpipe(out);
+                    out.destroy();
+                    req.removeListener('data', onData);
+                    req.on('data', () => { });
+                    settle();
+                    return;
+                }
                 hash.update(chunk);
-            });
+            };
+            req.on('data', onData);
             req.on('error', (err) => {
                 out.destroy();
-                rejectPromise(err);
+                settle(err);
             });
-            out.on('error', rejectPromise);
-            out.on('finish', () => resolvePromise());
+            out.on('error', (err) => settle(err));
+            out.on('finish', () => settle());
             req.pipe(out);
         }).catch((err) => {
             streamError = err;
         });
+        if (capExceeded) {
+            // Hard stream cap: the client exceeded ARTIFACT_MAX_BYTES mid-body
+            // (or lied in Content-Length). Remove the partial file, leave the row
+            // 'pending' so a legitimate retry can follow.
+            await (0, promises_1.rm)(dest, { force: true });
+            log_1.logger.warn('artifact upload exceeded size cap', { artifact: id, received, maxBytes });
+            (0, errors_1.sendError)(res, 413, 'payload_too_large', `upload exceeded the artifact cap of ${maxBytes} bytes`);
+            return;
+        }
         if (streamError) {
             // Transport failure mid-upload: remove the partial file, leave the row
             // 'pending' so the client can retry the upload.
@@ -207,7 +278,9 @@ exports.artifactsRouter.get('/', auth_1.requireAgent, (0, auth_1.requirePermissi
         next(err);
     }
 });
-// GET /v1/artifacts/:id/download — agent (read_status) OR host token; streams bytes.
+// GET /v1/artifacts/:id/download — agent (read_status) OR host token with
+// scoping (2026-10-05): a host may only download artifacts referenced by
+// tasks it claimed. Streams bytes.
 exports.artifactsRouter.get('/:id/download', async (req, res, next) => {
     try {
         if (!req.auth) {
@@ -228,6 +301,13 @@ exports.artifactsRouter.get('/:id/download', async (req, res, next) => {
         if (!artifact) {
             next(new errors_1.HttpError(404, 'not_found', 'artifact not found'));
             return;
+        }
+        if (req.auth.kind === 'host') {
+            const allowed = await hostMayDownloadArtifact(pool, req.auth.id, req.params.id);
+            if (!allowed) {
+                (0, errors_1.sendError)(res, 403, 'forbidden', 'artifact is not referenced by any task claimed by this host');
+                return;
+            }
         }
         if (artifact.status !== 'ready') {
             (0, errors_1.sendError)(res, 409, 'conflict', `artifact is ${artifact.status}; content not available`);
