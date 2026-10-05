@@ -10,6 +10,7 @@ import {
   allocatePort,
   isValidServicePort,
   releasePortAllocations,
+  settleRollbackPorts,
   TERMINAL_PORT_RELEASE_STATUSES,
 } from '../src/lib/ports';
 
@@ -83,5 +84,126 @@ describe('allocatePort / releasePortAllocations against pg-mem', () => {
     expect(await releasePortAllocations(pool, 'dep-1')).toBe(1);
     await allocatePort(pool, 'host-1', 8080, 'dep-4'); // no longer collides
     expect(await releasePortAllocations(pool, 'dep-unknown')).toBe(0);
+  });
+
+  it('concurrent allocations of the same fixed port: exactly one succeeds', async () => {
+    // The PRIMARY KEY (host_id, port) is the serialization point: two
+    // simultaneous INSERTs cannot both win, so exactly one caller gets
+    // the reservation and the other gets a unique violation (409 at the
+    // route). This is the atomicity guarantee for fixed-port requests.
+    const attempts = await Promise.allSettled([
+      allocatePort(pool, 'host-9', 9090, 'dep-a'),
+      allocatePort(pool, 'host-9', 9090, 'dep-b'),
+    ]);
+    const won = attempts.filter((a) => a.status === 'fulfilled');
+    const lost = attempts.filter((a) => a.status === 'rejected');
+    expect(won).toHaveLength(1);
+    expect(lost).toHaveLength(1);
+    // the winner holds the reservation; the loser changed nothing
+    const { rows } = await pool.query(
+      'SELECT deployment_id FROM port_allocations WHERE host_id = $1 AND port = $2',
+      ['host-9', 9090],
+    );
+    expect(rows).toHaveLength(1);
+    expect(['dep-a', 'dep-b']).toContain(rows[0].deployment_id);
+  });
+
+  it('concurrent allocations of different ports both succeed', async () => {
+    const attempts = await Promise.allSettled([
+      allocatePort(pool, 'host-9', 9091, 'dep-a'),
+      allocatePort(pool, 'host-9', 9092, 'dep-b'),
+    ]);
+    expect(attempts.every((a) => a.status === 'fulfilled')).toBe(true);
+  });
+});
+
+describe('settleRollbackPorts against pg-mem', () => {
+  let pool: any;
+
+  beforeAll(() => {
+    const db = newDb();
+    db.public.none(`
+      CREATE TABLE deployments (
+        id TEXT PRIMARY KEY,
+        host_id TEXT,
+        ports JSONB
+      );
+      CREATE TABLE port_allocations (
+        host_id TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        deployment_id TEXT NOT NULL,
+        allocated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (host_id, port)
+      );
+    `);
+    const pg = db.adapters.createPg();
+    pool = new pg.Pool();
+  });
+
+  async function seed() {
+    await pool.query('DELETE FROM port_allocations');
+    await pool.query('DELETE FROM deployments');
+    // dep-old ran on 8080 (its reservation was dropped at supersede time);
+    // dep-new (rolled back) holds the temp port 8081.
+    await pool.query(
+      `INSERT INTO deployments (id, host_id, ports) VALUES
+       ('dep-old', 'host-1', '{"8080": 3000}'::jsonb),
+       ('dep-new', 'host-1', '{"8081": 3000}'::jsonb)`,
+    );
+    await pool.query(
+      `INSERT INTO port_allocations (host_id, port, deployment_id)
+       VALUES ('host-1', 8081, 'dep-new')`,
+    );
+  }
+
+  it('releases the temp port and restores the old port to the target', async () => {
+    await seed();
+    const settlement = await settleRollbackPorts(pool, 'dep-new', 'dep-old');
+    expect(settlement).toEqual({ released: 1, restored: 1, skipped: 0, ports: [8080] });
+    const { rows } = await pool.query(
+      'SELECT port, deployment_id FROM port_allocations ORDER BY port',
+    );
+    expect(rows).toEqual([{ port: 8080, deployment_id: 'dep-old' }]);
+  });
+
+  it('a target port grabbed by someone else is skipped, not an error', async () => {
+    await seed();
+    // someone re-allocated 8080 between supersede and rollback
+    await pool.query(
+      `INSERT INTO port_allocations (host_id, port, deployment_id)
+       VALUES ('host-1', 8080, 'dep-other')`,
+    );
+    const settlement = await settleRollbackPorts(pool, 'dep-new', 'dep-old');
+    expect(settlement.released).toBe(1);
+    expect(settlement.restored).toBe(0);
+    expect(settlement.skipped).toBe(1);
+    expect(settlement.ports).toEqual([]);
+    // the conflict never clobbers the current holder and never duplicates
+    const { rows } = await pool.query(
+      'SELECT port, deployment_id FROM port_allocations ORDER BY port',
+    );
+    expect(rows).toEqual([{ port: 8080, deployment_id: 'dep-other' }]);
+  });
+
+  it('target with no recorded ports only releases', async () => {
+    await pool.query('DELETE FROM port_allocations');
+    await pool.query('DELETE FROM deployments');
+    await pool.query(
+      `INSERT INTO deployments (id, host_id, ports) VALUES
+       ('dep-old', 'host-1', NULL),
+       ('dep-new', 'host-1', '{"8081": 3000}'::jsonb)`,
+    );
+    await pool.query(
+      `INSERT INTO port_allocations (host_id, port, deployment_id)
+       VALUES ('host-1', 8081, 'dep-new')`,
+    );
+    const settlement = await settleRollbackPorts(pool, 'dep-new', 'dep-old');
+    expect(settlement).toEqual({ released: 1, restored: 0, skipped: 0, ports: [] });
+  });
+
+  it('unknown target deployment throws', async () => {
+    await expect(settleRollbackPorts(pool, 'dep-new', 'dep-missing')).rejects.toThrow(
+      /not found/,
+    );
   });
 });
