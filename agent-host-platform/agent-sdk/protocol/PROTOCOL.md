@@ -480,7 +480,7 @@ Canonical event types: `agent.connected`, `agent.disconnected`,
 `deployment.failed`, `deployment.rolled_back`, `service.started`,
 `service.stopped`, `service.restarted`, `host.registered`, `host.online`,
 `host.offline`, `healthcheck.passed`, `healthcheck.failed`,
-`worker.updated`, `secret.updated`.
+`worker.updated`, `secret.changed`, `secret.deleted`.
 
 ### 3.9 Misc
 
