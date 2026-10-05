@@ -1,0 +1,30 @@
+[Unit]
+Description=Universal AGT host worker (outbound-only deployment agent)
+Documentation=https://github.com/kilomene/Universal-AGT
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=agenthost
+Group=agenthost
+WorkingDirectory=/opt/agent-host/worker
+EnvironmentFile=/opt/agent-host/config/worker.env
+ExecStart=/usr/bin/python3 -m agent.main --config /opt/agent-host/config/worker.env
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# Hardening: the worker needs docker + outbound HTTPS only.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/agent-host /srv/agent-apps /var/run/docker.sock
+# Keep the journal readable for heartbeat verification.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
