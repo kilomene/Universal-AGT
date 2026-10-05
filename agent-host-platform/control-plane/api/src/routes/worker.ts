@@ -25,6 +25,49 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// First-appearance dedupe for worker-reported crash loops: the heartbeat
+// payload keeps carrying the issue while the flag stands, but the
+// service.crash_loop event fires once per (host, deployment) per process.
+const crashLoopSeen = new Set<string>();
+export function resetCrashLoopSeenForTests(): void {
+  crashLoopSeen.clear();
+}
+
+async function emitWorkerIssues(
+  pool: Pool,
+  hostId: string,
+  hostName: string,
+  issues: unknown,
+): Promise<void> {
+  if (!Array.isArray(issues)) return;
+  for (const issue of issues) {
+    if (typeof issue !== 'object' || issue === null) continue;
+    const rec = issue as Record<string, unknown>;
+    if (rec.issue !== 'crash_loop') continue; // unknown issue kinds: ignored
+    const deploymentId = typeof rec.deployment_id === 'string' ? rec.deployment_id : null;
+    if (!deploymentId) continue;
+    const key = `${hostId}:${deploymentId}`;
+    if (crashLoopSeen.has(key)) continue;
+    crashLoopSeen.add(key);
+    await appendEvent(pool, {
+      type: 'service.crash_loop',
+      actor_type: 'host',
+      actor_id: hostName,
+      deployment_id: deploymentId,
+      host_id: hostId,
+      payload: {
+        project: typeof rec.project === 'string' ? rec.project : null,
+        container: typeof rec.container === 'string' ? rec.container : null,
+        restarts: typeof rec.restarts === 'number' ? rec.restarts : null,
+      },
+    });
+    logger.warn('service entered crash loop', {
+      host: hostName,
+      deployment: deploymentId,
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // POST /v1/hosts/:id/heartbeat — HOST token only; the token must belong to
 // the host identified in the path.
@@ -47,11 +90,14 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
       next(new HttpError(404, 'not_found', 'host not found'));
       return;
     }
-    const wasOnline = current.rows[0].status === 'online';
+    const prevStatus: string = current.rows[0].status;
+    // A heartbeat revives offline/degraded hosts to online, but NEVER
+    // overwrites an operator-set `draining` state.
+    const revived = prevStatus === 'offline' || prevStatus === 'degraded';
 
     await pool.query(
       `UPDATE hosts SET
-         status = 'online',
+         status = CASE WHEN status = 'draining' THEN 'draining' ELSE 'online' END,
          cpu_pct = COALESCE($2, cpu_pct),
          ram_pct = COALESCE($3, ram_pct),
          disk_pct = COALESCE($4, disk_pct),
@@ -77,16 +123,19 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
       ],
     );
 
-    if (!wasOnline) {
+    if (revived) {
       await appendEvent(pool, {
         type: 'host.online',
         actor_type: 'host',
         actor_id: req.auth!.name,
         host_id: hostId,
-        payload: {},
+        payload: { previous_status: prevStatus },
       });
-      logger.info('host came online', { host: req.auth!.name });
+      logger.info('host came online', { host: req.auth!.name, from: prevStatus });
     }
+
+    // Worker-reported issues (e.g. crash loops) -> events, first appearance.
+    await emitWorkerIssues(pool, hostId, req.auth!.name, body.issues);
 
     // pending_tasks: queued work this host may claim.
     const pending = await pool.query(
