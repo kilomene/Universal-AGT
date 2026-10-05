@@ -38,6 +38,38 @@
   </div>
 
   <main class="grid">
+    <!-- Overview: derived from the same polled endpoints as the panels below.
+         No new API endpoints were added for it. -->
+    <section class="panel wide strip" aria-label="Overview">
+      <div class="stat"><span class="stat-val" id="statHosts">&mdash;</span><span class="stat-label">Hosts online</span></div>
+      <div class="stat"><span class="stat-val" id="statAgents">&mdash;</span><span class="stat-label">Agents active (15m)</span></div>
+      <div class="stat"><span class="stat-val" id="statApps">&mdash;</span><span class="stat-label">Apps running</span></div>
+      <div class="stat"><span class="stat-val" id="statDeployments">&mdash;</span><span class="stat-label">Active deployments</span></div>
+      <div class="stat"><span class="stat-val" id="statFailed">&mdash;</span><span class="stat-label">Failed deploys (24h)</span></div>
+      <div class="stat"><span class="stat-val" id="statApprovals">&mdash;</span><span class="stat-label">Pending approvals</span></div>
+    </section>
+
+    <section class="panel wide" aria-label="Approvals">
+      <div class="panel-head">
+        <h2>Approvals</h2>
+        <span class="updated" id="approvalsUpdated"></span>
+      </div>
+      <p class="panel-error" id="approvalsError" hidden></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Task</th><th>Type</th><th>Project</th><th>Version</th>
+              <th>Host</th><th>Requested</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="approvalsBody">
+            <tr class="empty"><td colspan="7">Nothing awaiting approval.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="panel wide" aria-label="Hosts">
       <div class="panel-head">
         <h2>Hosts</h2>
@@ -70,11 +102,11 @@
           <thead>
             <tr>
               <th>Service</th><th>Version</th><th>Status</th><th>Health</th>
-              <th>Host</th><th>Ports</th><th>Domains</th>
+              <th>Host</th><th>Ports</th><th>Domains</th><th>Actions</th>
             </tr>
           </thead>
           <tbody id="servicesBody">
-            <tr class="empty"><td colspan="7">No running services.</td></tr>
+            <tr class="empty"><td colspan="8">No running services.</td></tr>
           </tbody>
         </table>
       </div>
@@ -116,6 +148,28 @@
       </div>
     </section>
 
+    <!-- No GET /v1/agents list endpoint exists in the control-plane API
+         (only /agents/register, /agents/me, /agents/me/rotate), so there is
+         no agents table. "Agents active" is derived from recent events in the
+         overview strip instead. -->
+    <section class="panel" aria-label="Projects">
+      <div class="panel-head">
+        <h2>Projects</h2>
+        <span class="updated" id="projectsUpdated"></span>
+      </div>
+      <p class="panel-error" id="projectsError" hidden></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Owner</th><th>Runtime</th><th>Updated</th></tr>
+          </thead>
+          <tbody id="projectsBody">
+            <tr class="empty"><td colspan="4">No projects.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="panel wide" aria-label="Live events">
       <div class="panel-head">
         <h2>Live events</h2>
@@ -125,6 +179,20 @@
       <ul id="eventsList" class="events" aria-live="polite"></ul>
     </section>
   </main>
+
+  <!-- Approve confirmation modal: summarizes exactly what the approval will
+       deploy, and where, before the mutating POST is sent. -->
+  <div id="approveModal" class="overlay" hidden>
+    <div class="auth-card modal-card" role="dialog" aria-modal="true" aria-labelledby="approveModalTitle">
+      <h1 id="approveModalTitle">Approve deployment?</h1>
+      <div id="approveModalSummary" class="modal-summary"></div>
+      <p id="approveModalResult" class="modal-result" hidden></p>
+      <div class="modal-actions">
+        <button id="approveModalCancel" class="btn" type="button">Cancel</button>
+        <button id="approveModalConfirm" class="btn primary" type="button">Approve &amp; queue</button>
+      </div>
+    </div>
+  </div>
 
   <footer class="foot">
     <span class="muted">Universal AGT dashboard &middot; panels refresh every 10s &middot;
