@@ -358,6 +358,11 @@ export class UahtClient {
   listDomains(deploymentId) {
     return this._get("/domains", { deployment_id: deploymentId });
   }
+  // Fetch one domain's lifecycle row: status, dns_configured,
+  // tunnel_configured, https_reachable, verified_at, error.
+  getDomain(hostname) {
+    return this._get(`/domains/${encodeURIComponent(hostname)}`);
+  }
   removeDomain(deploymentId, hostname) {
     return this._delete("/domains", { deployment_id: deploymentId, hostname });
   }
