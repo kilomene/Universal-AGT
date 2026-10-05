@@ -5,7 +5,9 @@ import subprocess
 import sys
 
 SUBCOMMANDS = ["hosts", "apps", "deploy", "logs", "restart", "stop", "start",
-               "status", "rollback", "tasks", "events"]
+               "status", "rollback", "domains", "tasks", "events",
+               "agents", "projects", "deployments", "approve", "reject",
+               "cancel", "secrets"]
 
 failures = []
 invocations = [["agent-host", "--help"]] + [["agent-host", c, "--help"] for c in SUBCOMMANDS]
