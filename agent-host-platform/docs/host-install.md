@@ -148,6 +148,40 @@ plane is reachable again; and a container that restarts
 (`crash_loop`) rather than restarted forever — redeploy or clear the flag
 to recover it.
 
+## Public ingress (optional, Phase 7)
+
+Disabled by default. To serve public hostnames from this host through a
+worker-managed Cloudflare tunnel (outbound-only — the host dials out, no
+inbound ports):
+
+1. Create the tunnel in the Cloudflare dashboard (**Zero Trust → Networks
+   → Tunnels → Create a tunnel**), copy the **tunnel token**, note the
+   tunnel hostname (`<tunnel-id>.cfargotunnel.com`), and add each public
+   hostname in the tunnel's **Public hostnames** tab (required for
+   dashboard-created token tunnels).
+2. On the control plane, set `CLOUDFLARE_API_TOKEN`,
+   `CLOUDFLARE_ZONE_ID`, and `TUNNEL_INGRESS_HOSTNAME=<tunnel-id>.cfargotunnel.com`.
+3. On the host, add to `/etc/uagt/worker.env` (mode `0600`):
+
+```bash
+WORKER_INGRESS_ENABLED=true
+WORKER_INGRESS_PROVIDER=cloudflare-tunnel
+UAHT_TUNNEL_TOKEN=<tunnel token from step 1>   # never in the repo, never logged
+```
+
+   (or pass `UAHT_INGRESS_ENABLED=1 UAHT_TUNNEL_TOKEN=...` to
+   `scripts/install-host.sh` at install time)
+4. Restart the worker, then request domains with `--ingress tunnel`:
+
+```bash
+agent-host domains add --deployment <id> --hostname api.example.com --ingress tunnel
+```
+
+The worker downloads `cloudflared` (pinned release, SHA-256 verified) if
+needed, starts the supervised tunnel, and syncs `hostname →
+http://127.0.0.1:<container-port>` routes on every tunnel-mode domain
+change. Full story (including the honest limits): `docs/cloudflare.md`.
+
 ## Updating
 
 The worker self-updates: the control plane advertises the current worker
