@@ -62,7 +62,7 @@ class IngressConfig:
 
         WORKER_INGRESS_ENABLED=true
         WORKER_INGRESS_PROVIDER=cloudflare-tunnel
-        UAHT_TUNNEL_TOKEN=<redacted>   # from the Cloudflare dashboard; never in the repo
+        WORKER_TUNNEL_TOKEN=<redacted>   # from the Cloudflare dashboard; never in the repo
     """
 
     enabled: bool = False
@@ -83,9 +83,10 @@ class IngressConfig:
         if self.provider == "cloudflare-tunnel" and not self.tunnel_token:
             raise ConfigError(
                 "ingress provider 'cloudflare-tunnel' is enabled but no "
-                "tunnel token is configured: set UAHT_TUNNEL_TOKEN in the "
-                "host environment (the token shown when you create the "
-                "tunnel in the Cloudflare dashboard). Refusing to start "
+                "tunnel token is configured: set WORKER_TUNNEL_TOKEN in the "
+                "host worker.env (the installer accepts UAHT_TUNNEL_TOKEN; "
+                "it is the token shown when you create the tunnel in the "
+                "Cloudflare dashboard). Refusing to start "
                 "ingress without it."
             )
 
