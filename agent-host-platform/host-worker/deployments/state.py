@@ -6,14 +6,20 @@ Each deployment gets a directory:
 The registry is the worker's local view of what it runs; the control
 plane database remains the source of truth. Env values that came from
 task secrets are NEVER persisted here — only non-secret env is stored.
+
+A corrupt state.json never crashes the worker: it is quarantined aside
+with a timestamp suffix and treated as absent.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Optional
+
+LOG = logging.getLogger("agent-host-worker.state")
 
 
 class DeploymentStore:
@@ -40,8 +46,24 @@ class DeploymentStore:
         path = self._state_path(deployment_id)
         if not path.exists():
             return None
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            self._quarantine(path, exc)
+            return None
+
+    def _quarantine(self, path: Path, exc: Exception) -> None:
+        """Move a corrupt state file aside; never crash on bad local data."""
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup = path.with_name(f"{path.name}.corrupt-{stamp}")
+        try:
+            os.replace(path, backup)
+            LOG.warning("quarantined corrupt state file %s -> %s (%s)",
+                        path, backup.name, exc)
+        except OSError as move_exc:
+            LOG.error("could not quarantine corrupt state file %s: %s",
+                      path, move_exc)
 
     def list_all(self) -> list:
         states = []
