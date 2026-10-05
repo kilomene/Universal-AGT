@@ -55,8 +55,19 @@ client.delete_secret("proj-uuid", "DB_PASSWORD")
 ## Live event stream
 
 ```python
-for event in client.stream_events():
+for event in client.stream_events(since="2026-10-05T00:00:00Z"):
     print(event["type"], event.get("deployment_id") or event.get("task_id"))
+```
+
+## Logs
+
+```python
+# Create a `logs` task for a deployment and poll it to terminal.
+text = client.get_logs(deployment_id="dep-uuid")
+
+# Or poll an existing logs task by id, and stream chunks as they arrive:
+for chunk in client.get_logs(task_id="task-uuid", follow=True):
+    print(chunk, end="")
 ```
 
 ## Error shape
