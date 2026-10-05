@@ -40,6 +40,7 @@ import re
 import shutil
 import socket
 import tarfile
+import threading
 import time
 import uuid
 import zipfile
@@ -186,6 +187,89 @@ def pick_free_port(used: set, log=None) -> int:
         if port not in used:
             return port
     raise DeployError("could not find a free host port after 20 attempts")
+
+
+# ---------------------------------------------------------------------------
+# Process-wide host-port reservation (spec §42).
+#
+# pick_free_port(store.used_host_ports()) is a check-then-act race when two
+# deploy() calls run on threads in the same worker process (the production
+# claim loop dispatches on a ThreadPoolExecutor): both can read the same
+# store state and pick the same port before either container binds it. The
+# physical port checks catch the collision, but the losing deployment then
+# fails spuriously.
+#
+# Reservation closes the race: a picked port is reserved process-wide from
+# pick time until the deployment's own state row (which then carries the
+# host_port) is persisted — later picks consult the store AND the
+# reservation set. Compose deployments declare their own ports, so they
+# reserve their declared ports for the same window instead of picking.
+# ---------------------------------------------------------------------------
+_port_alloc_lock = threading.Lock()
+_port_reservations: dict[int, str] = {}  # host_port -> deployment_id
+
+
+def reserve_free_port(store, log=None, deployment_id="") -> int:
+    """Pick a free host port and reserve it for this deployment."""
+    with _port_alloc_lock:
+        used = set(store.used_host_ports()) | set(_port_reservations)
+        port = pick_free_port(used, log=log)
+        _port_reservations[port] = deployment_id
+        return port
+
+
+def reserve_declared_ports(ports, deployment_id="") -> list[int]:
+    """Reserve app-declared (compose) host ports for this deployment.
+
+    Refuses when another in-flight deployment already reserved one of
+    them — a genuine collision, failed loudly before `compose up`.
+    """
+    wanted = sorted({int(p) for p in ports or []})
+    with _port_alloc_lock:
+        dupes = [p for p in wanted if p in _port_reservations]
+        if dupes:
+            raise DeployError(
+                f"host port(s) {dupes} already reserved by a concurrent "
+                f"deployment; refusing to collide")
+        for p in wanted:
+            _port_reservations[p] = deployment_id
+    return wanted
+
+
+def release_port_reservations(ports) -> None:
+    """Release reservations; safe to call with None/empty/duplicates."""
+    with _port_alloc_lock:
+        for p in ports or []:
+            try:
+                _port_reservations.pop(int(p), None)
+            except (TypeError, ValueError):
+                pass
+
+
+def reserved_port_snapshot() -> set:
+    """Current reservations (for registry_used-style collision checks)."""
+    with _port_alloc_lock:
+        return set(_port_reservations)
+
+
+# ---------------------------------------------------------------------------
+# Per-artifact download lock (spec §42).
+#
+# Two concurrent deploys of the SAME artifact_id write to the same
+# artifacts/<id>.bin. Without serialization the bytes interleave and the
+# SHA-256 verification fails (or worse, passes on a torn file neither
+# deploy intended). One lock per artifact_id; different artifacts download
+# fully in parallel.
+# ---------------------------------------------------------------------------
+_artifact_dl_guard = threading.Lock()
+_artifact_dl_locks: dict[str, threading.Lock] = {}
+
+
+def artifact_download_lock(artifact_id: str) -> threading.Lock:
+    """Process-wide mutex for downloading one artifact id."""
+    with _artifact_dl_guard:
+        return _artifact_dl_locks.setdefault(str(artifact_id),
+                                             threading.Lock())
 
 
 # Fields of the persisted deployment contract every docker-run rebuild must
@@ -339,6 +423,50 @@ def sanitize_env(env: dict, log=None) -> dict:
 # Deploy handler
 # ---------------------------------------------------------------------------
 
+def _fetch_verified_artifact(ctx, log, work_dir: Path, artifact_id: str,
+                            payload: dict, state_dir: Path) -> str:
+    """Download + SHA-256-verify + extract one artifact.
+
+    Serialized per artifact_id (spec §42): concurrent deploys of the SAME
+    artifact would otherwise interleave writes into artifacts/<id>.bin and
+    corrupt each other's download. Different artifacts download fully in
+    parallel. Extraction reads the shared dest file, so it stays inside
+    the lock; the extract target itself is per-deployment.
+
+    Returns the extraction directory. Raises DeployError before ANY docker
+    interaction on checksum failure (the bad bytes are quarantined).
+    """
+    expected_checksum = payload.get("artifact_checksum")
+    if not expected_checksum:
+        raise DeployError(
+            "refusing to deploy: payload has artifact_id but no "
+            "artifact_checksum; unverified artifacts are never executed"
+        )
+    with artifact_download_lock(artifact_id):
+        artifacts_dir = work_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        dest = str(artifacts_dir / f"{artifact_id}.bin")
+        log(f"downloading artifact {artifact_id}")
+        ctx.api.download_artifact(
+            artifact_id, dest, expected_size=payload.get("artifact_size")
+        )
+        log("verifying SHA-256")
+        if not verify_checksum(dest, expected_checksum):
+            quarantine = work_dir / QUARANTINE_DIRNAME
+            quarantine.mkdir(parents=True, exist_ok=True)
+            qpath = quarantine / f"{artifact_id}-{int(time.time())}.bin"
+            shutil.move(dest, qpath)
+            raise DeployError(
+                f"artifact checksum mismatch for {artifact_id}; "
+                f"quarantined at {qpath}, no docker interaction performed"
+            )
+        log("checksum OK")
+        extract_dir = str(state_dir / "source")
+        log(f"extracting artifact to {extract_dir}")
+        extract_archive(dest, extract_dir)
+    return extract_dir
+
+
 def deploy(ctx, task: dict) -> dict:
     payload = task.get("payload") or {}
     task_id = task.get("id", "unknown")
@@ -352,10 +480,22 @@ def deploy(ctx, task: dict) -> dict:
     if not project_id or not project_name or not version:
         raise DeployError("deploy payload needs project_id, project_name and version")
 
+    # Active scrubber for this thread. The dispatcher installs its task
+    # scrubber thread-locally (WorkerContext.scrub_scope); reading it via
+    # effective_scrub() keeps concurrent dispatches on the shared ctx from
+    # clobbering each other (spec §42). Duck-typed ctxs in unit tests may
+    # lack effective_scrub; fall back to the plain attribute there (those
+    # tests are single-threaded by construction).
+    _get_effective = getattr(ctx, "effective_scrub", None)
+
+    def _active_scrub():
+        return _get_effective() if _get_effective else ctx.scrub
+
     def log(line: str) -> None:
-        ctx.log(task_id, line)  # ctx.log scrubs secrets before writing
+        clean = _active_scrub()(line)
+        ctx.log(task_id, clean)  # ctx.log re-applies the task scrubber; idempotent
         try:
-            ctx.log_store.append_deployment(deployment_id, ctx.scrub(line))
+            ctx.log_store.append_deployment(deployment_id, clean)
         except OSError:
             pass
 
@@ -382,33 +522,8 @@ def deploy(ctx, task: dict) -> dict:
     built_image = image_tag or f"uaht-{safe_project}:{safe_version}"
 
     if artifact_id:
-        expected_checksum = payload.get("artifact_checksum")
-        if not expected_checksum:
-            raise DeployError(
-                "refusing to deploy: payload has artifact_id but no "
-                "artifact_checksum; unverified artifacts are never executed"
-            )
-        artifacts_dir = work_dir / "artifacts"
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        dest = str(artifacts_dir / f"{artifact_id}.bin")
-        log(f"downloading artifact {artifact_id}")
-        ctx.api.download_artifact(
-            artifact_id, dest, expected_size=payload.get("artifact_size")
-        )
-        log("verifying SHA-256")
-        if not verify_checksum(dest, expected_checksum):
-            quarantine = work_dir / QUARANTINE_DIRNAME
-            quarantine.mkdir(parents=True, exist_ok=True)
-            qpath = quarantine / f"{artifact_id}-{int(time.time())}.bin"
-            shutil.move(dest, qpath)
-            raise DeployError(
-                f"artifact checksum mismatch for {artifact_id}; "
-                f"quarantined at {qpath}, no docker interaction performed"
-            )
-        log("checksum OK")
-        extract_dir = str(state_dir / "source")
-        log(f"extracting artifact to {extract_dir}")
-        extract_archive(dest, extract_dir)
+        extract_dir = _fetch_verified_artifact(
+            ctx, log, work_dir, artifact_id, payload, state_dir)
         file_manifest = Path(extract_dir) / MANIFEST_FILENAME
         if file_manifest.exists():
             import json
@@ -462,13 +577,24 @@ def deploy(ctx, task: dict) -> dict:
     # W11: register the API-fetched secret values with the active log
     # scrubber. The dispatcher built its scrubber before this handler ran,
     # so it only covers payload-carried secrets + the host token; these
-    # pulled values flow into docker argv and container-log tails from here
-    # on and must be redacted everywhere too. The dispatcher restores
-    # ctx.scrub after the task, so this chaining cannot leak across tasks.
-    # (Deliberately not restored on raise paths: the dispatcher's failure
-    # logging must keep redacting these values as well.)
+    # pulled values flow into docker argv (`-e KEY=VALUE`, visible in
+    # DockerError messages) and container-log tails from here on and must
+    # be redacted everywhere too.
+    #
+    # Installed thread-locally on a real WorkerContext (extend_scrub) so
+    # concurrent dispatches on the shared ctx cannot leak each other's
+    # secrets (spec §42); on duck-typed test ctxs the historical
+    # ctx.scrub assignment is kept. Deliberately not restored on raise
+    # paths: the dispatcher's failure logging must keep redacting these
+    # values as well. The dispatcher's scrub_scope() restores the thread's
+    # pre-task scrubber when the task ends.
     if fetched_secrets:
-        ctx.scrub = _chain_secret_scrubber(ctx.scrub, fetched_secrets.values())
+        chained = _chain_secret_scrubber(_active_scrub(),
+                                         fetched_secrets.values())
+        if hasattr(ctx, "extend_scrub"):
+            ctx.extend_scrub(chained)
+        else:
+            ctx.scrub = chained
 
     # -- 3. host resource check (admission control on RESERVED resources) ----
     # allocated = sum of reservations from running deployments' manifests
@@ -523,6 +649,11 @@ def deploy(ctx, task: dict) -> dict:
         log("no previous healthy deployment; rollback target: none")
 
     # -- 5. build ------------------------------------------------------------
+    # Process-wide port reservations taken below (compose-declared ports,
+    # or the picked / control-plane-requested single-container port) are
+    # held until the deployment's state row is persisted; the finally in
+    # section 8 releases them on every path.
+    reserved_ports: list[int] = []
     effective_health_port = None  # for compose-discovered ports
     compose_file = None
     compose_project_name = None
@@ -604,8 +735,14 @@ def deploy(ctx, task: dict) -> dict:
                     continue
         verify_compose_ports_free(docker, compose_project_name, wanted_ports,
                                   log=log,
-                                  registry_used=store.used_host_ports()
-                                  - previous_ports)
+                                  registry_used=(store.used_host_ports()
+                                                 - previous_ports)
+                                  | reserved_port_snapshot())
+        # Reserve the declared ports process-wide: a concurrent
+        # single-container deploy must not pick one of them (spec §42).
+        # Released in the section-8 finally once this deployment's state
+        # row (carrying compose_ports) is persisted.
+        reserved_ports = reserve_declared_ports(wanted_ports, deployment_id)
         compose_ports = sorted(wanted_ports) or None
         log(f"docker compose up: {compose_file} (project {compose_project_name})")
         docker.compose_up(compose_file, project_name=compose_project_name,
@@ -634,85 +771,195 @@ def deploy(ctx, task: dict) -> dict:
         raise DeployError(f"unsupported runtime: {runtime!r}")
 
     # -- 6. run new container (compose runtime already running) -------------
+    # Sections 6-8 run under the port reservation: it bridges the gap
+    # between picking a port and persisting the deployment state row
+    # that records it. The finally releases it on every path — on
+    # success the state row itself keeps the port out of later picks;
+    # on failure the port is genuinely free again.
     new_container_started = False
     host_port = None
-    if runtime == "docker-compose":
-        host_port = effective_health_port
-    else:
-        requested = payload.get("requested_host_port")
-        if requested is not None:
-            # Fixed port reserved in the control plane's port registry for
-            # this deployment: use it, after verifying it is really free.
-            try:
-                requested_port = int(requested)
-            except (TypeError, ValueError):
-                raise DeployError(
-                    f"invalid requested_host_port {requested!r}; "
-                    f"expected an integer 1-65535"
-                )
-            if not 1 <= requested_port <= 65535:
-                raise DeployError(
-                    f"invalid requested_host_port {requested!r}; "
-                    f"expected an integer 1-65535"
-                )
-            host_port = requested_port
-            log(f"using registry-reserved host port {host_port}")
+    try:
+        if runtime == "docker-compose":
+            host_port = effective_health_port
         else:
-            host_port = pick_free_port(store.used_host_ports(), log=log)
-        verify_host_port_free(docker, host_port, log=log)
-        if docker.container_exists(container_name):
-            log(f"removing stale container {container_name}")
+            requested = payload.get("requested_host_port")
+            if requested is not None:
+                # Fixed port reserved in the control plane's port registry for
+                # this deployment: use it, after verifying it is really free.
+                try:
+                    requested_port = int(requested)
+                except (TypeError, ValueError):
+                    raise DeployError(
+                        f"invalid requested_host_port {requested!r}; "
+                        f"expected an integer 1-65535"
+                    )
+                if not 1 <= requested_port <= 65535:
+                    raise DeployError(
+                        f"invalid requested_host_port {requested!r}; "
+                        f"expected an integer 1-65535"
+                    )
+                host_port = requested_port
+                log(f"using registry-reserved host port {host_port}")
+                # Also reserve process-wide: a concurrent auto-pick must
+                # not take this port (spec §42).
+                reserved_ports = reserve_declared_ports([host_port],
+                                                       deployment_id)
+            else:
+                host_port = reserve_free_port(store, log=log,
+                                              deployment_id=deployment_id)
+                reserved_ports = [host_port]
+            verify_host_port_free(docker, host_port, log=log)
+            if docker.container_exists(container_name):
+                log(f"removing stale container {container_name}")
+                docker.stop(container_name)
+                docker.rm(container_name)
+            log(f"docker run: name={container_name} image={built_image} "
+                f"port {host_port}->{container_port}")
+            docker.run(
+                container_name, built_image,
+                ports={host_port: container_port},
+                env=run_env,
+                memory=resources.get("memory"),
+                cpus=str(resources["cpu"]) if resources.get("cpu") else None,
+                restart=restart_policy,
+            )
+            new_container_started = True
+
+        # -- 7. healthcheck -------------------------------------------------------
+        health_timeout = int(payload.get("healthcheck_timeout", 120))
+        log(f"healthcheck: GET :{host_port}{healthcheck_path} "
+            f"(timeout {health_timeout}s)")
+        healthy = health_checker.wait_for_healthcheck(
+            host_port, healthcheck_path, timeout_secs=health_timeout, log=log)
+
+        action = decide_rollback(healthy, previous)
+        if action == "keep_new":
+            if previous and previous.get("container_name"):
+                log(f"new version healthy; stopping previous "
+                    f"{previous['container_name']} (kept for rollback)")
+                docker.stop(previous["container_name"])
+                prev_state = store.load(previous["deployment_id"]) or previous
+                prev_state["status"] = "superseded"
+                store.save(prev_state)
+            state = {
+                "deployment_id": deployment_id,
+                "task_id": task_id,
+                "project_id": project_id,
+                "project_name": project_name,
+                "version": version,
+                "container_name": container_name if new_container_started else None,
+                "compose_project": compose_project_name,
+                "compose_file": compose_file,
+                "compose_ports": compose_ports,
+                "image": built_image,
+                "image_built": image_built,  # GC may only remove images we built
+                "runtime": runtime,
+                "host_port": host_port,
+                "container_port": container_port,
+                # Full deployment contract (W4): every later rebuild of this
+                # deployment — env updates, restarts, post-reboot reconcile —
+                # derives its run behavior from THESE fields via
+                # run_spec_from_state(), never from hard-coded defaults or
+                # re-derived `docker inspect` output.
+                "ports": {str(host_port): container_port} if host_port else None,
+                "restart": restart_policy,
+                "resources": {
+                    "cpu": resources.get("cpu"),
+                    "memory": resources.get("memory"),
+                },
+                "volumes": manifest_data.get("volumes"),
+                "healthcheck": manifest_data.get("healthcheck"),
+                "domains": manifest_data.get("domains"),
+                "manifest": manifest_data,
+                "healthcheck_path": healthcheck_path,
+                "env": manifest_env,  # secrets deliberately NOT persisted
+                "status": "running",
+                "health_status": "healthy",
+                "previous_deployment_id": (previous or {}).get("deployment_id"),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            store.save(state)
+            log(f"deploy OK: {project_name} {version} healthy on :{host_port}")
+            # Garbage-collect superseded generations AFTER the successful
+            # deploy — never during. Keeps DEPLOY_KEEP_GENERATIONS (default 2)
+            # newest generations per project.
+            try:
+                gc_summary = gc.collect_garbage(ctx, log=log)
+                removed = (len(gc_summary["removed_containers"])
+                           + len(gc_summary["removed_images"]))
+                if removed:
+                    log(f"gc: removed {len(gc_summary['removed_containers'])} "
+                        f"container(s), {len(gc_summary['removed_images'])} "
+                        f"image(s)")
+            except Exception as exc:  # GC must never fail a good deploy
+                log(f"gc error (non-fatal): {exc}")
+            return {
+                "deployment_id": deployment_id,
+                "status": "running",
+                "health_status": "healthy",
+                "ports": {str(host_port): container_port},
+            }
+
+        # -- 8. failure: remove new, roll back ------------------------------------
+        log("healthcheck failed; rolling back")
+        if runtime == "docker-compose" and compose_project_name:
+            # Tear down the NEW unhealthy compose stack first — it must not
+            # keep running (and holding ports) after a failed deploy.
+            log(f"tearing down failed compose stack {compose_project_name}")
+            try:
+                docker.compose_down(compose_file, project_name=compose_project_name)
+            except Exception as exc:
+                log(f"compose down of failed stack failed (continuing): {exc}")
+        if new_container_started:
+            container_logs = ""
+            try:
+                container_logs = docker.logs(container_name, tail=200)
+            except Exception:
+                pass
+            if container_logs:
+                log(f"failed container logs (tail):\n{container_logs[-4000:]}")
             docker.stop(container_name)
-            docker.rm(container_name)
-        log(f"docker run: name={container_name} image={built_image} "
-            f"port {host_port}->{container_port}")
-        docker.run(
-            container_name, built_image,
-            ports={host_port: container_port},
-            env=run_env,
-            memory=resources.get("memory"),
-            cpus=str(resources["cpu"]) if resources.get("cpu") else None,
-            restart=restart_policy,
-        )
-        new_container_started = True
-
-    # -- 7. healthcheck -------------------------------------------------------
-    health_timeout = int(payload.get("healthcheck_timeout", 120))
-    log(f"healthcheck: GET :{host_port}{healthcheck_path} "
-        f"(timeout {health_timeout}s)")
-    healthy = health_checker.wait_for_healthcheck(
-        host_port, healthcheck_path, timeout_secs=health_timeout, log=log)
-
-    action = decide_rollback(healthy, previous)
-    if action == "keep_new":
-        if previous and previous.get("container_name"):
-            log(f"new version healthy; stopping previous "
-                f"{previous['container_name']} (kept for rollback)")
-            docker.stop(previous["container_name"])
-            prev_state = store.load(previous["deployment_id"]) or previous
-            prev_state["status"] = "superseded"
+            docker.rm(container_name, force=True)
+        rolled_back_to = None
+        if action == "rollback_to_previous" and previous:
+            prev_name = previous.get("container_name")
+            prev_compose = previous.get("compose_project")
+            if prev_name:
+                log(f"restarting previous container {prev_name}")
+                docker.start(prev_name)
+            elif prev_compose:
+                prev_file = previous.get("compose_file")
+                if not prev_file or not os.path.isfile(prev_file):
+                    raise DeployError(
+                        f"healthcheck failed for {project_name} {version} and "
+                        f"the previous compose stack {prev_compose} cannot be "
+                        f"restored: its compose file "
+                        f"{prev_file!r} is missing (redeploy required)"
+                    )
+                log(f"restoring previous compose stack {prev_compose} "
+                    f"from {prev_file}")
+                docker.compose_up(prev_file, project_name=prev_compose, build=True)
+            prev_state = store.load(previous["deployment_id"]) or dict(previous)
+            prev_state["status"] = "running"
+            prev_state["health_status"] = "healthy"
             store.save(prev_state)
-        state = {
+            rolled_back_to = previous["deployment_id"]
+        store.save({
             "deployment_id": deployment_id,
             "task_id": task_id,
             "project_id": project_id,
             "project_name": project_name,
             "version": version,
-            "container_name": container_name if new_container_started else None,
-            "compose_project": compose_project_name,
+            "container_name": None,
+            "compose_project": None,
             "compose_file": compose_file,
             "compose_ports": compose_ports,
             "image": built_image,
-            "image_built": image_built,  # GC may only remove images we built
+            "image_built": image_built,
             "runtime": runtime,
-            "host_port": host_port,
+            "host_port": None,
             "container_port": container_port,
-            # Full deployment contract (W4): every later rebuild of this
-            # deployment — env updates, restarts, post-reboot reconcile —
-            # derives its run behavior from THESE fields via
-            # run_spec_from_state(), never from hard-coded defaults or
-            # re-derived `docker inspect` output.
-            "ports": {str(host_port): container_port} if host_port else None,
+            "ports": None,
             "restart": restart_policy,
             "resources": {
                 "cpu": resources.get("cpu"),
@@ -723,116 +970,20 @@ def deploy(ctx, task: dict) -> dict:
             "domains": manifest_data.get("domains"),
             "manifest": manifest_data,
             "healthcheck_path": healthcheck_path,
-            "env": manifest_env,  # secrets deliberately NOT persisted
-            "status": "running",
-            "health_status": "healthy",
-            "previous_deployment_id": (previous or {}).get("deployment_id"),
+            "env": manifest_env,
+            "status": "rolled_back" if rolled_back_to else "failed",
+            "health_status": "unhealthy",
+            "rollback_of": rolled_back_to,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        store.save(state)
-        log(f"deploy OK: {project_name} {version} healthy on :{host_port}")
-        # Garbage-collect superseded generations AFTER the successful
-        # deploy — never during. Keeps DEPLOY_KEEP_GENERATIONS (default 2)
-        # newest generations per project.
-        try:
-            gc_summary = gc.collect_garbage(ctx, log=log)
-            removed = (len(gc_summary["removed_containers"])
-                       + len(gc_summary["removed_images"]))
-            if removed:
-                log(f"gc: removed {len(gc_summary['removed_containers'])} "
-                    f"container(s), {len(gc_summary['removed_images'])} "
-                    f"image(s)")
-        except Exception as exc:  # GC must never fail a good deploy
-            log(f"gc error (non-fatal): {exc}")
-        return {
-            "deployment_id": deployment_id,
-            "status": "running",
-            "health_status": "healthy",
-            "ports": {str(host_port): container_port},
-        }
-
-    # -- 8. failure: remove new, roll back ------------------------------------
-    log("healthcheck failed; rolling back")
-    if runtime == "docker-compose" and compose_project_name:
-        # Tear down the NEW unhealthy compose stack first — it must not
-        # keep running (and holding ports) after a failed deploy.
-        log(f"tearing down failed compose stack {compose_project_name}")
-        try:
-            docker.compose_down(compose_file, project_name=compose_project_name)
-        except Exception as exc:
-            log(f"compose down of failed stack failed (continuing): {exc}")
-    if new_container_started:
-        container_logs = ""
-        try:
-            container_logs = docker.logs(container_name, tail=200)
-        except Exception:
-            pass
-        if container_logs:
-            log(f"failed container logs (tail):\n{container_logs[-4000:]}")
-        docker.stop(container_name)
-        docker.rm(container_name, force=True)
-    rolled_back_to = None
-    if action == "rollback_to_previous" and previous:
-        prev_name = previous.get("container_name")
-        prev_compose = previous.get("compose_project")
-        if prev_name:
-            log(f"restarting previous container {prev_name}")
-            docker.start(prev_name)
-        elif prev_compose:
-            prev_file = previous.get("compose_file")
-            if not prev_file or not os.path.isfile(prev_file):
-                raise DeployError(
-                    f"healthcheck failed for {project_name} {version} and "
-                    f"the previous compose stack {prev_compose} cannot be "
-                    f"restored: its compose file "
-                    f"{prev_file!r} is missing (redeploy required)"
-                )
-            log(f"restoring previous compose stack {prev_compose} "
-                f"from {prev_file}")
-            docker.compose_up(prev_file, project_name=prev_compose, build=True)
-        prev_state = store.load(previous["deployment_id"]) or dict(previous)
-        prev_state["status"] = "running"
-        prev_state["health_status"] = "healthy"
-        store.save(prev_state)
-        rolled_back_to = previous["deployment_id"]
-    store.save({
-        "deployment_id": deployment_id,
-        "task_id": task_id,
-        "project_id": project_id,
-        "project_name": project_name,
-        "version": version,
-        "container_name": None,
-        "compose_project": None,
-        "compose_file": compose_file,
-        "compose_ports": compose_ports,
-        "image": built_image,
-        "image_built": image_built,
-        "runtime": runtime,
-        "host_port": None,
-        "container_port": container_port,
-        "ports": None,
-        "restart": restart_policy,
-        "resources": {
-            "cpu": resources.get("cpu"),
-            "memory": resources.get("memory"),
-        },
-        "volumes": manifest_data.get("volumes"),
-        "healthcheck": manifest_data.get("healthcheck"),
-        "domains": manifest_data.get("domains"),
-        "manifest": manifest_data,
-        "healthcheck_path": healthcheck_path,
-        "env": manifest_env,
-        "status": "rolled_back" if rolled_back_to else "failed",
-        "health_status": "unhealthy",
-        "rollback_of": rolled_back_to,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    })
-    raise DeployError(
-        f"healthcheck failed for {project_name} {version} "
-        f"(GET :{host_port}{healthcheck_path} never returned 200); "
-        + (f"rolled back to deployment {rolled_back_to}"
-           if rolled_back_to else "no previous healthy deployment to roll back to")
-    )
+        })
+        raise DeployError(
+            f"healthcheck failed for {project_name} {version} "
+            f"(GET :{host_port}{healthcheck_path} never returned 200); "
+            + (f"rolled back to deployment {rolled_back_to}"
+               if rolled_back_to else "no previous healthy deployment to roll back to")
+        )
+    finally:
+        release_port_reservations(reserved_ports)
 
 
 def _discover_compose_port(docker, compose_project: str, log=None) -> Optional[int]:
