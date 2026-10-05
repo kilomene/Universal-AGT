@@ -8,6 +8,18 @@ mechanism that the host dials out to. This package does not pretend
 otherwise: every provider defined here dials OUT. Nothing in this package
 opens a listening socket or accepts inbound connections.
 
+CONTROL AUTHORITY (W9): for token-based (remotely-managed) tunnels — the
+only kind this system runs — the route table that actually moves traffic
+lives in CLOUDFLARE, not on the host. ``cloudflared tunnel --token <TOKEN>
+run`` IGNORES local config.yml ingress rules; it pulls its configuration
+from the edge and picks up a new remote version within seconds, no restart
+needed. The authoritative route table is written by the CONTROL PLANE via
+the Cloudflare tunnel-config API (PUT
+/accounts/{id}/cfd_tunnel/{id}/configurations); the worker's local
+config.yml is a NON-AUTHORITATIVE mirror — an operator checklist and
+debugging artifact, never the routing authority. Nothing in this package
+implies otherwise.
+
 Interface every ingress provider implements::
 
     IngressProvider: name, setup(config), add_route(...), remove_route(...),
@@ -39,11 +51,31 @@ TERMINAL_DEPLOYMENT_STATUSES = frozenset(
 
 #: Hostnames are validated before they ever reach a provider config file —
 #  a crafted hostname must not be able to inject YAML into cloudflared's
-#  config.yml. Same shape as the control plane's isValidHostname.
+#  config.yml. Same shape as the control plane's isValidHostname, including
+#  the W10 hardening (no wildcards, no localhost/internal/special-use
+#  names, no IP literals).
 _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$",
     re.IGNORECASE,
 )
+
+#: Suffixes that must never be routed, mirroring the control plane's
+#: BLOCKED_SUFFIXES (RFC 6761/6762 special-use + internal-only convention).
+_BLOCKED_SUFFIXES = (
+    "localhost",
+    "local",
+    "internal",
+    "invalid",
+    "example",
+    "test",
+    "onion",
+)
+
+
+def _is_blocked_hostname(hostname: str) -> bool:
+    lower = hostname.lower()
+    return any(lower == s or lower.endswith("." + s)
+               for s in _BLOCKED_SUFFIXES)
 
 
 class IngressError(Exception):
@@ -51,7 +83,17 @@ class IngressError(Exception):
 
 
 def is_valid_hostname(hostname) -> bool:
-    return isinstance(hostname, str) and bool(_HOSTNAME_RE.match(hostname))
+    if not isinstance(hostname, str):
+        return False
+    if "*" in hostname:
+        return False
+    if not _HOSTNAME_RE.match(hostname):
+        return False
+    if _is_blocked_hostname(hostname):
+        return False
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname):
+        return False
+    return True
 
 
 @dataclass
@@ -286,11 +328,12 @@ def render_cloudflared_config(routes: list[dict]) -> str:
     """
     lines = [
         "# Managed by Universal-AGT ingress (cloudflare-tunnel provider).",
-        "# Canonical route table — rewritten on every ingress sync; do not edit by hand.",
-        "# See docs/cloudflare.md. NOTE: for dashboard-created (token) tunnels,",
-        "# Cloudflare reads public-hostname routes from the tunnel's dashboard",
-        "# configuration, not from this file; mirror the hostnames below in",
-        "# Zero Trust -> Networks -> Tunnels -> Public hostnames.",
+        "# NON-AUTHORITATIVE LOCAL MIRROR — rewritten on every ingress sync;",
+        "# do not edit by hand. For token-based (remotely-managed) tunnels,",
+        "# cloudflared IGNORES this file's ingress rules: the authoritative",
+        "# route table is the tunnel's REMOTE configuration, written by the",
+        "# control plane via the Cloudflare API. This file is an operator",
+        "# checklist / debugging artifact only. See docs/cloudflare.md.",
         "ingress:",
     ]
     for route in sorted(routes, key=lambda r: r["hostname"]):
