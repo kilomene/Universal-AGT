@@ -203,11 +203,12 @@ describe('permissionForTaskType', () => {
     deploy: 'deploy', remove: 'deploy', rollback: 'deploy', build: 'deploy',
     'docker-build': 'deploy', 'docker-run': 'deploy', 'docker-compose': 'deploy',
     'environment-update': 'deploy', 'artifact-upload': 'deploy',
+    'ingress-sync': 'deploy',
     restart: 'restart', start: 'restart', stop: 'stop',
     logs: 'read_status', status: 'read_status', healthcheck: 'read_status',
     'system-info': 'read_status', 'artifact-download': 'read_status',
   };
-  it('covers exactly the 17 protocol task types', () => {
+  it('covers exactly the 18 protocol task types', () => {
     expect([...TASK_TYPES].sort()).toEqual(Object.keys(expected).sort());
   });
   it('maps every type to its permission', () => {
