@@ -97,7 +97,8 @@ jobs:
             echo "ERROR: .env file committed"; exit 1
           fi
           # No private keys, tokens, or passwords in tracked files
-          if git grep -nEi 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[bap]-|sk-live-|aws_secret_access_key|password\s*=\s*["'"'"'][^"'"'"']+["'"'"']' -- ':!*.md' ':!docs/**' ; then
+          # (the workflow's own pattern text is excluded — it self-matches otherwise)
+          if git grep -nEi 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[bap]-|sk-live-|aws_secret_access_key|password\s*=\s*["'"'"'][^"'"'"']+["'"'"']' -- ':!*.md' ':!docs/**' ':!.github/workflows/**' ; then
             echo "ERROR: possible secret found in tracked files"; exit 1
           fi
           echo "secrets sweep clean"
