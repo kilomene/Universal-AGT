@@ -54,6 +54,8 @@ says so at boot. There are no insecure fallbacks in any mode.
 | `LOG_LEVEL` | no | `info` |
 | `CLOUDFLARE_API_TOKEN` | no | Optional; with `CLOUDFLARE_ZONE_ID` enables `POST /v1/domains` DNS management (scoped to Zone / DNS / Edit). |
 | `CLOUDFLARE_ZONE_ID` | no | Optional; see above. |
+| `CLOUDFLARE_TUNNEL_API_TOKEN` | no | Optional; dedicated token for tunnel config sync (needs Account / Cloudflare Tunnel / Edit). Falls back to `CLOUDFLARE_API_TOKEN` when unset. See `docs/cloudflare.md`. |
+| `CLOUDFLARE_ACCOUNT_ID` | no | Optional; required alongside a tunnel token for tunnel route management (tunnel id is parsed from `TUNNEL_INGRESS_HOSTNAME`). |
 | `PUBLIC_INGRESS_HOSTNAME` | no | Optional direct-mode ingress target for domain CNAMEs. |
 | `TUNNEL_INGRESS_HOSTNAME` | no | Optional; when set, new domains default to tunnel mode (`<tunnel-id>.cfargotunnel.com`). |
 
