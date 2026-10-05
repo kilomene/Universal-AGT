@@ -92,9 +92,9 @@ jobs:
       - name: Fail on committed secrets or env files
         run: |
           set -euo pipefail
-          # No .env files may ever be committed
-          if git ls-files | grep -E '(^|/)\.env($|\.)' ; then
-            echo "ERROR: .env file committed"; exit 1
+          # No real .env files may ever be committed (.env.example templates are fine)
+          if git ls-files | grep -E '(^|/)\.env($|\.)' | grep -vE '\.env\.(example|sample|template|dist)$' ; then
+            echo "ERROR: real .env file committed"; exit 1
           fi
           # No private keys, tokens, or passwords in tracked files
           # (the workflow's own pattern text is excluded — it self-matches otherwise)
