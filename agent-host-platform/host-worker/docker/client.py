@@ -69,8 +69,11 @@ class DockerClient:
         return proc
 
     # -- info ------------------------------------------------------------
-    def version(self) -> str:
-        return self._run("version", "--format", "{{.Server.Version}}").stdout.strip()
+    def version(self, timeout: Optional[int] = 300) -> str:
+        """Server version. Callers on a hot path (heartbeats) should pass a
+        short timeout — a wedged docker daemon must never stall them."""
+        return self._run("version", "--format", "{{.Server.Version}}",
+                         timeout=timeout).stdout.strip()
 
     def compose_available(self) -> bool:
         proc = self._run("compose", "version", check=False)
@@ -171,6 +174,19 @@ class DockerClient:
         if not data:
             return None
         return (data[0].get("State") or {}).get("Status")
+
+    def restart_count(self, name: str) -> Optional[int]:
+        """Container RestartCount from docker inspect; None if it does not exist."""
+        try:
+            data = self.inspect(name)
+        except DockerError:
+            return None
+        if not data:
+            return None
+        try:
+            return int(data[0].get("RestartCount") or 0)
+        except (TypeError, ValueError):
+            return 0
 
     # -- compose ---------------------------------------------------------
     def compose_up(self, compose_file: str, project_name: Optional[str] = None,
