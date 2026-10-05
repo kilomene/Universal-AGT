@@ -206,3 +206,44 @@ class DockerClient:
             argv += ["-p", sanitize_ident(project_name)]
         argv += ["down"]
         return self._run(*argv, timeout=timeout, check=False).stdout[-4000:]
+
+    def compose_ps(self, project_name: str, timeout: int = 60) -> list:
+        """`docker compose -p <name> ps --format json`, parsed to a list of
+        dicts. Each record carries Name, State and a Publishers list
+        ([{PublishedPort, TargetPort, Protocol, ...}]). Tolerates both the
+        one-JSON-object-per-line format and a single JSON array. Never
+        raises on unparseable output — returns what parsed."""
+        argv = ["compose", "-p", sanitize_ident(project_name),
+                "ps", "--format", "json"]
+        out = (self._run(*argv, timeout=timeout, check=False).stdout or "").strip()
+        records: list = []
+        if not out:
+            return records
+        if out.startswith("["):
+            try:
+                parsed = json.loads(out)
+            except json.JSONDecodeError:
+                parsed = []
+            records = [r for r in parsed if isinstance(r, dict)]
+        else:
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    records.append(rec)
+        return records
+
+    def compose_config_json(self, compose_file: str, timeout: int = 60) -> dict:
+        """Normalized compose model via `docker compose config --format
+        json`. Used to read published ports before `compose up` so the
+        worker can verify them free. Raises DockerError on failure."""
+        out = self._run("compose", "-f", compose_file, "config",
+                        "--format", "json",
+                        timeout=timeout).stdout
+        data = json.loads(out)
+        return data if isinstance(data, dict) else {}
