@@ -1,6 +1,6 @@
 """Policy allowlist tests.
 
-  * every one of the 17 protocol task types maps to a handler
+  * every one of the 18 protocol task types maps to a handler
   * unknown / missing types are rejected with TaskRejected (no execution)
   * static check: no worker source uses shell=True, and no subprocess call
     takes a plain string as its command (argv lists only) in code that can
@@ -14,17 +14,18 @@ import pytest
 
 from agent import policy
 
-# The 17 task types from PROTOCOL §3.2 / §5.
+# The 18 task types from PROTOCOL §3.2 / §5.
 PROTOCOL_TASK_TYPES = [
     "deploy", "restart", "stop", "start", "remove", "rollback",
     "logs", "status", "healthcheck", "build", "docker-build",
     "docker-run", "docker-compose", "environment-update",
     "artifact-download", "artifact-upload", "system-info",
+    "ingress-sync",
 ]
 
 
-def test_all_17_types_mapped():
-    assert len(PROTOCOL_TASK_TYPES) == 17
+def test_all_18_types_mapped():
+    assert len(PROTOCOL_TASK_TYPES) == 18
     for task_type in PROTOCOL_TASK_TYPES:
         assert policy.is_allowed(task_type), f"{task_type} not in allowlist"
         handler = policy.get_handler(task_type)
@@ -96,7 +97,7 @@ def test_rejected_task_reports_failed_without_executing():
 # ---------------------------------------------------------------------------
 WORKER_ROOT = Path(__file__).resolve().parent.parent
 AUDITED_PACKAGES = ["agent", "executor", "deployments", "docker",
-                    "health", "logs", "updater"]
+                    "health", "logs", "updater", "ingress"]
 SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
 
 
