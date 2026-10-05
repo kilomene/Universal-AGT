@@ -258,3 +258,44 @@ plane must reach. Hosts are referenced by `host_id` / `host_name` only —
 IP addresses never appear in requests or responses. This is what makes the
 system work behind NAT, on laptops, and on machines whose network identity
 changes: as long as the worker can reach the control plane, it can do work.
+
+## Dashboard
+
+The control plane serves a static, no-build dashboard (`dashboard/`) at any
+base path. It is a monitoring surface with a small set of guarded actions —
+not a second API:
+
+- **Auth.** The agent API key lives in `sessionStorage` only (cleared when
+  the tab closes) and is sent as `Authorization: Bearer` on every call,
+  including mutating ones (never a query parameter — except the SSE stream,
+  where `EventSource` cannot set headers, so `?api_key=` is used on
+  `GET /v1/events/stream` only). A 401 re-arms the sign-in gate; a 403 is
+  shown as "not permitted" next to the panel or action, since the key may
+  simply lack the permission.
+- **Approvals.** The Approvals panel polls `GET /v1/tasks?status=awaiting_approval`
+  and builds a dossier per task from existing endpoints only
+  (task → deployment → project → artifact, plus the deployment's domains):
+  requested action, project/version, target host, artifact name/size,
+  resources, domains, and declared environment. Approve opens a confirmation
+  modal summarizing what will be deployed where before
+  `POST /v1/tasks/:id/approve` is sent; Reject asks for confirmation, then
+  `POST /v1/tasks/:id/reject`. Both need the `approve_deployments`
+  permission.
+- **Service actions.** The Applications panel has per-service Restart / Stop /
+  Start buttons calling `POST /v1/services/:id/{restart,stop,start}` (a 403
+  shows "not permitted"). Stop is destructive and asks for confirmation first.
+- **Overview strip.** Hosts online/total, agents active in the last 15
+  minutes (derived from recent events — there is no `GET /v1/agents` list
+  endpoint), running applications, active deployments, deployments failed in
+  the last 24h, and pending approvals — all computed from the same polled
+  endpoints the panels use. No new API endpoints were added for it.
+- **Projects.** Read-only table (name/owner/runtime/updated) from
+  `GET /v1/projects`. There is intentionally no agents table (see above).
+- **Host status.** The dashboard renders the server's `host.status`
+  (maintained by the stale-host sweeper: `online`/`degraded`/`offline`, plus
+  operator-set `draining`) and only falls back to client-side 90s heartbeat
+  freshness when the field is absent.
+
+`dashboard/check.py` statically verifies the page (`node --check`,
+element-id cross-references, badge-class coverage, panel wiring) and runs in
+CI.
