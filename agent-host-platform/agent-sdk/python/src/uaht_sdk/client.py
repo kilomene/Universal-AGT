@@ -346,8 +346,11 @@ class UahtClient:
         return self._post(f"/deployments/{deployment_id}/rollback", {})
 
     # -- §3.10 Domains --------------------------------------------------
-    def add_domain(self, deployment_id, hostname):
-        return self._post("/domains", {"deployment_id": deployment_id, "hostname": hostname})
+    def add_domain(self, deployment_id, hostname, ingress=None):
+        body = {"deployment_id": deployment_id, "hostname": hostname}
+        if ingress is not None:
+            body["ingress"] = ingress  # 'tunnel' | 'direct' (Phase 7)
+        return self._post("/domains", body)
 
     def list_domains(self, deployment_id):
         return self._get("/domains", {"deployment_id": deployment_id})
