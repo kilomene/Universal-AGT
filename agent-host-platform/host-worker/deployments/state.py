@@ -96,12 +96,21 @@ class DeploymentStore:
         return candidates[0] if candidates else None
 
     def used_host_ports(self) -> set:
+        """Host ports held by live deployments: single-container
+        ``host_port`` plus every published port recorded for compose
+        deployments (``compose_ports``). Used for allocation and for the
+        pre-up collision check on compose redeploys."""
         ports = set()
         for state in self.list_all():
             if state.get("status") in ("running", "starting", "healthcheck"):
                 port = state.get("host_port")
                 if port:
                     ports.add(int(port))
+                for p in state.get("compose_ports") or []:
+                    try:
+                        ports.add(int(p))
+                    except (TypeError, ValueError):
+                        continue
         return ports
 
     def deployment_dir(self, deployment_id: str) -> Path:
