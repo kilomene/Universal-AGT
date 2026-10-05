@@ -10,7 +10,7 @@ import { decodeCursor, encodeCursor, isUuid, parseLimit } from './_helpers';
 
 export const tasksRouter = Router();
 
-// PROTOCOL §3.2 — the 17 allowed task types.
+// PROTOCOL §3.2 — the 18 allowed task types.
 export const TASK_TYPES = [
   'deploy',
   'restart',
@@ -29,6 +29,7 @@ export const TASK_TYPES = [
   'artifact-download',
   'artifact-upload',
   'system-info',
+  'ingress-sync',
 ] as const;
 
 // Exported for the security test-suite: every type in TASK_TYPES must map
@@ -47,6 +48,7 @@ export function permissionForTaskType(type: string): string {
     case 'docker-compose':
     case 'environment-update':
     case 'artifact-upload':
+    case 'ingress-sync':
       return 'deploy';
     case 'restart':
     case 'start':
