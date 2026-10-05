@@ -37,6 +37,90 @@ HEALTH_IMPORTS = (
     "deployments.manifest, deployments.pipeline, deployments.state, "
     "docker.client, health.collector, health.checker, logs.store"
 )
+# The running worker writes this on every boot (see agent.main); the
+# updater reads it after a self-update restart to confirm the NEW version
+# actually came up healthy before declaring the update done.
+STATUS_FILENAME = "worker.status.json"
+# Seconds to wait for the new version to report healthy after restart
+# (env-overridable; honoring the operator's rollout patience).
+HEALTH_TIMEOUT_S = int(os.environ.get("WORKER_UPDATE_HEALTH_TIMEOUT_S", "120") or 120)
+HEALTH_POLL_INTERVAL_S = 5
+
+
+def write_status_file(work_dir: str, version: str) -> Path:
+    """Record a boot marker for the post-update health gate to read."""
+    import json
+    path = Path(work_dir) / STATUS_FILENAME
+    path.write_text(json.dumps({
+        "version": version,
+        "boot_ts": time.time(),
+        "pid": os.getpid(),
+    }), encoding="utf-8")
+    return path
+
+
+def read_status_file(work_dir: str) -> dict | None:
+    """Return the boot marker dict, or None if absent/unparseable."""
+    import json
+    try:
+        data = json.loads((Path(work_dir) / STATUS_FILENAME).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _service_active() -> bool:
+    """True when systemd reports the worker unit active."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", SERVICE_NAME],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "active"
+
+
+def wait_for_healthy(work_dir: str, version: str, pre_ts: float,
+                     timeout_s: int = HEALTH_TIMEOUT_S,
+                     is_active_fn=None, sleep_fn=time.sleep,
+                     log=None) -> bool:
+    """Poll until the restarted worker proves it is the new version.
+
+    Healthy = systemd unit active AND the boot marker shows ``version``
+    with a boot timestamp at/after ``pre_ts`` (i.e. written by the
+    post-restart process, not a stale marker from the old run).
+    Returns True on success, False on timeout. ``is_active_fn`` and
+    ``sleep_fn`` are injectable for tests.
+    """
+    is_active = is_active_fn or _service_active
+    deadline = time.time() + max(1, timeout_s)
+    while time.time() < deadline:
+        marker = read_status_file(work_dir)
+        if (marker
+                and marker.get("version") == version
+                and isinstance(marker.get("boot_ts"), (int, float))
+                and marker["boot_ts"] >= pre_ts - 1
+                and is_active()):
+            if log:
+                log(f"update {version} healthy after restart "
+                    f"(pid {marker.get('pid')})")
+            return True
+        sleep_fn(HEALTH_POLL_INTERVAL_S)
+    return False
+
+
+def _rollback_symlink(work: Path, previous_target: str | None) -> None:
+    """Swing <work>/current back to the previous release."""
+    if not previous_target:
+        return
+    rb = work / "current.rb"
+    if rb.is_symlink() or rb.exists():
+        rb.unlink()
+    rb.symlink_to(previous_target)
+    os.replace(rb, work / "current")
 
 
 class UpdateError(Exception):
@@ -145,13 +229,9 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
         shutil.rmtree(release_dir)
     release_dir.mkdir(parents=True)
     with tarfile.open(tarball, "r:gz") as tf:
-        # traversal protection
-        base = release_dir.resolve()
-        for member in tf.getmembers():
-            target = (base / member.name).resolve()
-            if target != base and base not in target.parents:
-                raise UpdateError(f"update tarball escapes: {member.name!r}")
-        tf.extractall(release_dir)
+        # tarfile.data_filter (3.12+) blocks absolute paths, ".." escapes,
+        # and symlink/hardlink members resolving outside release_dir.
+        tf.extractall(release_dir, filter="data")
 
     current_link = work / "current"
     previous_target = None
@@ -172,21 +252,32 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
     os.replace(tmp_link, current_link)
     if log:
         log(f"update {version} installed; restarting {SERVICE_NAME}")
+    pre_ts = time.time()
     proc = subprocess.run(
         ["systemctl", "restart", SERVICE_NAME],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120,
     )
     if proc.returncode != 0:
         # rollback the symlink; the old code is still on disk
-        if previous_target:
-            rb = work / "current.rb"
-            if rb.is_symlink() or rb.exists():
-                rb.unlink()
-            rb.symlink_to(previous_target)
-            os.replace(rb, current_link)
+        _rollback_symlink(work, previous_target)
         raise UpdateError(
             f"systemctl restart failed: {proc.stderr[-2000:]}; "
             "symlink rolled back to previous release")
+    # Post-restart health gate: the NEW worker must write a fresh boot
+    # marker and stay active within the timeout, or we roll back. This is
+    # what catches a release that installs cleanly but crashes on boot.
+    if not wait_for_healthy(str(work), version, pre_ts,
+                            timeout_s=HEALTH_TIMEOUT_S, log=log):
+        _rollback_symlink(work, previous_target)
+        subprocess.run(
+            ["systemctl", "restart", SERVICE_NAME],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=120,
+        )
+        raise UpdateError(
+            f"update {version} did not come up healthy within "
+            f"{HEALTH_TIMEOUT_S}s of restart; rolled back to previous "
+            "release and restarted it")
     return "updated"
 
 
