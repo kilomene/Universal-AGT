@@ -25,6 +25,11 @@ openssl rand -hex 32   # paste into DATA_ENCRYPTION_KEY
 
 ## Running
 
+`dist/` is generated build output and is **never committed** — every run
+builds from `src/`. `npm start` runs the compiled `dist/index.js`, so it
+requires a prior `npm run build`; `npm run prod` does build + start in one
+step.
+
 Against **local Postgres**:
 
 ```bash
