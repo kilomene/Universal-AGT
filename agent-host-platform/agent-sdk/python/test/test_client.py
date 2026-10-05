@@ -252,6 +252,7 @@ def test_deploy_helper_resolves_names_and_waits():
         "artifact_id": None,
         "mode": None,
         "idempotency_key": None,
+        "host_port": None,
     }
 
 
@@ -428,7 +429,7 @@ PARITY_METHODS = [
     "create_deployment", "get_deployment", "list_deployments", "rollback_deployment",
     "list_services", "restart_service", "stop_service", "start_service",
     "set_secret", "list_secrets", "delete_secret",
-    "add_domain", "list_domains", "remove_domain",
+    "add_domain", "list_domains", "get_domain", "remove_domain",
     "list_events", "stream_events",
     "deploy", "health",
 ]
@@ -476,3 +477,84 @@ def test_permission_error_surfaces_cleanly():
     assert exc.value.code == "forbidden"
     assert exc.value.status == 403
     assert exc.value.message == "missing permission: deploy"
+
+
+# -- W15 contract conformance (2026-10-05) -------------------------------
+# The wire protocol is authoritative: SDK method signatures must expose
+# exactly the params the server implements (no dead params the server
+# ignores), and every stable capability must exist in both SDKs.
+
+def test_create_deployment_sends_host_port():
+    client, fake = client_with({"/v1/deployments": lambda: make_response(201, {"deployment": {"id": "d1"}, "task": {}})})
+    client.create_deployment(project_id="p1", version="1.0.0", host_id="h1", host_port=8080)
+    _, url, kwargs = fake.calls[0]
+    assert url.endswith("/v1/deployments")
+    assert kwargs["json"]["host_port"] == 8080
+    assert kwargs["json"]["host_id"] == "h1"
+
+
+def test_update_project_sends_repository_and_runtime():
+    client, fake = client_with({"/v1/projects/p1": lambda: make_response(200, {"project": {}})})
+    client.update_project("p1", {"env": {"A": "1"}}, repository="https://example.com/r.git", runtime="docker")
+    method, url, kwargs = fake.calls[0]
+    assert method == "PUT"
+    assert url.endswith("/v1/projects/p1")
+    assert kwargs["json"] == {
+        "configuration": {"env": {"A": "1"}},
+        "repository": "https://example.com/r.git",
+        "runtime": "docker",
+    }
+
+
+def test_update_project_omits_unset_fields():
+    client, fake = client_with({"/v1/projects/p1": lambda: make_response(200, {"project": {}})})
+    client.update_project("p1", {"env": {}})
+    _, _, kwargs = fake.calls[0]
+    assert kwargs["json"] == {"configuration": {"env": {}}}
+
+
+def test_list_projects_sends_no_dead_params():
+    # GET /v1/projects has no limit/cursor server-side; the SDK must not
+    # send params the wire ignores.
+    client, fake = client_with({"/v1/projects": lambda: make_response(200, {"projects": []})})
+    client.list_projects()
+    _, url, kwargs = fake.calls[0]
+    assert url.endswith("/v1/projects")
+    # no params at all on the wire: the endpoint takes none
+    assert kwargs.get("params") in (None, {})
+
+
+def test_list_artifacts_sends_only_project_id():
+    client, fake = client_with({"/v1/artifacts": lambda: make_response(200, {"artifacts": []})})
+    client.list_artifacts(project_id="p1")
+    _, _, kwargs = fake.calls[0]
+    assert kwargs["params"] == {"project_id": "p1"}
+
+
+def test_list_deployments_sends_no_cursor():
+    client, fake = client_with({"/v1/deployments": lambda: make_response(200, {"deployments": []})})
+    client.list_deployments(project_id="p1", status="running", limit=10)
+    _, _, kwargs = fake.calls[0]
+    assert kwargs["params"] == {"project_id": "p1", "status": "running", "limit": 10}
+
+
+def test_list_services_supports_limit():
+    client, fake = client_with({"/v1/services": lambda: make_response(200, {"services": []})})
+    client.list_services(host_id="h1", limit=5)
+    _, _, kwargs = fake.calls[0]
+    assert kwargs["params"] == {"host_id": "h1", "limit": 5}
+
+
+def test_deploy_helper_passes_host_port():
+    client, fake = client_with(
+        {
+            "/v1/projects": lambda: make_response(200, {"projects": [{"id": "p-1", "name": "web"}]}),
+            "/v1/deployments": lambda: make_response(
+                201, {"deployment": {"id": "d-1"}, "task": {"id": "t-1", "status": "queued"}}
+            ),
+        }
+    )
+    deployment, task = client.deploy(project="web", version="1.0.0", host_port=9090)
+    deploy_call = [c for c in fake.calls if c[1].endswith("/v1/deployments")][0]
+    assert deploy_call[2]["json"]["host_port"] == 9090
+    assert deployment["id"] == "d-1"
