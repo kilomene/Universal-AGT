@@ -1,4 +1,4 @@
-# Public ingress & Cloudflare DNS (Phase 7)
+# Public ingress & Cloudflare DNS
 
 ## The one thing you must understand first
 
@@ -10,25 +10,47 @@ A CNAME record is just a name pointing at another name. If nothing at the
 other end can carry traffic back down to the host, the domain resolves and
 the connection goes nowhere.
 
-So there are three modes, and you must pick one deliberately:
+So there are two ingress modes, and you must pick one deliberately:
 
 | Mode | What it is | When traffic actually reaches the host |
 |---|---|---|
-| (a) **metadata-only** (default) | `POST /v1/domains` records the hostname on the deployment; no DNS is touched (`status: 'dns_pending'`). | **Never.** The hostname is bookkeeping only. |
-| (b) **direct** | CNAME `hostname → PUBLIC_INGRESS_HOSTNAME` (proxied, TTL 300). | Only if **you** run an ingress in front of the host — a reverse proxy, load balancer, or tunnel you manage — and it can reach the host's container ports. That ingress is **your responsibility**; this system never sees host IPs and cannot check it for you. |
-| (c) **cloudflare-tunnel** *(recommended for the private-host case)* | CNAME `hostname → TUNNEL_INGRESS_HOSTNAME` (e.g. `<tunnel-id>.cfargotunnel.com`), and the **worker itself** runs a supervised `cloudflared` tunnel — an outbound-only connection to Cloudflare's edge that carries inbound HTTP back to the host's loopback container ports. | **Yes** — once the tunnel is up and the route is synced (see below). This is the only mode where this system owns the whole path. |
+| **tunnel** *(recommended for the private-host case)* | CNAME `hostname → <tunnel-id>.cfargotunnel.com`, and the **worker itself** runs a supervised `cloudflared tunnel --token <TOKEN> run` — an outbound-only connection to Cloudflare's edge that carries inbound HTTP back to the host's loopback container ports. | **Yes** — once the tunnel is up and the route is in the remote tunnel configuration (see below). This is the only mode where this system owns the whole path. |
+| **direct** | CNAME `hostname → PUBLIC_INGRESS_HOSTNAME` (proxied, TTL 300). | Only if **you** run an ingress in front of the host — a reverse proxy, load balancer, or tunnel you manage — and it can reach the host's container ports. That ingress is **your responsibility**; this system never sees host IPs and cannot check it for you. |
 
-**Without (b) or (c), domains resolve but traffic cannot reach the host.**
+**Without one of these, domains resolve but traffic cannot reach the host.**
 That is not a bug or a missing feature — it is the architecture (spec
 §28). Do not pretend otherwise in runbooks or status pages.
 
-## Mode (a): metadata-only
+## Control authority: the remote tunnel configuration is the source of truth
 
-Configure nothing. `POST /v1/domains` stores the hostname; point your DNS
-at your own ingress manually. The entry keeps `status: 'dns_pending'` until
-you manage DNS yourself.
+For token-based (remotely-managed) tunnels — the only kind this system runs
+(`cloudflared tunnel --token <TOKEN> run`) — **routes are controlled
+remotely through Cloudflare, not by any local config file.**
 
-## Mode (b): direct (your own ingress)
+Concretely: when `cloudflared` is started with `--token`, it ignores the
+ingress rules in any local `config.yml` and pulls its configuration from
+the Cloudflare edge. Editing or rewriting a local `config.yml` does **not**
+change where traffic goes. The control plane therefore manages routes
+exclusively through the Cloudflare API:
+
+- `GET /accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations` — read the live ingress table
+- `PUT /accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations` — full-replace the ingress table, then re-read to verify
+
+Remote config changes propagate to a running `cloudflared` within seconds —
+**no restart is needed** to change routes. The worker still keeps a local
+`config.yml` on disk, but it is a **non-authoritative diagnostic mirror**
+(the file says so in its header comment): it lets an operator eyeball the
+intended routes on the host, but it routes nothing. Any documentation,
+status page, or runbook that implies a local config file controls routing
+is wrong and must be fixed.
+
+The remote ingress table is shared: the reconciler only touches hostnames
+the system manages (the active tunnel domains of live deployments plus
+operator hostnames it has seen before as managed). Ingress rules for
+hostnames the system does not know about are **preserved verbatim** — the
+system will not delete an operator's dashboard-created routes.
+
+## Mode: direct (your own ingress)
 
 1. Run your ingress (Caddy/Nginx/LB/anything) where it can reach the host's
    published container ports.
@@ -49,22 +71,20 @@ agent-host domains add --deployment <id> --hostname api.example.com --ingress di
 ```
 
 The API creates a proxied (orange-cloud) CNAME `api.example.com →
-ingress.example.net` with TTL 300. Re-adding is idempotent; removing the
-domain (`agent-host domains rm` / `DELETE /v1/domains`) deletes the DNS
-record. The worker is not involved: your ingress must already route to the
-host's container ports.
+ingress.example.net` with TTL 300. Removing the domain
+(`agent-host domains rm` / `DELETE /v1/domains`) deletes the DNS record and
+verifies it is gone. The worker is not involved: your ingress must already
+route to the host's container ports.
 
-## Mode (c): cloudflare-tunnel (worker-managed, outbound-only)
+## Mode: cloudflare-tunnel (worker-managed, outbound-only)
 
 The worker supervises `cloudflared tunnel --token <TOKEN> run`. The tunnel
-dials **out** to Cloudflare; no inbound ports are opened on the host. For
-each tunnel-mode domain on a live deployment, the worker maps
-`hostname → http://127.0.0.1:<container-port>` and rewrites the tunnel's
-`config.yml` route table.
+dials **out** to Cloudflare; no inbound ports are opened on the host.
 
-### Setup
+### Setup — the live-credential step (done once, by the operator)
 
-**Human steps (cannot be automated — they live in your Cloudflare account):**
+These live in your Cloudflare account and **cannot be automated**; no
+credentials are ever stored in the repo:
 
 1. In the Cloudflare dashboard: **Zero Trust → Networks → Tunnels →
    Create a tunnel** (Cloudflared type). Name it, e.g. `agent-host-ingress`.
@@ -72,19 +92,18 @@ each tunnel-mode domain on a live deployment, the worker maps
    `eyJ…`). Treat it like a password.
 3. Find the tunnel hostname: on the tunnel's overview it looks like
    `<tunnel-id>.cfargotunnel.com`. Copy it.
-4. In the tunnel's **Public hostnames** tab, add one entry per app hostname
-   you will serve (e.g. `api.example.com` → service `http://localhost:8080`
-   — the port is a placeholder; the worker's route table is the source of
-   truth for which local port each hostname reaches). **This dashboard step
-   is required**: for dashboard-created (token) tunnels, Cloudflare reads
-   public-hostname routes from the tunnel's dashboard configuration, not
-   from the worker-generated `config.yml`.
+4. Create an API token with **Account → Cloudflare Tunnel → Edit** on the
+   account (for route management) — it may be the same token as the DNS one
+   if you give it both scopes — and note your **Account ID** (dashboard
+   URL or the account home page).
 
-**Control plane:**
+**Control plane environment:**
 
 ```bash
-CLOUDFLARE_API_TOKEN=<scoped token>   # Zone → DNS → Edit on your zone
+CLOUDFLARE_API_TOKEN=<scoped token>        # Zone → DNS → Edit (DNS records)
 CLOUDFLARE_ZONE_ID=<zone id>
+CLOUDFLARE_TUNNEL_API_TOKEN=<token>        # Account → Tunnel → Edit (may reuse API_TOKEN)
+CLOUDFLARE_ACCOUNT_ID=<account id>
 TUNNEL_INGRESS_HOSTNAME=<tunnel-id>.cfargotunnel.com   # from step 3
 ```
 
@@ -101,65 +120,114 @@ verified — no auto-trust of "latest") if it isn't on `PATH`, then starts the
 supervised tunnel. If the download fails or the token is missing, the worker
 **logs clearly and stays with ingress disabled** — deployments keep working.
 
-**Request domains:**
+### The domain lifecycle
+
+Domains are first-class rows in the `domains` table (migration
+`007_domains_lifecycle.sql`), not a JSON blob:
+
+```
+requested → configuring → active → failed
+                          ↘ removing → removed
+```
+
+`POST /v1/domains` runs the full provisioning flow:
+
+1. **Validate** the hostname (well-formed DNS name; no wildcards, no
+   `localhost`/`.local`/`.internal`/`.invalid`/`.example`/`.test`/`.onion`,
+   no IP literals) and the CNAME target.
+2. **Attach** the domain to the deployment (`requested`).
+3. **DNS**: create (or reuse) a proxied CNAME
+   `hostname → <tunnel-id>.cfargotunnel.com`, then re-read the record to
+   confirm it exists (`dns_configured`).
+4. **Tunnel route**: read the remote ingress table, upsert
+   `hostname → http://127.0.0.1:<container-port>` (the deployment's own
+   published host port — never an arbitrary URL), re-read the table to
+   confirm the rule is present (`tunnel_configured`). Rules for hostnames the
+   system doesn't manage are left untouched.
+5. **HTTPS probe**: a plain GET to `https://hostname` from the control
+   plane records reachability (`https_reachable`, `https_status`) —
+   informational only, it never blocks activation (DNS/TLS propagation can
+   lag).
+6. The domain becomes `active` (`verified_at` set) — or `failed` with the
+   exact reason in `error`. A failure leaves the domain in `failed`, not
+   half-wired: DNS records and tunnel rules created before the failure stay
+   where they are (the retry/removal path cleans them), and the status and
+   error are queryable via `GET /v1/domains/:hostname`.
+
+`DELETE /v1/domains` detaches cleanly (`removing` → `removed`): the tunnel
+route is dropped from the remote configuration and the DNS record is
+deleted, each **verified gone by re-reading** before the domain is marked
+`removed`. If verification fails the domain stays `removing` with an error
+— never silently half-deleted.
+
+**A domain never points at a dead deployment without the control plane
+knowing.** When a deployment reaches a terminal state (`stopped`, `failed`,
+`rolled_back`), its tunnel domains are marked `failed` (with an event on
+the deployment's event stream), their tunnel routes are dropped from the
+remote configuration, and DNS records are removed; `deployments.domains`
+(the old JSONB column) is kept as a derived summary mirror only. When the
+deployment recovers (a new live deployment supersedes it), its tunnel
+domains are re-provisioned.
+
+Request a domain:
 
 ```bash
 agent-host domains add --deployment <id> --hostname api.example.com --ingress tunnel
 # or POST /v1/domains {"deployment_id":"<uuid>","hostname":"api.example.com","ingress":"tunnel"}
 ```
 
-What happens:
-
-1. The API creates the proxied CNAME `api.example.com →
-   <tunnel-id>.cfargotunnel.com` (422 if you request tunnel mode without
-   `TUNNEL_INGRESS_HOSTNAME` configured — the error says so plainly).
-2. The domain entry is stored with `ingress: 'tunnel'` and the tunnel host.
-3. The API queues an `ingress-sync` task for the host; the worker rebuilds
-   its route table from all current tunnel-mode domains and rewrites
-   `config.yml`. (Deploys/removes also trigger a best-effort in-process
-   sync; `ingress-sync` tasks are idempotent and safe to re-run or trigger
-   manually.)
-
-Verify:
-
-```bash
-agent-host tasks --status completed   # the ingress-sync task completed
-# on the host:
-cat /opt/agent-host/ingress/cloudflared/config.yml   # hostname -> 127.0.0.1:port
-```
-
-Then open `https://api.example.com` — traffic flows: client → Cloudflare
-edge → (outbound tunnel) → `cloudflared` on the host → `127.0.0.1:<port>`.
+The API returns `422` if you request tunnel mode without
+`TUNNEL_INGRESS_HOSTNAME` configured or against a non-live deployment, and
+`409` if the hostname is already attached anywhere live — the error says so
+plainly. Then open `https://api.example.com` — traffic flows: client →
+Cloudflare edge → (outbound tunnel) → `cloudflared` on the host →
+`127.0.0.1:<port>`.
 
 ### Tunnel behavior notes
 
 - Crash supervision: if `cloudflared` exits unexpectedly, the worker
-  restarts it with exponential backoff. Route changes rewrite `config.yml`
-  and restart the tunnel (cloudflared has no SIGHUP config reload; restart
-  is the real mechanism) — intentional restarts don't count as crashes.
+  restarts it with exponential backoff. Route changes propagate through the
+  remote configuration — **no tunnel restart is needed for route changes**
+  (the local `config.yml` mirror is rewritten for diagnostics only).
 - The token is passed as a process argument; it is visible in the host's
   process table to local root only, never in logs, events, task results,
   or API responses.
 - To rotate the token: create a new token in the dashboard, update
-  `WORKER_TUNNEL_TOKEN` (installer input: `UAHT_TUNNEL_TOKEN`), and either restart the worker or queue an
-  `ingress-sync` task (the restart picks up the new token).
+  `WORKER_TUNNEL_TOKEN` (installer input: `UAHT_TUNNEL_TOKEN`), and restart
+  the worker.
+- The worker's tunnel provider only ever routes to `127.0.0.1` — it cannot
+  be steered at arbitrary network targets (SSRF-safe by construction).
+  Origins are always the deployment's own published container host port.
 
 ## Choosing
 
-- Host is private / behind NAT / no public IP → **(c) cloudflare-tunnel**.
-- You already run edge infrastructure in front of the host → **(b) direct**.
-- You only need the hostname recorded for later → **(a) metadata-only**.
+- Host is private / behind NAT / no public IP → **tunnel**.
+- You already run edge infrastructure in front of the host → **direct**.
 
 ## Security notes
 
 - The Cloudflare API token lives only in the control plane's environment;
   the tunnel token lives only in the host's environment — agents never see
-  either, and neither appears in logs, events, or API responses.
+  either, and neither appears in logs, events, task results, or API
+  responses.
 - Only agents with `manage_domains` can add/remove hostnames; only agents
   with `deploy` can queue `ingress-sync` tasks.
-- Hostname validation rejects anything that isn't a well-formed DNS name,
-  on the API and again on the worker before it reaches `config.yml`.
-- The worker's tunnel provider only ever routes to `127.0.0.1` — it cannot
-  be steered at arbitrary network targets.
+- Hostname validation rejects wildcards, localhost, internal-only names,
+  and IP literals — on the API and again on the worker before anything is
+  written to the remote tunnel configuration.
+- Ingress targets are always `http://127.0.0.1:<deployment port>` — the
+  deployment's own local endpoint. Arbitrary URLs are never accepted.
 - `cloudflared` is only ever executed from a SHA-256-pinned official
   release (or a copy you installed yourself on `PATH`).
+
+## Testing without live credentials
+
+There are no Cloudflare credentials in this repository or its test
+environment. Everything except the single live-credential step above is
+tested against a **fake Cloudflare API** — a local stub HTTP server in the
+test suite (`control-plane/api/test/fakeCloudflare.ts`) implementing the
+token/DNS/tunnel endpoints the code calls. It is test infrastructure,
+clearly labeled as such, and is never used by production code (the API
+defaults to `https://api.cloudflare.com/client/v4`; the override
+`CLOUDFLARE_API_BASE` exists only so tests can point the client at the
+stub).
