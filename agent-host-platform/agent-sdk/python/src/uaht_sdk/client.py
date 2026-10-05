@@ -364,6 +364,11 @@ class UahtClient:
     def list_domains(self, deployment_id):
         return self._get("/domains", {"deployment_id": deployment_id})
 
+    def get_domain(self, hostname):
+        """Fetch one domain's lifecycle row: status, dns_configured,
+        tunnel_configured, https_reachable, verified_at, error."""
+        return self._get(f"/domains/{hostname}")
+
     def remove_domain(self, deployment_id, hostname):
         return self._delete("/domains", {"deployment_id": deployment_id, "hostname": hostname})
 
