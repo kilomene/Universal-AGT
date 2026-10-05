@@ -20,14 +20,20 @@ environment variable (the installer accepts ``UAHT_TUNNEL_TOKEN`` and maps
 it into ``worker.env``). It is never logged, never appears in status output,
 and never lives in the repo.
 
-Route application: the provider rewrites ``config.yml`` (the canonical
-route table, see ingress.render_cloudflared_config) and restarts the
-tunnel process so a rotated token or changed mode takes effect.
-(cloudflared does not reload tunnel config on SIGHUP; restart is the real
-mechanism.) Honesty note: for dashboard-created (token) tunnels, Cloudflare
-reads public-hostname routes from the tunnel's dashboard configuration, not
-from this config.yml — mirror the hostnames there (the config.yml doubles
-as the checklist, and is used verbatim by locally-managed tunnels).
+Route application: the provider rewrites ``config.yml`` on route changes —
+and that is ALL it does. Be clear about what that file IS: for token-based
+(remotely-managed) tunnels — the only kind this system runs — cloudflared
+IGNORES local config.yml ingress rules; the authoritative route table is
+the tunnel's REMOTE configuration, written by the control plane via the
+Cloudflare API (see
+control-plane/api/src/lib/cloudflare-tunnel.ts). The local config.yml is
+a NON-AUTHORITATIVE mirror — an operator checklist and debugging
+artifact. Rewriting it never routes traffic, so the tunnel is NOT
+restarted on route changes (remotely-managed cloudflared picks up a new
+remote config version within seconds on its own; restarting would only
+drop in-flight connections for no benefit). A rotated tunnel token takes
+effect on worker restart — the token is read once at provider setup and
+is never re-read by a route sync.
 
 All subprocess calls use argv lists with shell=False.
 """
@@ -190,7 +196,6 @@ class CloudflaredTunnelProvider(IngressProvider):
         self._proc: subprocess.Popen | None = None
         self._supervisor: threading.Thread | None = None
         self._stop = threading.Event()
-        self._expect_exit = False  # set before an intentional restart
         self._restarts = 0
         self._last_error = ""
         self._lock = threading.Lock()
@@ -299,16 +304,9 @@ class CloudflaredTunnelProvider(IngressProvider):
             with self._lock:
                 if self._proc is proc:
                     self._proc = None
-                intentional, self._expect_exit = self._expect_exit, False
             if self._stop.is_set():
                 LOG.info("cloudflared stopped (rc=%s)", rc)
                 return
-            if intentional:
-                # Route change / token rotation restart, not a crash: no
-                # backoff, no restart counter; respawn promptly.
-                LOG.info("cloudflared restarted for new routes (rc=%s)", rc)
-                failures = 0
-                continue
             # Unexpected exit: crash-loop backoff, then respawn.
             self._restarts += 1
             failures += 1
@@ -320,20 +318,6 @@ class CloudflaredTunnelProvider(IngressProvider):
             if self._stop.wait(delay):
                 return
 
-    def _terminate_current(self) -> None:
-        with self._lock:
-            proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=_RESTART_GRACE_S)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
     # -- routes ----------------------------------------------------------
     def _write_config(self) -> None:
         text = render_cloudflared_config(self._routes.values())
@@ -343,14 +327,16 @@ class CloudflaredTunnelProvider(IngressProvider):
         os.replace(tmp, self._config_path)
 
     def _apply_routes(self) -> None:
-        """Rewrite config.yml and restart the tunnel so the change (or a
-        rotated token) takes effect. cloudflared has no SIGHUP config
-        reload — restart is the real mechanism."""
+        """Rewrite the local config.yml mirror (diagnostic only).
+
+        The mirror is NON-AUTHORITATIVE for token-based tunnels: the
+        remote tunnel configuration is the routing authority and the
+        control plane writes it via the Cloudflare API. Rewriting the
+        mirror never routes traffic, so the tunnel is deliberately NOT
+        restarted here — a restart would drop in-flight connections for
+        no routing benefit. (A rotated tunnel token takes effect on
+        worker restart, not on a route sync.)"""
         self._write_config()
-        LOG.info("cloudflared config rewritten (%d routes); restarting tunnel",
+        LOG.info("cloudflared route mirror rewritten (%d routes); "
+                 "tunnel NOT restarted (remote config is authoritative)",
                  len(self._routes))
-        with self._lock:
-            self._expect_exit = True
-        self._terminate_current()
-        # The supervisor loop respawns on the next iteration; the
-        # _expect_exit flag keeps this restart out of the crash backoff.
