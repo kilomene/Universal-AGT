@@ -1,7 +1,7 @@
-"""Ingress route sync (Phase 7).
+"""Ingress route mirror sync (Phase 7).
 
-The single code path that turns "current deployments' domains" into live
-tunnel routes. Used two ways:
+The single code path that turns "current deployments' domains" into the
+worker's LOCAL route mirror. Used two ways:
 
 1. the ``ingress-sync`` task type (executor/handlers.handle_ingress_sync) —
    for manual or remote (control-plane-triggered) syncs;
@@ -11,8 +11,14 @@ tunnel routes. Used two ways:
 The worker learns the current domains from the control plane
 (``GET /v1/worker/domains``, host token) and resolves each deployment's
 host port from its own local deployment store. Only entries with
-``ingress: 'tunnel'`` become tunnel routes; 'direct' entries are the
+``ingress: 'tunnel'`` become mirror routes; 'direct' entries are the
 operator's own ingress and are left alone.
+
+CONTROL AUTHORITY: for token-based tunnels the routing authority is the
+REMOTE tunnel configuration, which the control plane writes via the
+Cloudflare API. This sync only refreshes the local config.yml mirror
+(non-authoritative, diagnostic) — it never routes traffic and never
+restarts the tunnel.
 """
 from __future__ import annotations
 
@@ -24,7 +30,12 @@ LOG = logging.getLogger("agent-host-worker.ingress")
 
 
 def sync_ingress(ctx) -> dict:
-    """Rebuild the provider's route table from current domains.
+    """Refresh the provider's local route mirror from current domains.
+
+    For token-based tunnels this only rewrites the non-authoritative
+    config.yml mirror — routing authority is the remote tunnel
+    configuration (control plane writes it via the Cloudflare API), and
+    the tunnel is never restarted by a sync.
 
     Returns a JSON-able result dict (also used as the ingress-sync task
     result). Never raises for a disabled provider; raises for a provider
