@@ -41,9 +41,6 @@ function sleep(ms: number): Promise<void> {
 // payload keeps carrying the issue while the flag stands, but the
 // service.crash_loop event fires once per (host, deployment) per process.
 const crashLoopSeen = new Set<string>();
-export function resetCrashLoopSeenForTests(): void {
-  crashLoopSeen.clear();
-}
 
 async function emitWorkerIssues(
   pool: Pool,
