@@ -3,14 +3,24 @@
 # Universal AGT — persistent host installer (one command)
 #
 # Installs the host worker on a Debian/Ubuntu persistent Linux host:
-#   * installs python3 + docker.io if missing (apt)
-#   * creates the `agenthost` system user
+#   * fails unless running on Linux, as root, with python3 >= 3.10
+#   * installs python3 + python3-requests + docker.io if missing (apt);
+#     falls back to `pip install -r host-worker/requirements.txt` when the
+#     requests module is still not importable
+#   * validates the Docker daemon with `docker info` (hard failure if down)
+#   * creates the `agenthost` system user (added to the docker group)
 #   * lays out /opt/agent-host and /srv/agent-apps
+#   * copies the full worker tree (agent, executor, deployments, docker,
+#     health, logs, updater, ingress) to /opt/agent-host/worker
 #   * provisions the host at the control plane (POST /v1/hosts/register)
 #     unless UAHT_HOST_TOKEN / UAHT_HOST_ID are already supplied
 #   * writes /opt/agent-host/config/worker.env (0600, agenthost-owned)
 #   * installs + enables + starts the agent-host-worker systemd unit
-#   * verifies the service is active and a heartbeat landed
+#   * verifies, in order, failing loudly on any failure:
+#       1. `systemctl is-active agent-host-worker`
+#       2. the worker's own `--self-check` (run as agenthost): config
+#          validates, deployment state readable, docker reachable-or-skipped
+#       3. a first "heartbeat ok" line in the unit journal within 120s
 #
 # Usage:
 #   sudo UAHT_CONTROL_PLANE_URL=https://cp.example.com \
@@ -46,6 +56,8 @@
 #      mkdir -p /opt/agent-host/config /opt/agent-host/worker /srv/agent-apps
 #      cp -r <repo>/agent-host-platform/host-worker/{agent,executor,\
 #        deployments,docker,health,logs,updater,ingress} /opt/agent-host/worker/
+#      python3 -m pip install --break-system-packages \
+#        -r <repo>/agent-host-platform/host-worker/requirements.txt
 #      chown -R agenthost:agenthost /opt/agent-host /srv/agent-apps
 # 3. Write /opt/agent-host/config/worker.env by hand (see host-worker/
 #    .env.example), mode 0600, owned by agenthost. To provision credentials
@@ -83,11 +95,17 @@ ENV_FILE="$CONFIG_DIR/worker.env"
 SERVICE_NAME="agent-host-worker"
 WORKER_USER="agenthost"
 
+# Every first-party worker package the installer must lay down. The worker's
+# entry point (agent/main.py) imports all of these at startup; a package
+# missing here means ModuleNotFoundError on the first boot.
+WORKER_PACKAGES="agent executor deployments docker health logs updater ingress"
+
 log()  { echo "[install-host] $*"; }
 fail() { echo "[install-host] ERROR: $*" >&2; exit 1; }
 
 # ---- preconditions ----------------------------------------------------------
 [ "$(id -u)" -eq 0 ] || fail "run as root (sudo)"
+[ "$(uname -s)" = "Linux" ] || fail "this installer only supports Linux (detected: $(uname -s))"
 [ -n "$UAHT_CONTROL_PLANE_URL" ] || fail "UAHT_CONTROL_PLANE_URL is required"
 [ -n "$UAHT_HOST_NAME" ] || fail "UAHT_HOST_NAME is required (e.g. persistent-host-01)"
 if [ -n "$UAHT_HOST_TOKEN" ] && [ -z "$UAHT_HOST_ID" ]; then
@@ -97,16 +115,17 @@ if [ -n "$UAHT_HOST_ID" ] && [ -z "$UAHT_HOST_TOKEN" ]; then
   fail "UAHT_HOST_ID given without UAHT_HOST_TOKEN (supply both or neither)"
 fi
 [ -d "$WORKER_SRC/agent" ] || fail "worker source not found at $WORKER_SRC"
+[ -f "$WORKER_SRC/requirements.txt" ] || fail "requirements.txt not found at $WORKER_SRC/requirements.txt"
 
 if [ -r /etc/os-release ]; then
   # shellcheck disable=SC1091
   . /etc/os-release
   case "${ID:-}" in
     debian|ubuntu) log "detected OS: $PRETTY_NAME";;
-    *) log "WARNING: untested OS ($PRETTY_NAME); continuing, apt steps may fail";;
+    *) log "WARNING: untested distro ($PRETTY_NAME); apt steps target Debian/Ubuntu and may fail";;
   esac
 else
-  log "WARNING: /etc/os-release missing; cannot verify Debian/Ubuntu"
+  log "WARNING: /etc/os-release missing; apt steps target Debian/Ubuntu"
 fi
 
 # ---- dependencies -----------------------------------------------------------
@@ -121,7 +140,32 @@ else
   log "UAHT_SKIP_APT=1: skipping apt installs"
 fi
 command -v python3 >/dev/null || fail "python3 still missing after install step"
-python3 -c "import requests" 2>/dev/null || fail "python3-requests missing (import requests failed)"
+python3 - <<'EOF' || fail "python3 >= 3.10 is required (worker uses 3.10+ syntax)"
+import sys
+sys.exit(0 if sys.version_info >= (3, 10) else 1)
+EOF
+log "python3 version OK: $(python3 -c 'import sys; print(sys.version.split()[0])')"
+
+# The worker needs the `requests` library (agent/api.py). Prefer the distro
+# package installed above; fall back to pip installing requirements.txt.
+if ! python3 -c "import requests" 2>/dev/null; then
+  log "requests module missing; installing from $WORKER_SRC/requirements.txt"
+  PIP_CMD=(pip3)
+  if ! command -v pip3 >/dev/null 2>&1; then
+    python3 -m pip --version >/dev/null 2>&1 \
+      || fail "pip is unavailable; install python3-requests or python3-pip and re-run"
+    PIP_CMD=(python3 -m pip)
+  fi
+  "${PIP_CMD[@]}" install --break-system-packages -r "$WORKER_SRC/requirements.txt" \
+    || fail "pip install -r requirements.txt failed"
+  python3 -c "import requests" 2>/dev/null \
+    || fail "requests still not importable after pip install"
+fi
+
+# The worker schedules real Docker workloads: the daemon must be up, not
+# merely installed.
+docker info >/dev/null 2>&1 \
+  || fail "docker daemon is not running ('docker info' failed); start Docker and re-run"
 
 # ---- user / directories ------------------------------------------------------
 if ! id "$WORKER_USER" >/dev/null 2>&1; then
@@ -135,9 +179,11 @@ fi
 
 mkdir -p "$CONFIG_DIR" "$WORKER_DIR" "$APPS_DIR" \
          /opt/agent-host/{logs,deployments,artifacts,builds,updates,releases,quarantine}
-# copy worker code (idempotent: rsync-like via cp --remove-destination)
+# copy worker code (idempotent: remove-then-copy per package)
 log "installing worker code to $WORKER_DIR"
-for pkg in agent executor deployments docker health logs updater; do
+# shellcheck disable=SC2086
+for pkg in $WORKER_PACKAGES; do
+  [ -d "$WORKER_SRC/$pkg" ] || fail "worker package missing from source: $WORKER_SRC/$pkg"
   rm -rf "$WORKER_DIR/$pkg"
   cp -r "$WORKER_SRC/$pkg" "$WORKER_DIR/$pkg"
 done
@@ -200,21 +246,49 @@ UNIT_SRC="$WORKER_SRC/agent/agent-host-worker.service"
 [ -f "$UNIT_SRC" ] || fail "systemd unit not found at $UNIT_SRC"
 log "installing systemd unit $SERVICE_NAME"
 cp "$UNIT_SRC" "/etc/systemd/system/$SERVICE_NAME.service"
-systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
+systemctl daemon-reload \
+  || fail "systemctl daemon-reload failed"
+systemctl enable --now "$SERVICE_NAME" \
+  || fail "systemctl enable --now $SERVICE_NAME failed"
 
 # ---- verify ---------------------------------------------------------------------
+# Never claim success from `systemctl start` alone. Three gates:
+#   1. systemd reports the unit active;
+#   2. the worker's own --self-check passes as the agenthost user (config
+#      loads, deployment state readable, docker reachable-or-skipped, and —
+#      crucially — every worker module imports, which catches a broken
+#      worker-tree copy);
+#   3. a first "heartbeat ok" lands in the journal within 120s, proving the
+#      worker can actually reach the control plane.
 log "waiting for service to settle..."
 sleep 8
-if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-  fail "service failed to start; see: journalctl -u $SERVICE_NAME -n 100"
-fi
-if journalctl -u "$SERVICE_NAME" -n 60 --no-pager 2>/dev/null | grep -q "heartbeat ok"; then
-  log "verified: heartbeat reached the control plane"
+systemctl is-active --quiet "$SERVICE_NAME" \
+  || fail "service failed to start; see: journalctl -u $SERVICE_NAME -n 100"
+
+SELF_CHECK_CMD="cd '$WORKER_DIR' && exec /usr/bin/python3 -m agent.main --config '$ENV_FILE' --self-check"
+if command -v runuser >/dev/null 2>&1; then
+  SELF_CHECK_RUN=(runuser -u "$WORKER_USER" -- bash -c "$SELF_CHECK_CMD")
 else
-  log "WARNING: service is active but no 'heartbeat ok' in the recent journal;"
-  log "         check connectivity: journalctl -u $SERVICE_NAME -n 50"
+  SELF_CHECK_RUN=(su -s /bin/bash "$WORKER_USER" -c "$SELF_CHECK_CMD")
 fi
+if SELF_CHECK_OUT="$("${SELF_CHECK_RUN[@]}" 2>&1)"; then
+  log "worker self-check passed: $SELF_CHECK_OUT"
+else
+  fail "worker self-check failed as $WORKER_USER (exit != 0): $SELF_CHECK_OUT"
+fi
+
+log "waiting for first heartbeat (up to 120s)..."
+HEARTBEAT_SEEN=0
+for _ in $(seq 1 24); do
+  if journalctl -u "$SERVICE_NAME" -n 60 --no-pager 2>/dev/null | grep -q "heartbeat ok"; then
+    HEARTBEAT_SEEN=1
+    break
+  fi
+  sleep 5
+done
+[ "$HEARTBEAT_SEEN" -eq 1 ] \
+  || fail "no 'heartbeat ok' in the journal within 120s; the worker cannot reach the control plane at $UAHT_CONTROL_PLANE_URL — inspect: journalctl -u $SERVICE_NAME -n 100"
+log "verified: heartbeat reached the control plane"
 
 log "done. Host '$UAHT_HOST_NAME' is registered and the worker is running."
 log "Logs: journalctl -u $SERVICE_NAME -f"
