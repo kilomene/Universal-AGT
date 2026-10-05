@@ -165,6 +165,120 @@ describe("deployments and services", () => {
     assert.equal(calls[1].url, "https://cp.example.com/v1/services/s2/stop");
     assert.equal(calls[2].url, "https://cp.example.com/v1/services/s3/start");
   });
+
+  // W15 contract conformance (2026-10-05): the wire protocol is
+  // authoritative — SDK signatures expose exactly the params the server
+  // implements (no dead params the server ignores), and every stable
+  // capability exists in both SDKs.
+  it("createDeployment passes host_port for fixed-port reservation", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(201, { deployment: { id: "d1" }, task: { id: "t1" } })),
+    });
+    await client.createDeployment({
+      project_id: "p1",
+      host_id: "h1",
+      version: "1.0.0",
+      host_port: 8080,
+    });
+    const body = JSON.parse(calls[0].opts.body);
+    assert.equal(body.host_port, 8080);
+    assert.equal(body.host_id, "h1");
+  });
+
+  it("updateProject sends configuration, repository, and runtime (PUT wire shape)", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { project: { id: "p1" } })),
+    });
+    await client.updateProject(
+      "p1",
+      { env: { A: "1" } },
+      { repository: "https://example.com/r.git", runtime: "docker" }
+    );
+    const body = JSON.parse(calls[0].opts.body);
+    assert.deepEqual(body, {
+      configuration: { env: { A: "1" } },
+      repository: "https://example.com/r.git",
+      runtime: "docker",
+    });
+    assert.equal(calls[0].opts.method, "PUT");
+  });
+
+  it("updateProject stays backwards compatible with (id, configuration)", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { project: { id: "p1" } })),
+    });
+    await client.updateProject("p1", { env: {} });
+    const body = JSON.parse(calls[0].opts.body);
+    assert.deepEqual(body, { configuration: { env: {} } });
+  });
+
+  it("listProjects sends no dead params (wire has no pagination here)", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { projects: [] })),
+    });
+    await client.listProjects();
+    assert.equal(calls[0].url, "https://cp.example.com/v1/projects");
+  });
+
+  it("listArtifacts sends only project_id (wire has no limit/cursor here)", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { artifacts: [] })),
+    });
+    await client.listArtifacts({ project_id: "p1" });
+    assert.equal(calls[0].url, "https://cp.example.com/v1/artifacts?project_id=p1");
+  });
+
+  it("listDeployments sends no cursor (wire supports project_id/host_id/status/limit)", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { deployments: [] })),
+    });
+    await client.listDeployments({ project_id: "p1", status: "running", limit: 10 });
+    const { url } = calls[0];
+    assert.ok(url.includes("project_id=p1"));
+    assert.ok(url.includes("status=running"));
+    assert.ok(url.includes("limit=10"));
+    assert.ok(!url.includes("cursor="));
+  });
+
+  it("listServices supports host_id and limit", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { services: [] })),
+    });
+    await client.listServices({ host_id: "h1", limit: 5 });
+    const { url } = calls[0];
+    assert.ok(url.includes("host_id=h1"));
+    assert.ok(url.includes("limit=5"));
+  });
+
+  it("deploy() passes hostPort through to createDeployment", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: async (url, opts) => {
+        calls.push({ url, opts });
+        if (url.endsWith("/v1/projects")) return jsonResponse(200, { projects: [{ id: "p-1", name: "web" }] });
+        return jsonResponse(201, { deployment: { id: "d-1" }, task: { id: "t-1" } });
+      },
+    });
+    await client.deploy({ project: "web", version: "1.0.0", hostPort: 9090 });
+    const deployCall = calls.find((c) => c.url.endsWith("/v1/deployments"));
+    const body = JSON.parse(deployCall.opts.body);
+    assert.equal(body.host_port, 9090);
+  });
 });
 
 describe("secrets", () => {
@@ -523,7 +637,7 @@ describe("JS/Python parity (Phase 8)", () => {
     "createDeployment", "getDeployment", "listDeployments", "rollbackDeployment",
     "listServices", "restartService", "stopService", "startService",
     "setSecret", "listSecrets", "deleteSecret",
-    "addDomain", "listDomains", "removeDomain",
+    "addDomain", "listDomains", "getDomain", "removeDomain",
     "listEvents", "streamEvents",
     "deploy", "health",
   ];
