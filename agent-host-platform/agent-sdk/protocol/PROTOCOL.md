@@ -10,6 +10,53 @@ Content-Type: `application/json` everywhere unless noted.
 
 ---
 
+## Changelog
+
+- **2026-10-05 — Phase 3 (task/deployment reliability).**
+  - Task retry policy: a worker-reported `failed` now becomes `retrying`
+    (then back to `queued` via the sweeper) when the retry budget
+    (`attempts`/`max_attempts`) allows and the task type is safe to re-run
+    from where it failed (idempotent reads always; `deploy`/`restart`/
+    `start`/`stop`/build tasks only when the attempt never reached
+    `running`; `remove`/`rollback` never). `retrying` is now a reachable
+    state (`claimed|running → retrying → queued`). Events: `task.retrying`,
+    `task.requeued`.
+  - Claim leases: `POST /v1/worker/tasks/claim` records
+    `lease_expires_at` (now + `TASK_CLAIM_LEASE_S`, default 600s), refreshed
+    on every progress report. The stuck-task sweeper requeues tasks stuck in
+    `claimed`/`running` past their lease (or fails them when the retry budget
+    is exhausted), and moves `retrying → queued`. Tasks expose
+    `lease_expires_at` / `last_progress_at`.
+  - `POST /v1/deployments/:id/rollback` no longer inserts a duplicate
+    deployment row (which 500'd on the unique constraint). It now creates a
+    `type=rollback` task (`payload: {deployment_id, target_deployment_id}`)
+    against the last healthy deployment of the same project+host, emits
+    `deployment.rollback_requested`, and the worker's completion report
+    drives `deployment.rolled_back`. Response shape is unchanged
+    (`{deployment, task}`); `deployment` is the deployment being rolled back.
+  - `POST /v1/deployments` accepts an optional `host_port` (integer
+    1–65535, requires `host_id`): reserved in the new `port_allocations`
+    registry (409 on collision). The worker verifies the port is free at OS
+    level (bind test) and Docker level (`docker ps` scan) before
+    `docker run`, failing the task with a clear error on collision.
+    `deployments.ports` is now written from the deploy task's `result.ports`
+    on completion. Reservations release when the deployment reaches
+    `failed`/`rolled_back`/`stopped` or is superseded.
+  - Deployment idempotency now compares the `mode`/`artifact_id` columns
+    (previously read from a row that lacked them → false 409s).
+  - Container names are unique per deployment attempt
+    (`uaht-<project>-<version>-<deployment[:8]>`): same-version redeploys no
+    longer stop/remove the live container before health passes.
+  - **Security tightening (intentional):** `POST /v1/tasks` enforces a
+    per-type permission map — `deploy`/`remove`/`rollback`/`build`/
+    `docker-*`/`environment-update`/`artifact-upload` need `deploy`;
+    `restart`/`start` need `restart`; `stop` needs `stop`; reads
+    (`logs`/`status`/`healthcheck`/`system-info`/`artifact-download`) need
+    `read_status`. `POST /v1/tasks/:id/cancel` now needs the `deploy`
+    permission or task creatorship (was `read_status` alone).
+
+---
+
 ## 1. Authentication
 
 Two credential kinds, both sent as `Authorization: Bearer <token>`:
@@ -84,10 +131,18 @@ POST /v1/tasks
 
 GET  /v1/tasks/:id               → {task:{...}}
 GET  /v1/tasks?status=&type=&host_id=&limit=&cursor=
-POST /v1/tasks/:id/cancel        → terminal state 'cancelled' (if not terminal)
+POST /v1/tasks/:id/cancel        → terminal state 'cancelled' (if not terminal);
+                                   needs `deploy` permission or task creatorship
 POST /v1/tasks/:id/approve       # needs approve_deployments; awaiting_approval → queued
 POST /v1/tasks/:id/reject        # needs approve_deployments; awaiting_approval → cancelled
 ```
+
+`POST /v1/tasks` enforces a per-type permission map (see Changelog
+2026-10-05): `deploy`/`remove`/`rollback`/`build`/`docker-build`/
+`docker-run`/`docker-compose`/`environment-update`/`artifact-upload` need
+`deploy`; `restart`/`start` need `restart`; `stop` needs `stop`;
+`logs`/`status`/`healthcheck`/`system-info`/`artifact-download` need
+`read_status`.
 
 Task object:
 
@@ -103,7 +158,15 @@ Task object:
 
 Status machine: `queued → claimed → running → completed|failed`
 (`running → awaiting_approval → queued|cancelled` in manual mode;
-`cancelled` reachable from any non-terminal state; `retrying → queued`.)
+`cancelled` reachable from any non-terminal state;
+`claimed|running → retrying → queued` when a failure is retryable — see
+Changelog 2026-10-05.)
+
+**Retry rule:** a worker-reported `failed` becomes `retrying` (sweeper moves
+it back to `queued`) when `attempts < max_attempts` and the task type is
+safe to re-run: idempotent reads always; `deploy`/`restart`/`start`/`stop`
+and build tasks only when the attempt never reached `running`;
+`remove`/`rollback` never auto-retry.
 
 **Resumability rule:** the task row is the source of truth. If the creating
 agent vanishes, the worker still executes the queued task, stores the result,
@@ -165,12 +228,18 @@ GET  /v1/artifacts/:id/download  # host token OR agent token; streams bytes
 ```
 POST /v1/deployments
   {project_id, host_id?, version, artifact_id?, mode?:"automatic"|"manual",
+   host_port?: 1-65535,   # optional fixed host port; reserved in the port
+                          # registry (requires host_id; 409 on collision).
+                          # The worker verifies it is free before `docker run`.
    idempotency_key?}
   → creates a task type=deploy (+ a deployment row); 201 {deployment, task}
 
 GET  /v1/deployments?project_id=&host_id=&status=
 GET  /v1/deployments/:id         → {deployment, task?}
-POST /v1/deployments/:id/rollback  # needs deploy; deploys previous healthy version
+POST /v1/deployments/:id/rollback  # needs deploy; creates a type=rollback task
+                                   # against the previous healthy deployment
+                                   # (no new deployment row); emits
+                                   # deployment.rollback_requested
 
 GET  /v1/services?host_id=       → running deployments (friendly view)
 POST /v1/services/:id/restart    # needs restart; creates task type=restart
@@ -289,7 +358,11 @@ like `256m|1g`; `resources.cpu` positive number; `restart` in
 ## 5. Task payloads by type
 
 - `deploy`: `{project_id, version, artifact_id?, manifest?}` (+ secrets injected server-side)
-- `restart|stop|start|remove|rollback|logs|status|healthcheck`: `{deployment_id}`
+- `rollback`: `{deployment_id, target_deployment_id?}` — the control plane
+  sets `target_deployment_id` to the last healthy deployment of the same
+  project+host; a hand-built task may omit it (worker picks the newest
+  restorable local deployment)
+- `restart|stop|start|remove|logs|status|healthcheck`: `{deployment_id}`
 - `build|docker-build`: `{project_id, artifact_id?, dockerfile?, context?}`
 - `docker-run|docker-compose`: `{project_id, compose_file?, service?}`
 - `environment-update`: `{deployment_id, env:{...}}`
