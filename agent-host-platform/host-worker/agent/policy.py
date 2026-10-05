@@ -78,3 +78,21 @@ def get_handler(task_type) -> callable:
 
 def is_allowed(task_type) -> bool:
     return task_type in TASK_HANDLERS
+
+
+def reject_disallowed_fields(task_type: str, task: dict) -> None:
+    """Raise TaskRejected for payload fields removed for security reasons.
+
+    Nothing is executed when this raises — the dispatcher reports the task
+    ``failed`` (rejected) before any handler runs.
+    """
+    payload = (task or {}).get("payload") or {}
+    # 2026-10-05: 'extra_args' on docker-run was an argv-injection path to
+    # host root (--privileged, -v /:/host). Removed from the protocol;
+    # any task still carrying it is rejected, not executed.
+    if task_type == "docker-run" and "extra_args" in payload:
+        raise TaskRejected(
+            "docker-run no longer accepts 'extra_args' (removed 2026-10-05: "
+            "arbitrary docker flags such as --privileged or -v /:/host gave "
+            "host root). Remove the field from the payload and re-submit."
+        )
