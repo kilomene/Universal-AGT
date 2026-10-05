@@ -190,7 +190,7 @@ direct` with your own ingress + `PUBLIC_INGRESS_HOSTNAME`).
 ### Worker never starts the tunnel
 
 **Cause:** ingress disabled (`WORKER_INGRESS_ENABLED` false), missing
-`UAHT_TUNNEL_TOKEN`, or the `cloudflared` download failed (pinned release
+`WORKER_TUNNEL_TOKEN`, or the `cloudflared` download failed (pinned release
 2026.10.0, SHA-256 verified).
 
 **Fix:** check the worker log — it logs clearly and **stays with ingress
