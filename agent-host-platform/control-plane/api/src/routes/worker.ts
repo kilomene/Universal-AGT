@@ -15,6 +15,7 @@ import { decideRetryOutcome } from '../lib/retryPolicy';
 import { canTransitionTask, isTaskStatus, isTerminalTaskStatus } from '../lib/stateMachine';
 import { readTaskSweeperConfig } from '../lib/taskSweeper';
 import { requireHost } from '../middleware/auth';
+import { getDecryptedProjectSecrets } from './secrets';
 import { isUuid, publicHost } from './_helpers';
 
 export const workerRouter = Router();
@@ -477,6 +478,61 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
     );
 
     res.json({ task: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /v1/worker/projects/:project_id/secrets — HOST token only.
+// Returns the DECRYPTED project secrets, scoped (2026-10-05): only when
+// this host has an active (claimed/running/awaiting_approval) task for the
+// project, or a live (requested/approved/building/starting/healthcheck/
+// running) deployment of it. Completes the secrets feature: the worker
+// pulls these at deploy time and injects them as container env (never
+// persisted to state.json). 403 when the host has no live work for the
+// project; 404 when the project does not exist.
+// ---------------------------------------------------------------------------
+export async function hostMayReadProjectSecrets(
+  pool: Pool,
+  hostId: string,
+  projectId: string,
+): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM tasks
+      WHERE claimed_by = $1 AND payload->>'project_id' = $2
+        AND status IN ('claimed', 'running', 'awaiting_approval')
+     UNION
+     SELECT 1 FROM deployments
+      WHERE host_id = $1 AND project_id = $2
+        AND status IN ('requested', 'approved', 'building', 'starting',
+                       'healthcheck', 'running')
+     LIMIT 1`,
+    [hostId, projectId],
+  );
+  return rows.length > 0;
+}
+
+workerRouter.get('/projects/:project_id/secrets', requireHost, async (req, res, next) => {
+  try {
+    const projectId = req.params.project_id;
+    if (!isUuid(projectId)) {
+      sendError(res, 400, 'bad_request', 'project_id must be a UUID');
+      return;
+    }
+    const pool = getPool();
+    const project = await pool.query('SELECT id FROM projects WHERE id = $1', [projectId]);
+    if (!project.rows[0]) {
+      next(new HttpError(404, 'not_found', 'project not found'));
+      return;
+    }
+    const allowed = await hostMayReadProjectSecrets(pool, req.auth!.id, projectId);
+    if (!allowed) {
+      sendError(res, 403, 'forbidden', 'no active task or deployment for this project on this host');
+      return;
+    }
+    const secrets = await getDecryptedProjectSecrets(pool, projectId);
+    res.json({ secrets });
   } catch (err) {
     next(err);
   }
