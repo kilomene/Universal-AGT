@@ -12,6 +12,58 @@ Content-Type: `application/json` everywhere unless noted.
 
 ## Changelog
 
+- **2026-10-05 — Phase 6 (security hardening).**
+  - **Intentional tightenings (behavior changes):**
+    - `docker-run` payload field `extra_args` **removed** — it allowed
+      arbitrary `docker run` flags (`--privileged`, `-v /:/host`) straight
+      to host root. The worker now rejects any `docker-run` task carrying
+      it (task reported `failed`, nothing executed). Remove the field from
+      payloads and re-submit.
+    - `POST /v1/agents/register` is gated by a provisioning token:
+      header `X-Provisioning-Token: <UAHT_PROVISIONING_TOKEN>` (env, required
+      at startup when `NODE_ENV=production`). With the env unset, only the
+      very first registration is open (bootstrap); afterwards registration
+      is closed until the operator sets the token. Unauthenticated requests
+      are now rate-limited (10/min per IP, `RATE_LIMIT_UNAUTH_PER_MIN`).
+    - Artifact uploads are capped: `ARTIFACT_MAX_BYTES` (default 500MB) is
+      enforced on `Content-Length` upfront, per-chunk while streaming, and
+      on the declared `size` at `POST /v1/artifacts/init` — all 413
+      `payload_too_large` on exceed (new error code).
+    - `GET /v1/artifacts/:id/download` is scoped: a host token may only
+      download artifacts referenced by tasks it claimed (`payload.artifact_id`);
+      other hosts get 403. Agent `read_status` access is unchanged.
+    - `?api_key=` query fallback is now honored **only** on
+      `GET /v1/events/stream` (EventSource can't set headers); every other
+      endpoint requires the `Authorization` header.
+  - **Additive (backwards compatible):**
+    - `POST /v1/agents/me/rotate` (agent auth) — returns a NEW API key,
+      invalidates the old one immediately, emits `agent.key_rotated`.
+    - `POST /v1/hosts/:id/rotate-token` (host auth, `:id` must match the
+      token's host) — returns a NEW host token, invalidates the old one,
+      emits `host.token_rotated`.
+    - `GET /v1/worker/projects/:project_id/secrets` (host token) — returns
+      the project's DECRYPTED secrets, but only when the host has a
+      claimed/active task or a live deployment for that project (403
+      otherwise). This completes the secrets feature: the worker pulls
+      secrets at deploy time and injects them as container env (payload
+      secrets still win on collision; never persisted to state.json).
+    - New error code `payload_too_large` (HTTP 413).
+  - Worker-side hardening (no REST changes): tar extraction uses
+    `tarfile.data_filter` (blocks symlink escapes); manifest-controlled
+    paths (`build.dockerfile`, `build.context`, `compose_file`) are confined
+    to the extracted artifact tree; `artifact-upload` refuses to read
+    anything under the worker's `config/` directory (worker.env); the
+    self-updater now health-gates the restarted worker (fresh boot marker +
+    active unit within `WORKER_UPDATE_HEALTH_TIMEOUT_S`, default 120s) and
+    rolls back on failure; `agent-host-worker --self-check` runs startup
+    self-checks without starting the loop.
+  - Database: migration `005_events_truncate_block.sql` adds an event
+    trigger aborting any `TRUNCATE` on the append-only `events` table
+    (row-level triggers can't block TRUNCATE; needs superuser to install).
+  - Accepted limitation (documented, not fixed): no replay protection on
+    bearer tokens — static tokens + rotation + TLS are the mitigations;
+    HMAC request signing is future work.
+
 - **2026-10-05 — Phase 4 (multi-application hosting).**
   - Compose deployments now get the same host-port safety as `docker run`:
     before `docker compose up` the worker reads the declared published
@@ -110,7 +162,8 @@ Error shape (all failures):
 
 Common codes: `bad_request`, `unauthorized`, `forbidden`, `not_found`,
 `conflict` (idempotency key reused with *different* payload),
-`unprocessable` (manifest/validation failure), `rate_limited`.
+`unprocessable` (manifest/validation failure), `payload_too_large` (HTTP 413),
+`rate_limited`.
 
 ---
 
@@ -137,7 +190,13 @@ Common codes: `bad_request`, `unauthorized`, `forbidden`, `not_found`,
 ```
 POST /v1/agents/register        {name, type?, capabilities?[], permissions?{}}
                                 → 201 {agent:{...}, api_key:"<show once>"}
+                                # gated: X-Provisioning-Token header required
+                                # (UAHT_PROVISIONING_TOKEN), except the very
+                                # first registration when the env is unset
+                                # (bootstrap mode)
 GET  /v1/agents/me              → caller's own agent row (no secret fields)
+POST /v1/agents/me/rotate       → 200 {api_key:"<new show-once key>"}
+                                # old key invalidated immediately
 ```
 
 ### 3.2 Tasks — the durable work queue (agent API key)
@@ -221,6 +280,11 @@ POST /v1/worker/tasks/:id/progress
    log_chunk?: "text appended to task logs",
    result?: {...}, error?: "message"}
   → 200 {task:{...}}
+
+GET /v1/worker/projects/:project_id/secrets
+  → 200 {secrets: {NAME: "value", ...}}   # decrypted; only when this host
+                                         # has a claimed/active task or live
+                                         # deployment for the project (else 403)
 ```
 
 Claim semantics: exactly one host gets a queued task (atomic `UPDATE ...
@@ -232,6 +296,8 @@ multi-host safe without a lock service.
 ```
 GET /v1/hosts
 GET /v1/hosts/:id        → includes last heartbeat stats + running_apps
+POST /v1/hosts/:id/rotate-token   # host token only, :id must match the token's
+                                # host → 200 {host_token:"<new show-once token>"}
 ```
 
 ### 3.5 Projects & artifacts (agent API key)
@@ -244,11 +310,16 @@ PUT  /v1/projects/:id            # update configuration (validated manifest)
 POST /v1/artifacts/init
   {project_id, filename, size, checksum:"sha256:<hex>", version}
   → 201 {artifact:{...}, upload_url:"/v1/artifacts/:id/content"}
+  # 413 payload_too_large when size > ARTIFACT_MAX_BYTES (default 500MB)
 PUT  /v1/artifacts/:id/content   # Content-Type: application/octet-stream
                                  # server verifies size + sha256, rejects mismatch
+                                 # 413 when Content-Length or the streamed body
+                                 # exceeds ARTIFACT_MAX_BYTES
 GET  /v1/artifacts/:id
 GET  /v1/artifacts?project_id=
-GET  /v1/artifacts/:id/download  # host token OR agent token; streams bytes
+GET  /v1/artifacts/:id/download  # host token (scoped: only artifacts from
+                                 # tasks the host claimed) OR agent token
+                                 # with read_status; streams bytes
 ```
 
 ### 3.6 Deployments (agent API key)
@@ -296,7 +367,9 @@ DELETE /v1/projects/:id/secrets/:name
 ```
 
 The worker receives decrypted values only inside task payloads for deployments
-it is executing, over its authenticated channel. Secrets never appear in
+it is executing, over its authenticated channel — or by pulling
+`GET /v1/worker/projects/:project_id/secrets` (host token, scoped to projects
+with live work on that host) at deploy time. Secrets never appear in
 logs, events, or task results.
 
 ### 3.8 Events — append-only journal (agent API key, read_status)
@@ -393,6 +466,8 @@ like `256m|1g`; `resources.cpu` positive number; `restart` in
 - `restart|stop|start|remove|logs|status|healthcheck`: `{deployment_id}`
 - `build|docker-build`: `{project_id, artifact_id?, dockerfile?, context?}`
 - `docker-run|docker-compose`: `{project_id, compose_file?, service?}`
+  (`docker-run` no longer accepts `extra_args` — removed 2026-10-05; tasks
+  carrying it are rejected without execution)
 - `environment-update`: `{deployment_id, env:{...}}`
 - `artifact-download|artifact-upload`: `{artifact_id, destination?}`
 - `system-info`: `{}`
@@ -411,4 +486,13 @@ For `logs`: `{logs: "..."}`. For `system-info`: `{cpu, ram, disk, docker, ...}`.
 - Artifact SHA-256 is verified by the API on upload AND by the worker after
   download. Mismatch → task failed, artifact quarantined.
 - Rate limiting: 120 req/min per agent key, 600 req/min per host token
-  (heartbeat/claim heavy by design).
+  (heartbeat/claim heavy by design), 10 req/min per IP for unauthenticated
+  requests (`RATE_LIMIT_UNAUTH_PER_MIN`).
+- `?api_key=` is honored only on `GET /v1/events/stream` (browser
+  EventSource); all other endpoints require the `Authorization` header.
+- Credential rotation: `POST /v1/agents/me/rotate`,
+  `POST /v1/hosts/:id/rotate-token`. Rotate on suspected compromise; the
+  old credential dies immediately.
+- Accepted limitation: bearer tokens have no replay protection (no
+  per-request signatures). Mitigations are TLS-everywhere, rotation, and
+  short-lived operational use; HMAC request signing is future work.
