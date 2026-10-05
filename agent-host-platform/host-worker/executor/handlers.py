@@ -383,12 +383,14 @@ def handle_docker_run(ctx, task: dict) -> dict:
         docker.stop(name)
         docker.rm(name, force=True)
     ctx.log(_task_id(task), f"docker run name={name} image={image}")
+    # NOTE (security, 2026-10-05): payload 'extra_args' was removed from the
+    # protocol — it allowed arbitrary docker flags (-> host root). Policy
+    # rejects any docker-run task carrying it before this handler runs, so
+    # it is never forwarded here.
     cid = docker.run(
         name, image, ports=ports, env=env,
         memory=payload.get("memory"), cpus=payload.get("cpus"),
         restart=payload.get("restart", "unless-stopped"),
-        extra_args=payload.get("extra_args") if isinstance(
-            payload.get("extra_args"), list) else None,
     )
     return {"container": name, "container_id": cid, "status": "running",
             "ports": ports}
@@ -473,11 +475,34 @@ def handle_artifact_download(ctx, task: dict) -> dict:
             "sha256": _sha256_file(dest)}
 
 
+def _refuse_sensitive_path(ctx, path: Path, what: str) -> None:
+    """Refuse to read files the worker must never exfiltrate.
+
+    The artifact-upload handler's destination is already confined to
+    work_dir, but worker.env (host token, control-plane URL) lives under
+    <work_dir>/config/ — an agent task must not be able to upload it as
+    an "artifact". Deny anything at or under the config directory, plus
+    the configured worker.env path itself wherever it lives.
+    """
+    resolved = path.resolve()
+    base = Path(ctx.config.work_dir).resolve()
+    blocked = [base / "config"]
+    config_path = getattr(ctx.config, "config_path", "") or ""
+    if config_path:
+        blocked.append(Path(config_path).resolve())
+    for deny in blocked:
+        if resolved == deny or deny in resolved.parents:
+            raise HandlerError(
+                f"refusing to read {what}: {resolved} is a sensitive "
+                f"worker path")
+
+
 def handle_artifact_upload(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "artifact_id")
     base = Path(ctx.config.work_dir).resolve()
     src = _confined_path(base, payload.get("destination"), "destination")
+    _refuse_sensitive_path(ctx, src, "destination")
     if not src.is_file():
         raise HandlerError(f"upload source not found: {payload.get('destination')!r}")
     ctx.log(_task_id(task),
