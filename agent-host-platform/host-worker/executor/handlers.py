@@ -136,24 +136,53 @@ def handle_remove(ctx, task: dict) -> dict:
 
 
 def handle_rollback(ctx, task: dict) -> dict:
-    """Roll back to the newest non-current deployment of the same project."""
+    """Roll back to a previous deployment of the same project.
+
+    The control plane's POST /v1/deployments/:id/rollback names the target
+    explicitly (payload.target_deployment_id — the last healthy deployment
+    of the same project+host). When absent (a hand-built type=rollback
+    task), fall back to the newest non-current local deployment with a
+    container in a restorable state.
+    """
     payload = _payload(task)
     _require(payload, "deployment_id")
     docker = ctx.require_docker()
     current = _deployment_state(ctx, payload["deployment_id"])
     project_id = current.get("project_id")
-    candidates = [
-        s for s in ctx.deployment_store.list_all()
-        if s.get("project_id") == project_id
-        and s.get("deployment_id") != current["deployment_id"]
-        and s.get("container_name")
-        and s.get("status") in ("running", "superseded", "stopped")
-    ]
-    if not candidates:
-        raise HandlerError(
-            f"no rollback candidate for project {current.get('project_name')}"
-        )
-    target = candidates[0]  # list_all is newest-first
+
+    target = None
+    target_id = payload.get("target_deployment_id")
+    if target_id:
+        candidate = ctx.deployment_store.load(target_id)
+        if candidate is None:
+            raise HandlerError(
+                f"rollback target deployment {target_id} not found in the "
+                f"local registry"
+            )
+        if candidate.get("project_id") != project_id:
+            raise HandlerError(
+                f"rollback target {target_id} belongs to a different project"
+            )
+        if not candidate.get("container_name"):
+            raise HandlerError(
+                f"rollback target {target_id} has no container recorded"
+            )
+        ctx.log(_task_id(task),
+                f"rollback target (control plane): {target_id}")
+        target = candidate
+    else:
+        candidates = [
+            s for s in ctx.deployment_store.list_all()
+            if s.get("project_id") == project_id
+            and s.get("deployment_id") != current["deployment_id"]
+            and s.get("container_name")
+            and s.get("status") in ("running", "superseded", "stopped")
+        ]
+        if not candidates:
+            raise HandlerError(
+                f"no rollback candidate for project {current.get('project_name')}"
+            )
+        target = candidates[0]  # list_all is newest-first
     ctx.log(_task_id(task),
             f"rolling back {current['deployment_id']} -> {target['deployment_id']}")
     if current.get("container_name"):
