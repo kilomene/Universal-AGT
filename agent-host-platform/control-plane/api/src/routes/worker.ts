@@ -433,7 +433,7 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
            started_at = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
            completed_at = CASE WHEN $5 THEN now() ELSE completed_at END,
            last_progress_at = now(),
-           lease_expires_at = CASE WHEN $5 THEN NULL ELSE now() + make_interval(secs => $6) END
+           lease_expires_at = CASE WHEN $5 THEN NULL ELSE now() + ($6 || ' seconds')::interval END
          WHERE id = $1 RETURNING *`,
         [
           taskId,
