@@ -353,6 +353,22 @@ describe("domains (§3.10)", () => {
     assert.equal(opts.method, "DELETE");
     assert.deepEqual(JSON.parse(opts.body), { deployment_id: "d-1", hostname: "api.example.com" });
   });
+
+  it("getDomain GETs /v1/domains/:hostname and returns the lifecycle row", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, {
+        domain: { hostname: "api.example.com", status: "active", dns_configured: true, tunnel_configured: true },
+      })),
+    });
+    const out = await client.getDomain("api.example.com");
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/domains/api.example.com");
+    assert.equal(opts.method, "GET");
+    assert.equal(out.domain.status, "active");
+    assert.equal(out.domain.tunnel_configured, true);
+  });
 });
 
 describe("getLogs", () => {
@@ -559,5 +575,42 @@ describe("JS/Python parity (Phase 8)", () => {
       chunks.push(chunk);
     }
     assert.deepEqual(chunks, ["a", "b", "c"]);
+  });
+});
+
+describe("rotateKey error paths", () => {
+  it("surfaces a 403 as UahtError with the protocol code and keeps the old key", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(
+        jsonResponse(403, { error: { code: "forbidden", message: "missing or invalid bearer token" } })
+      ),
+    });
+    await assert.rejects(() => client.rotateKey(), (err) => {
+      assert.ok(err instanceof UahtError);
+      assert.equal(err.code, "forbidden");
+      assert.equal(err.status, 403);
+      return true;
+    });
+    // a failed rotation must not clobber the working key
+    assert.equal(client.apiKey, "k");
+  });
+
+  it("surfaces permission-denied errors with code, status, and message", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(
+        jsonResponse(403, { error: { code: "forbidden", message: "missing permission: deploy" } })
+      ),
+    });
+    await assert.rejects(() => client.createDeployment({ projectId: "p", version: "v1" }), (err) => {
+      assert.ok(err instanceof UahtError);
+      assert.equal(err.code, "forbidden");
+      assert.equal(err.status, 403);
+      assert.equal(err.message, "missing permission: deploy");
+      return true;
+    });
   });
 });
