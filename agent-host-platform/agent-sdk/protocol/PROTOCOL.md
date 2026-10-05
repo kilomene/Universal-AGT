@@ -12,6 +12,40 @@ Content-Type: `application/json` everywhere unless noted.
 
 ## Changelog
 
+- **2026-10-05 — W15 contract audit (doc corrections only; no wire changes).**
+  - **Permissions:** §1 listed `read_logs` and `remove` — those permissions do
+    not exist. The real set is `deploy`, `read_status`, `restart`, `stop`,
+    `manage_secrets`, `manage_domains`, `approve_deployments` (per
+    `middleware/auth.ts`).
+  - **Task approve side effect:** `POST /v1/tasks/:id/approve` also flips the
+    linked deployment to `approved` and emits `deployment.approved`
+    (previously undocumented).
+  - **Claim body:** `POST /v1/worker/tasks/claim` takes `{host_id}` only —
+    capabilities are read from the host row, not the claim body.
+  - **Artifacts:** `POST /v1/artifacts/init` and `PUT /v1/artifacts/:id/content`
+    require the `deploy` permission (not just any agent key); permission
+    annotations added to projects endpoints too (`POST`/`PUT` need `deploy`,
+    reads need `read_status`).
+  - **Deployments:** `GET /v1/deployments` supports `?limit=` (was
+    undocumented); added the missing host-token endpoint
+    `POST /v1/deployments/:id/settle-rollback-ports`
+    `{target_deployment_id}` → `deployment.ports_settled` (called by the
+    worker after a completed rollback).
+  - **Events:** canonical list replaced with the 41 types the server actually
+    emits (16 missing ones added: `agent.key_rotated`, `task.retrying`,
+    `task.requeued`, `deployment.rollback_requested`,
+    `deployment.rollback_failed`, `deployment.ports_settled`,
+    `service.crash_loop`, `service.removed`, `host.token_rotated`,
+    `host.degraded`, `domain.requested`, `domain.active`, `domain.failed`,
+    `domain.removed`, `domain.remove_failed`; 6 never-emitted ones removed:
+    `agent.disconnected`, `deployment.building`, `deployment.healthcheck`,
+    `healthcheck.passed`, `healthcheck.failed`, `worker.updated`).
+  - **Cursor semantics:** the events cursor is an integer event id, not an
+    opaque token (only the tasks cursor is opaque base64url).
+  - **Domains:** lifecycle corrected to `requested → configuring →
+    active | failed`, `removing → removed` on detach (migration 007 supersedes
+    the Phase 7 `dns_pending`/`error` names); added
+    `GET /v1/domains/:hostname`.
 - **2026-10-05 — Phase 9 (end-to-end testing).**
   - **Additive (backwards compatible):** `POST /v1/deployments` now injects
     `artifact_checksum` + `artifact_size` into the `type=deploy` task payload
@@ -224,9 +258,10 @@ Tokens are stored as SHA-256 hashes server-side. Agents and hosts are
 distinguished by which endpoints accept their token (see §3). A host token can
 never call agent endpoints and vice versa.
 
-Agent permissions (subset, enforced per endpoint):
-`deploy`, `read_status`, `read_logs`, `restart`, `stop`, `remove`,
-`manage_domains`, `approve_deployments`, `manage_secrets`
+Agent permissions (enforced per endpoint; the complete set — an agent row's
+`permissions` JSONB carries a subset of these):
+`deploy`, `read_status`, `restart`, `stop`, `manage_secrets`,
+`manage_domains`, `approve_deployments`
 
 Error shape (all failures):
 
@@ -245,7 +280,11 @@ Common codes: `bad_request`, `unauthorized`, `forbidden`, `not_found`,
 
 - IDs are UUID strings. Event IDs are integers (bigserial).
 - Timestamps are ISO-8601 UTC.
-- Pagination: `?limit=` (default 50, max 500), `?cursor=` (opaque), `?since=` (ISO time, events only).
+- Pagination: `?limit=` (default 50, max 500), `?cursor=`, `?since=` (ISO time,
+  events only). Cursor semantics differ per endpoint: the events cursor is an
+  integer event id (`next_cursor` from the previous page); the tasks cursor
+  is an opaque base64url token. Never invent a cursor value — always pass
+  through the server's `next_cursor`.
 - **Idempotency:** `POST /v1/tasks`, `POST /v1/deployments` accept an
   `idempotency_key` in the JSON body. Re-sending the *same* key with an
   *equal* payload returns the original object with HTTP 200 and
@@ -295,7 +334,9 @@ GET  /v1/tasks/:id               → {task:{...}}
 GET  /v1/tasks?status=&type=&host_id=&limit=&cursor=
 POST /v1/tasks/:id/cancel        → terminal state 'cancelled' (if not terminal);
                                    needs `deploy` permission or task creatorship
-POST /v1/tasks/:id/approve       # needs approve_deployments; awaiting_approval → queued
+POST /v1/tasks/:id/approve       # needs approve_deployments; awaiting_approval → queued;
+                                   also flips the task's linked deployment to
+                                   'approved' and emits deployment.approved
 POST /v1/tasks/:id/reject        # needs approve_deployments; awaiting_approval → cancelled
 ```
 
@@ -349,8 +390,9 @@ POST /v1/hosts/:id/heartbeat
   → 200 {host:{...}, pending_tasks: n}
 
 POST /v1/worker/tasks/claim?wait=25
-  {host_id, capabilities?[]}
+  {host_id}
   → 200 {task:{...}} | 204 (nothing within wait window)
+  # capabilities are read from the host row, not the claim body
 
 POST /v1/worker/tasks/:id/progress
   {status: "claimed"|"running"|"awaiting_approval"|"completed"|"failed",
@@ -387,19 +429,21 @@ POST /v1/hosts/:id/rotate-token   # host token only, :id must match the token's
 
 ```
 POST /v1/projects   {name, owner?, repository?, runtime?, configuration?}
-GET  /v1/projects   GET /v1/projects/:id
-PUT  /v1/projects/:id            # update configuration (validated manifest)
+                     # needs deploy
+GET  /v1/projects   GET /v1/projects/:id   # needs read_status
+PUT  /v1/projects/:id            # needs deploy; accepts {configuration?,
+                                 # repository?, runtime?} (validated manifest)
 
-POST /v1/artifacts/init
+POST /v1/artifacts/init           # needs deploy
   {project_id, filename, size, checksum:"sha256:<hex>", version}
   → 201 {artifact:{...}, upload_url:"/v1/artifacts/:id/content"}
   # 413 payload_too_large when size > ARTIFACT_MAX_BYTES (default 500MB)
-PUT  /v1/artifacts/:id/content   # Content-Type: application/octet-stream
+PUT  /v1/artifacts/:id/content   # needs deploy; Content-Type: application/octet-stream
                                  # server verifies size + sha256, rejects mismatch
                                  # 413 when Content-Length or the streamed body
                                  # exceeds ARTIFACT_MAX_BYTES
-GET  /v1/artifacts/:id
-GET  /v1/artifacts?project_id=
+GET  /v1/artifacts/:id           # needs read_status
+GET  /v1/artifacts?project_id=   # needs read_status
 GET  /v1/artifacts/:id/download  # host token (scoped: only artifacts from
                                  # tasks the host claimed) OR agent token
                                  # with read_status; streams bytes
@@ -416,12 +460,20 @@ POST /v1/deployments
    idempotency_key?}
   → creates a task type=deploy (+ a deployment row); 201 {deployment, task}
 
-GET  /v1/deployments?project_id=&host_id=&status=
+GET  /v1/deployments?project_id=&host_id=&status=&limit=
 GET  /v1/deployments/:id         → {deployment, task?}
 POST /v1/deployments/:id/rollback  # needs deploy; creates a type=rollback task
                                    # against the previous healthy deployment
                                    # (no new deployment row); emits
                                    # deployment.rollback_requested
+POST /v1/deployments/:id/settle-rollback-ports  # host token only (host must
+                                   # own the deployment); body
+                                   # {target_deployment_id}. Called by the
+                                   # worker after a completed rollback to
+                                   # release the rolled-back deployment's
+                                   # port reservations and re-reserve the
+                                   # target's host ports; emits
+                                   # deployment.ports_settled
 
 GET  /v1/services?host_id=       → running deployments (friendly view)
 POST /v1/services/:id/restart    # needs restart; creates task type=restart
@@ -471,16 +523,25 @@ Event object:
  "payload": {...}, "created_at": "..."}
 ```
 
-Canonical event types: `agent.connected`, `agent.disconnected`,
-`task.created`, `task.claimed`, `task.started`, `task.awaiting_approval`,
-`task.approved`, `task.rejected`, `task.completed`, `task.failed`,
-`task.cancelled`, `artifact.created`, `artifact.upload_failed`,
-`deployment.requested`, `deployment.approved`, `deployment.started`,
-`deployment.building`, `deployment.healthcheck`, `deployment.completed`,
-`deployment.failed`, `deployment.rolled_back`, `service.started`,
-`service.stopped`, `service.restarted`, `host.registered`, `host.online`,
-`host.offline`, `healthcheck.passed`, `healthcheck.failed`,
-`worker.updated`, `secret.changed`, `secret.deleted`.
+Canonical event types (41 — every type the server emits, verified against
+`routes/` + `lib/` 2026-10-05):
+
+- Agents: `agent.connected`, `agent.key_rotated`
+- Tasks: `task.created`, `task.claimed`, `task.started`, `task.retrying`,
+  `task.awaiting_approval`, `task.approved`, `task.rejected`,
+  `task.completed`, `task.failed`, `task.cancelled`, `task.requeued`
+- Artifacts: `artifact.created`, `artifact.upload_failed`
+- Deployments: `deployment.requested`, `deployment.approved`,
+  `deployment.started`, `deployment.completed`, `deployment.failed`,
+  `deployment.rolled_back`, `deployment.rollback_requested`,
+  `deployment.rollback_failed`, `deployment.ports_settled`
+- Services: `service.started`, `service.stopped`, `service.restarted`,
+  `service.removed`, `service.crash_loop`
+- Hosts: `host.registered`, `host.online`, `host.offline`, `host.degraded`,
+  `host.token_rotated`
+- Secrets: `secret.changed`, `secret.deleted`
+- Domains: `domain.requested`, `domain.active`, `domain.failed`,
+  `domain.removed`, `domain.remove_failed`
 
 ### 3.9 Misc
 
@@ -494,15 +555,22 @@ GET /v1/health → {ok:true, version, time}
 POST /v1/domains   {deployment_id, hostname, ingress?}
                    → 201 {domain:{hostname, cf_record_id?, status, added_at,
                                  ingress, tunnel_host?}}
-                   # status: 'active' (DNS created) | 'dns_pending' (Cloudflare
-                   # not configured — metadata only) | 'error'
+                   # lifecycle (migration 007): requested → configuring →
+                   # active | failed; DELETE moves removing → removed.
+                   # The control plane configures the DNS record and the
+                   # tunnel/direct route, then marks 'active' (or 'failed'
+                   # with an error, retryable). 'requested' is the initial
+                   # state when Cloudflare is not configured — metadata
+                   # only until the operator acts.
                    # ingress: 'tunnel' | 'direct' (default: tunnel when
                    # TUNNEL_INGRESS_HOSTNAME is set on the control plane,
                    # else direct). Tunnel mode without TUNNEL_INGRESS_HOSTNAME
                    # is 422. Tunnel-mode changes queue an `ingress-sync` task
                    # for the host.
 GET  /v1/domains?deployment_id=   → {domains:[...]}
+GET  /v1/domains/:hostname        → {domain:{...}} (live rows only)
 DELETE /v1/domains {deployment_id, hostname} → removes + deletes the DNS record
+                                             (removing → removed)
 ```
 
 Architectural rule: the system never stores host IPs, so A-records pointing
