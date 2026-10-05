@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HttpError } from '../src/lib/errors';
 import {
   cnameTargetFor,
+  cloudflareApiBase,
   deleteDnsRecord,
   ensureCnameRecord,
   findDnsRecord,
@@ -9,6 +10,7 @@ import {
   isValidHostname,
   requireTunnelHostname,
   resolveIngressMode,
+  validateCnameTarget,
   type CfConfig,
 } from '../src/lib/cloudflare';
 
@@ -41,6 +43,9 @@ afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.CLOUDFLARE_API_TOKEN;
   delete process.env.CLOUDFLARE_ZONE_ID;
+  delete process.env.CLOUDFLARE_API_BASE;
+  delete process.env.CLOUDFLARE_ACCOUNT_ID;
+  delete process.env.CLOUDFLARE_TUNNEL_API_TOKEN;
   delete process.env.PUBLIC_INGRESS_HOSTNAME;
   delete process.env.TUNNEL_INGRESS_HOSTNAME;
 });
@@ -55,6 +60,56 @@ describe('isValidHostname', () => {
       'notld', 'double..dot.com', 'x'.repeat(300)]) {
       expect(isValidHostname(bad)).toBe(false);
     }
+  });
+  it('rejects wildcards (W10: every hostname is explicit)', () => {
+    for (const bad of ['*.example.com', 'api.*.example.com', '*']) {
+      expect(isValidHostname(bad)).toBe(false);
+    }
+  });
+  it('rejects localhost / special-use / internal-only names', () => {
+    for (const bad of [
+      'localhost', 'api.localhost',
+      'printer.local', 'db.internal',
+      'x.invalid', 'y.example', 'z.test', 'q.onion',
+    ]) {
+      expect(isValidHostname(bad)).toBe(false);
+    }
+  });
+  it('rejects IP literals', () => {
+    for (const bad of ['127.0.0.1', '10.0.0.5', '192.168.1.1', '8.8.8.8']) {
+      expect(isValidHostname(bad)).toBe(false);
+    }
+  });
+});
+
+describe('validateCnameTarget', () => {
+  it('accepts a valid public hostname', () => {
+    expect(() => validateCnameTarget('ingress.example.net')).not.toThrow();
+    expect(() => validateCnameTarget('abc123.cfargotunnel.com')).not.toThrow();
+  });
+  it('422s IP literals, URLs, and internal names', () => {
+    for (const bad of [
+      '127.0.0.1', '10.0.0.5', '192.168.1.1',
+      'http://ingress.example.net', 'ingress.example.net/path',
+      'db.internal', 'api.localhost', '*.example.com',
+    ]) {
+      try {
+        validateCnameTarget(bad);
+        expect.unreachable(`accepted ${bad}`);
+      } catch (err) {
+        expect(err).toMatchObject({ status: 422 });
+      }
+    }
+  });
+});
+
+describe('cloudflareApiBase', () => {
+  it('defaults to the real Cloudflare API', () => {
+    expect(cloudflareApiBase()).toBe('https://api.cloudflare.com/client/v4');
+  });
+  it('honors CLOUDFLARE_API_BASE (the test hook)', () => {
+    process.env.CLOUDFLARE_API_BASE = 'http://127.0.0.1:9999/client/v4/';
+    expect(cloudflareApiBase()).toBe('http://127.0.0.1:9999/client/v4');
   });
 });
 
