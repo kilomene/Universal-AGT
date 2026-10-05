@@ -53,6 +53,49 @@ def _deployment_state(ctx, deployment_id: str) -> dict:
     return state
 
 
+def _restorable(state: dict) -> bool:
+    """A deployment can be restored by rollback when it has a container or
+    a compose stack recorded."""
+    return bool(state.get("container_name") or state.get("compose_project"))
+
+
+def _restore_deployment(ctx, docker, state: dict) -> None:
+    """Bring a rollback target back up: `docker start` for container
+    deployments, `docker compose up` with the stored compose file for
+    compose deployments. Scoped strictly to the target's own recorded
+    names — never by project-prefix matching."""
+    task_id = "rollback"
+    if state.get("container_name"):
+        docker.start(state["container_name"])
+    elif state.get("compose_project"):
+        compose_file = state.get("compose_file")
+        if not compose_file or not Path(compose_file).is_file():
+            raise HandlerError(
+                f"rollback target {state.get('deployment_id')} is a compose "
+                f"deployment but its compose file {compose_file!r} is "
+                f"missing; redeploy required"
+            )
+        docker.compose_up(compose_file,
+                          project_name=state["compose_project"], build=True)
+    else:  # pragma: no cover — callers check _restorable first
+        raise HandlerError(
+            f"rollback target {state.get('deployment_id')} has nothing to restore"
+        )
+
+
+def _teardown_current(ctx, docker, state: dict) -> None:
+    """Stop/remove the current deployment's own containers, scoped to its
+    recorded names only."""
+    if state.get("container_name"):
+        docker.stop(state["container_name"])
+        docker.rm(state["container_name"], force=True)
+    elif state.get("compose_project"):
+        compose_file = state.get("compose_file")
+        if compose_file and Path(compose_file).is_file():
+            docker.compose_down(compose_file,
+                                project_name=state["compose_project"])
+
+
 def _container_name(ctx, deployment_id: str) -> str:
     state = _deployment_state(ctx, deployment_id)
     name = state.get("container_name")
@@ -124,11 +167,18 @@ def handle_remove(ctx, task: dict) -> dict:
         docker.stop(name)
         docker.rm(name, force=True)
     if state.get("compose_project"):
-        compose_file = payload.get("compose_file")
+        # Prefer the compose file recorded at deploy time (it lives under
+        # the deployment's own state dir); fall back to a payload-supplied
+        # path for deployments recorded before Phase 4.
+        compose_file = state.get("compose_file") or payload.get("compose_file")
         if compose_file:
             base = Path(ctx.config.work_dir).resolve()
             cf = _confined_path(base, compose_file, "compose_file")
             docker.compose_down(str(cf), project_name=state["compose_project"])
+        else:
+            ctx.log(_task_id(task),
+                    f"compose deployment {payload['deployment_id']} has no "
+                    f"compose file recorded; skipping compose down")
     state["status"] = "removed"
     state["container_name"] = None
     ctx.deployment_store.save(state)
@@ -163,9 +213,10 @@ def handle_rollback(ctx, task: dict) -> dict:
             raise HandlerError(
                 f"rollback target {target_id} belongs to a different project"
             )
-        if not candidate.get("container_name"):
+        if not _restorable(candidate):
             raise HandlerError(
-                f"rollback target {target_id} has no container recorded"
+                f"rollback target {target_id} has no container or compose "
+                f"stack recorded"
             )
         ctx.log(_task_id(task),
                 f"rollback target (control plane): {target_id}")
@@ -175,7 +226,7 @@ def handle_rollback(ctx, task: dict) -> dict:
             s for s in ctx.deployment_store.list_all()
             if s.get("project_id") == project_id
             and s.get("deployment_id") != current["deployment_id"]
-            and s.get("container_name")
+            and _restorable(s)
             and s.get("status") in ("running", "superseded", "stopped")
         ]
         if not candidates:
@@ -185,10 +236,8 @@ def handle_rollback(ctx, task: dict) -> dict:
         target = candidates[0]  # list_all is newest-first
     ctx.log(_task_id(task),
             f"rolling back {current['deployment_id']} -> {target['deployment_id']}")
-    if current.get("container_name"):
-        docker.stop(current["container_name"])
-        docker.rm(current["container_name"], force=True)
-    docker.start(target["container_name"])
+    _teardown_current(ctx, docker, current)
+    _restore_deployment(ctx, docker, target)
     current["status"] = "rolled_back"
     ctx.deployment_store.save(current)
     target["status"] = "running"
