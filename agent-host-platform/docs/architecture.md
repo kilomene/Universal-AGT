@@ -130,6 +130,34 @@ The **task row is the source of truth**, not the agent's session:
 - If a worker dies mid-task, the task row shows the last reported progress
   and log chunks; another worker can pick the work back up and the retry
   budget (`attempts` / `max_attempts`) is enforced by the control plane.
+- **Retry policy.** A worker-reported `failed` becomes `retrying` (then back
+  to `queued` via the sweeper) when `attempts < max_attempts` and the task
+  type is safe to re-run from where it failed: idempotent reads always;
+  `deploy`/`restart`/`start`/`stop`/build tasks only when the attempt never
+  reached `running` (failed while still `claimed`); `remove`/`rollback` never
+  auto-retry. Retried tasks keep the same idempotency key, so a duplicate
+  report replays instead of double-applying.
+- **Claim leases.** Every claim records `lease_expires_at` (now +
+  `TASK_CLAIM_LEASE_S`, default 600s), refreshed on each progress report —
+  an actively-reporting worker is never swept. The stuck-task sweeper
+  requeues tasks stranded in `claimed`/`running` past their lease
+  (`task.requeued`, attempt counted) or fails them when the retry budget is
+  exhausted / the retry policy forbids it (`task.failed`).
+- **Zero-downtime same-version redeploy.** Container names are unique per
+  deployment attempt (`uaht-<project>-<version>-<deployment[:8]>`), so
+  redeploying a version never stop+rms the live container: it keeps serving
+  until the new container passes health, then it is stopped (kept, not
+  removed) for rollback. The actual name lives in the worker's `state.json`,
+  which is what reconcile and the lifecycle handlers use.
+- **Port registry.** `POST /v1/deployments` accepts an optional fixed
+  `host_port`, reserved in the `port_allocations` table (unique per
+  host+port → 409 on collision). The worker verifies the port is free at OS
+  level (bind test) and Docker level (`docker ps` published-port scan)
+  before `docker run`, failing the task with a clear error on collision.
+  Reservations release when the deployment reaches `failed`/`rolled_back`/
+  `stopped` or is superseded by a newer deployment of the same
+  project+host; `deployments.ports` is written from the deploy task's
+  `result.ports` on completion.
 - Deployment rows carry `status` through the full lifecycle
   (`requested → building → starting → healthcheck → running`, with
   `failed` / `rolled_back` / `stopped` as terminal branches), so a
