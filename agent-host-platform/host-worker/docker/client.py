@@ -11,6 +11,7 @@ non-zero exit.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -20,6 +21,82 @@ DOCKER_BINARY = "docker"
 
 # Safe for identifiers the worker mints (container names, image tags).
 _SAFE_IDENT = re.compile(r"[^a-z0-9_.-]+")
+
+# Restart policies the worker will pass to `docker run`. Anything else is
+# rejected before the argv is built (fail closed, not docker's error).
+RESTART_POLICIES = ("no", "always", "unless-stopped", "on-failure")
+
+# `--memory` / `--cpus` shapes accepted by run(). Values that do not match
+# are rejected client-side so a malformed payload fails fast with a clear
+# error instead of a cryptic docker CLI failure.
+_MEMORY_RE = re.compile(r"^\d+(\.\d+)?[bkmgBKMG]$")
+_CPU_RE = re.compile(r"^\d+(\.\d+)?$")
+_BUILD_ARG_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+# Environment allowlist for `docker compose` subprocesses (W5).
+#
+# Compose interpolates ${VAR} in the compose file from the worker's OS
+# environment — and the worker environment carries WORKER_HOST_TOKEN.
+# An agent-controlled compose file with
+#   environment: ["X=${WORKER_HOST_TOKEN}"]
+# would otherwise exfiltrate the host token into a container the agent
+# controls. Compose subprocesses therefore run with a scrubbed
+# environment containing only non-secret operational variables.
+# Defaults restrictive: anything not on this list is invisible to the
+# compose file.
+SAFE_COMPOSE_ENV_KEYS = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY",
+    "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES",
+})
+
+
+def compose_subprocess_env() -> dict:
+    """Scrubbed environment for `docker compose` subprocesses."""
+    return {k: v for k, v in os.environ.items() if k in SAFE_COMPOSE_ENV_KEYS}
+
+
+def validate_run_args(ports=None, memory=None, cpus=None,
+                      restart: str = "unless-stopped") -> None:
+    """Validate docker-run arguments client-side. Raises ValueError.
+
+    Pure function — unit tested. The pipeline/handlers call run(), which
+    invokes this before building the argv.
+    """
+    if restart not in RESTART_POLICIES:
+        raise ValueError(
+            f"invalid restart policy {restart!r}; must be one of "
+            f"{list(RESTART_POLICIES)}"
+        )
+    if memory is not None and not _MEMORY_RE.match(str(memory)):
+        raise ValueError(
+            f"invalid memory limit {memory!r}; must look like '256m' or '1g'"
+        )
+    if cpus is not None:
+        if not _CPU_RE.match(str(cpus)) or float(cpus) <= 0:
+            raise ValueError(
+                f"invalid cpu limit {cpus!r}; must be a positive number"
+            )
+    for host_port, container_port in (ports or {}).items():
+        for value, what in ((host_port, "host"), (container_port, "container")):
+            try:
+                port = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"invalid {what} port {value!r}; must be an integer"
+                )
+            if not 1 <= port <= 65535:
+                raise ValueError(
+                    f"invalid {what} port {value!r}; must be 1..65535"
+                )
+
+
+def validate_build_args(build_args: Optional[dict]) -> None:
+    """Build-arg keys become `docker --build-arg KEY=...` argv elements;
+    keep them identifier-shaped so a key can never smuggle a CLI flag."""
+    for key in (build_args or {}):
+        if not _BUILD_ARG_KEY_RE.match(str(key)):
+            raise ValueError(f"invalid build-arg key: {key!r}")
 
 
 class DockerMissing(Exception):
@@ -53,7 +130,8 @@ class DockerClient:
 
     # -- low level -------------------------------------------------------
     def _run(self, *argv: str, timeout: Optional[int] = 300,
-             check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+             check: bool = True, capture: bool = True,
+             env: Optional[dict] = None) -> subprocess.CompletedProcess:
         full = [self.binary, *argv]
         try:
             proc = subprocess.run(
@@ -61,6 +139,7 @@ class DockerClient:
                 stdout=subprocess.PIPE if capture else None,
                 stderr=subprocess.PIPE if capture else None,
                 text=True,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise DockerMissing(f"docker binary disappeared: {exc}")
@@ -82,6 +161,7 @@ class DockerClient:
     # -- images ----------------------------------------------------------
     def build(self, context_dir: str, dockerfile: str, tag: str,
               build_args: Optional[dict] = None, timeout: int = 1200) -> str:
+        validate_build_args(build_args)
         argv = ["build", "-t", tag, "-f", dockerfile]
         for key, val in (build_args or {}).items():
             argv += ["--build-arg", f"{key}={val}"]
@@ -110,7 +190,29 @@ class DockerClient:
         parameter. Caller-supplied docker flags were an argv-injection path
         to host root (``--privileged``, ``-v /:/host``); they were removed
         from the protocol and are rejected by policy before execution.
+
+        EXPLICIT DENY LIST (W5): ``docker run`` NEVER receives any of the
+        following — they are not parameters of this method at all, so no
+        caller, however compromised, can smuggle them into the argv built
+        here:
+
+          * ``--privileged``
+          * ``--network host`` (host networking)
+          * ``--pid host`` / ``--ipc host`` / ``--uts host``
+          * ``--device`` (host device access)
+          * ``-v /var/run/docker.sock:...`` (docker socket mount)
+          * ``-v`` / ``--volume`` / ``--mount`` (any host bind mount —
+            containers run with no host filesystem access at all)
+          * ``--cap-add`` (added capabilities)
+          * ``--security-opt`` (custom security options)
+
+        What run() DOES accept is allowlisted and validated client-side by
+        validate_run_args(): restart policy, --memory/--cpus shapes, and
+        1..65535 port mappings. Defaults restrictive: a bare
+        run(name, image) publishes no ports and mounts nothing.
         """
+        validate_run_args(ports=ports, memory=memory, cpus=cpus,
+                          restart=restart)
         name = sanitize_ident(name)
         argv = ["run", "-d", "--name", name]
         for host_port, container_port in (ports or {}).items():
@@ -193,6 +295,11 @@ class DockerClient:
             return 0
 
     # -- compose ---------------------------------------------------------
+    # Every compose invocation runs with compose_subprocess_env(): the
+    # compose file interpolates ${VAR} from the subprocess environment,
+    # and the worker's real environment carries WORKER_HOST_TOKEN. The
+    # scrubbed env keeps the token (and every other secret) invisible
+    # to agent-controlled compose files.
     def compose_up(self, compose_file: str, project_name: Optional[str] = None,
                    build: bool = False, timeout: int = 1200) -> str:
         argv = ["compose", "-f", compose_file]
@@ -201,7 +308,8 @@ class DockerClient:
         argv += ["up", "-d"]
         if build:
             argv.append("--build")
-        return self._run(*argv, timeout=timeout).stdout[-4000:]
+        return self._run(*argv, timeout=timeout,
+                         env=compose_subprocess_env()).stdout[-4000:]
 
     def compose_down(self, compose_file: str, project_name: Optional[str] = None,
                      timeout: int = 300) -> str:
@@ -209,7 +317,8 @@ class DockerClient:
         if project_name:
             argv += ["-p", sanitize_ident(project_name)]
         argv += ["down"]
-        return self._run(*argv, timeout=timeout, check=False).stdout[-4000:]
+        return self._run(*argv, timeout=timeout, check=False,
+                         env=compose_subprocess_env()).stdout[-4000:]
 
     def compose_ps(self, project_name: str, timeout: int = 60) -> list:
         """`docker compose -p <name> ps --format json`, parsed to a list of
@@ -219,7 +328,8 @@ class DockerClient:
         raises on unparseable output — returns what parsed."""
         argv = ["compose", "-p", sanitize_ident(project_name),
                 "ps", "--format", "json"]
-        out = (self._run(*argv, timeout=timeout, check=False).stdout or "").strip()
+        out = (self._run(*argv, timeout=timeout, check=False,
+                         env=compose_subprocess_env()).stdout or "").strip()
         records: list = []
         if not out:
             return records
@@ -248,6 +358,7 @@ class DockerClient:
         worker can verify them free. Raises DockerError on failure."""
         out = self._run("compose", "-f", compose_file, "config",
                         "--format", "json",
-                        timeout=timeout).stdout
+                        timeout=timeout,
+                        env=compose_subprocess_env()).stdout
         data = json.loads(out)
         return data if isinstance(data, dict) else {}
