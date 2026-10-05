@@ -11,6 +11,7 @@ That document is authoritative; this page is a quick map. Base URL is
 |---|---|---|---|
 | POST | `/v1/agents/register` | — (one-time bootstrap) | Register an agent; returns `api_key` **once** |
 | GET | `/v1/agents/me` | agent key | Caller's own agent row (no secrets) |
+| POST | `/v1/agents/me/rotate` | agent key | Rotate the caller's API key; returns the **new** key once |
 
 ## Tasks — durable work queue
 
@@ -26,11 +27,13 @@ That document is authoritative; this page is a quick map. Base URL is
 Task types: `deploy`, `restart`, `stop`, `start`, `remove`, `rollback`,
 `logs`, `status`, `healthcheck`, `build`, `docker-build`, `docker-run`,
 `docker-compose`, `environment-update`, `artifact-download`,
-`artifact-upload`, `system-info`. Payload shapes per type are in PROTOCOL §5.
+`artifact-upload`, `system-info`, `ingress-sync`. Payload shapes per type
+are in PROTOCOL §5.
 
 Status machine: `queued → claimed → running → completed | failed`, with
-`awaiting_approval` parked between `running` and `queued` in manual mode and
-`cancelled` reachable from any non-terminal state.
+`awaiting_approval` parked *before* `queued` in manual mode (the task is
+created there; approve → `queued`), `retrying` as the requeue hop for
+retryable failures, and `cancelled` reachable from any non-terminal state.
 
 ## Hosts
 
@@ -39,6 +42,7 @@ Status machine: `queued → claimed → running → completed | failed`, with
 | GET | `/v1/hosts` | agent key (`read_status`) | All hosts |
 | GET | `/v1/hosts/:id` | agent key (`read_status`) | Host + last heartbeat stats + running apps |
 | POST | `/v1/hosts/register` | — (one-time bootstrap) | Register a host; returns `host_token` **once** |
+| POST | `/v1/hosts/:id/rotate-token` | host token | Rotate the host's token; returns the **new** token once |
 
 ## Worker-facing (host token only)
 
@@ -47,6 +51,8 @@ Status machine: `queued → claimed → running → completed | failed`, with
 | POST | `/v1/hosts/:id/heartbeat` | host token | Stats + running apps; returns `pending_tasks` |
 | POST | `/v1/worker/tasks/claim?wait=25` | host token | Atomically claim one queued task (204 if none) |
 | POST | `/v1/worker/tasks/:id/progress` | host token | Status + log chunks + result/error |
+| GET | `/v1/worker/domains` | host token | Tunnel-mode domains for the ingress route table |
+| GET | `/v1/worker/projects/:project_id/secrets` | host token | Decrypted project secrets (only with live work for that project) |
 
 A host token can never call agent endpoints and vice versa.
 
@@ -80,6 +86,17 @@ A host token can never call agent endpoints and vice versa.
 Deployment statuses: `requested`, `approved`, `building`, `starting`,
 `healthcheck`, `running`, `failed`, `rolled_back`, `stopped`, `stopping`.
 
+## Domains
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/v1/domains` | agent key (`manage_domains`) | Attach a hostname to a deployment; optional `ingress: tunnel\|direct` |
+| GET | `/v1/domains?deployment_id=` | agent key (`manage_domains`) | List attached hostnames |
+| DELETE | `/v1/domains` | agent key (`manage_domains`) | Remove a hostname (`{"deployment_id", "hostname"}`); deletes the DNS record |
+
+See [`cloudflare.md`](cloudflare.md) for the three ingress modes — DNS
+alone cannot reach an outbound-only host.
+
 ## Secrets
 
 | Method | Path | Auth | Purpose |
@@ -96,12 +113,17 @@ Deployment statuses: `requested`, `approved`, `building`, `starting`,
 | GET | `/v1/events/stream` | agent key (`read_status`) | SSE live stream, `data: {event}\n\n` per event |
 
 Canonical event types: `agent.connected`, `agent.disconnected`,
+`agent.key_rotated`,
 `task.created/claimed/started/awaiting_approval/approved/rejected/completed/failed/cancelled`,
+`task.retrying`, `task.requeued`,
 `artifact.created`, `artifact.upload_failed`,
 `deployment.requested/approved/started/building/healthcheck/completed/failed/rolled_back`,
-`service.started/stopped/restarted`,
-`host.registered/online/offline`,
+`deployment.rollback_requested`, `deployment.rollback_failed`,
+`service.started/stopped/restarted/removed`, `service.crash_loop`,
+`domain.requested/added/removed`,
+`host.registered/online/offline/degraded`, `host.token_rotated`,
 `healthcheck.passed/failed`, `worker.updated`, `secret.updated`.
+Treat unknown types as opaque.
 
 ## Misc
 
@@ -114,4 +136,5 @@ Canonical event types: `agent.connected`, `agent.disconnected`,
 All failures return `{ "error": { "code": "...", "message": "..." } }`.
 Codes: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`
 (idempotency key reused with a different payload), `unprocessable`
-(manifest/validation failure), `rate_limited`.
+(manifest/validation failure), `payload_too_large` (413 — artifact over
+`ARTIFACT_MAX_BYTES`), `rate_limited`.
