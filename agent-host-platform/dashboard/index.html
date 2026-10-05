@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Universal AGT — Control Plane Dashboard</title>
+  <!-- Relative asset URLs: this page must work from ANY base path the
+       control plane serves it at ("/", "/dash/", ...). -->
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">&#9670;</span>
+      <span>Universal&nbsp;AGT</span>
+      <span class="sub">control plane</span>
+    </div>
+    <div class="top-right">
+      <span id="conn" class="conn unknown" title="connection status">connecting&hellip;</span>
+      <span id="agentName" class="agent"></span>
+      <button id="logoutBtn" class="btn small" type="button" hidden>Sign out</button>
+    </div>
+  </header>
+
+  <!-- Auth gate: API key is kept in sessionStorage ONLY (never localStorage,
+       never cookies) and is cleared when the tab closes. -->
+  <div id="authOverlay" class="overlay" hidden>
+    <form id="authForm" class="auth-card" autocomplete="off">
+      <h1>Control Plane Access</h1>
+      <p class="muted">Enter an agent API key. It stays in this tab&rsquo;s
+        session storage and is sent as <code>Authorization: Bearer</code>.</p>
+      <p id="authError" class="error" hidden></p>
+      <label for="apiKeyInput">API key</label>
+      <input id="apiKeyInput" type="password" name="api-key" autocomplete="off"
+             spellcheck="false" placeholder="uagt_&hellip;" required>
+      <button class="btn primary" type="submit">Connect</button>
+    </form>
+  </div>
+
+  <main class="grid">
+    <section class="panel wide" aria-label="Hosts">
+      <div class="panel-head">
+        <h2>Hosts</h2>
+        <span class="updated" id="hostsUpdated"></span>
+      </div>
+      <p class="panel-error" id="hostsError" hidden></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th><th>Status</th><th>CPU</th><th>RAM</th><th>Disk</th>
+              <th>Apps</th><th>Worker</th><th>Last seen</th>
+            </tr>
+          </thead>
+          <tbody id="hostsBody">
+            <tr class="empty"><td colspan="8">No hosts yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel wide" aria-label="Applications">
+      <div class="panel-head">
+        <h2>Applications</h2>
+        <span class="updated" id="servicesUpdated"></span>
+      </div>
+      <p class="panel-error" id="servicesError" hidden></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Service</th><th>Version</th><th>Status</th><th>Health</th>
+              <th>Host</th><th>Ports</th><th>Domains</th>
+            </tr>
+          </thead>
+          <tbody id="servicesBody">
+            <tr class="empty"><td colspan="7">No running services.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" aria-label="Deployments">
+      <div class="panel-head">
+        <h2>Deployments</h2>
+        <span class="updated" id="deploymentsUpdated"></span>
+      </div>
+      <p class="panel-error" id="deploymentsError" hidden></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Version</th><th>Status</th><th>Health</th><th>Host</th><th>Created</th></tr>
+          </thead>
+          <tbody id="deploymentsBody">
+            <tr class="empty"><td colspan="6">No deployments.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" aria-label="Tasks">
+      <div class="panel-head">
+        <h2>Tasks</h2>
+        <span class="updated" id="tasksUpdated"></span>
+      </div>
+      <p class="panel-error" id="tasksError" hidden></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Type</th><th>Status</th><th>Host</th><th>Attempts</th><th>Created</th></tr>
+          </thead>
+          <tbody id="tasksBody">
+            <tr class="empty"><td colspan="6">No tasks.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel wide" aria-label="Live events">
+      <div class="panel-head">
+        <h2>Live events</h2>
+        <span class="updated" id="eventsUpdated"></span>
+      </div>
+      <p class="panel-error" id="eventsError" hidden></p>
+      <ul id="eventsList" class="events" aria-live="polite"></ul>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span class="muted">Universal AGT dashboard &middot; panels refresh every 10s &middot;
+      events stream live via SSE (latest 200 kept)</span>
+  </footer>
+
+  <noscript><p class="noscript">This dashboard needs JavaScript to talk to the control plane API.</p></noscript>
+  <script src="js/app.js"></script>
+</body>
+</html>
