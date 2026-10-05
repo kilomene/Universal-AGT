@@ -12,6 +12,34 @@ Content-Type: `application/json` everywhere unless noted.
 
 ## Changelog
 
+- **2026-10-05 — Phase 4 (multi-application hosting).**
+  - Compose deployments now get the same host-port safety as `docker run`:
+    before `docker compose up` the worker reads the declared published
+    ports via `docker compose config --format json` and verifies each free
+    at OS level (bind test) and Docker level (`docker ps` scan); ports
+    already held by the same compose project's current stack are skipped
+    (a redeploy replaces its own stack). A collision fails the deploy task
+    before any container starts.
+  - Compose rollback fixed: on healthcheck failure the worker tears down
+    the new unhealthy stack (`docker compose down`) and restores the
+    previous stack (`docker compose up` with the compose file recorded in
+    its state). Worker state now records `compose_project`,
+    `compose_file`, and `image_built` per deployment.
+  - Garbage collection: after every successful deploy the worker keeps
+    `DEPLOY_KEEP_GENERATIONS` (default 2) newest generations per project
+    and removes older stopped containers (`docker rm`) plus images the
+    worker itself built (`docker rmi`), never an image still referenced by
+    a kept generation, never a prebuilt/external image, and never a
+    container docker still reports as running. Compose generations are
+    collected with `compose down`.
+  - Compose port discovery no longer parses `docker ps` text: it reads
+    `docker compose -p <name> ps --format json` (Publishers) with a
+    `docker inspect` NetworkSettings.Ports fallback.
+  - Artifact extraction now detects tar/zip by magic bytes instead of the
+    download filename (the worker stores artifacts as `<id>.bin`).
+  - No REST changes: all of the above is worker behavior; the API surface
+    is backwards compatible.
+
 - **2026-10-05 — Phase 3 (task/deployment reliability).**
   - Task retry policy: a worker-reported `failed` now becomes `retrying`
     (then back to `queued` via the sweeper) when the retry budget
