@@ -1,0 +1,103 @@
+name: CI
+
+# One fresh run per branch — queued/pending runs are cancelled, never stacked.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  control-plane:
+    name: Control Plane API (tsc + vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: agent-host-platform/control-plane/api/package-lock.json
+      - run: npm ci
+        working-directory: agent-host-platform/control-plane/api
+      - run: npm run build
+        working-directory: agent-host-platform/control-plane/api
+      - run: npm test
+        working-directory: agent-host-platform/control-plane/api
+
+  js-sdk:
+    name: JS SDK (node:test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm test
+        working-directory: agent-host-platform/agent-sdk/javascript
+
+  host-worker:
+    name: Host Worker (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: agent-host-platform/host-worker/requirements.txt
+      - run: pip install -r requirements.txt
+        working-directory: agent-host-platform/host-worker
+      - run: python -m pytest tests/ -q
+        working-directory: agent-host-platform/host-worker
+
+  python-sdk:
+    name: Python SDK (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e . pytest
+        working-directory: agent-host-platform/agent-sdk/python
+      - run: python -m pytest test/ -q
+        working-directory: agent-host-platform/agent-sdk/python
+
+  cli:
+    name: CLI (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ./agent-sdk/python
+        working-directory: agent-host-platform
+      - run: pip install -e .
+        working-directory: agent-host-platform/cli
+      - run: python test/smoke_help.py
+        working-directory: agent-host-platform/cli
+
+  secrets-sweep:
+    name: Secrets sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail on committed secrets or env files
+        run: |
+          set -euo pipefail
+          # No .env files may ever be committed
+          if git ls-files | grep -E '(^|/)\.env($|\.)' ; then
+            echo "ERROR: .env file committed"; exit 1
+          fi
+          # No private keys, tokens, or passwords in tracked files
+          if git grep -nEi 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[bap]-|sk-live-|aws_secret_access_key|password\s*=\s*["'"'"'][^"'"'"']+["'"'"']' -- ':!*.md' ':!docs/**' ; then
+            echo "ERROR: possible secret found in tracked files"; exit 1
+          fi
+          echo "secrets sweep clean"
