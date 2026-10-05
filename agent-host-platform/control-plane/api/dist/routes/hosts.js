@@ -61,6 +61,38 @@ exports.hostsRouter.post('/register', auth_1.provisioningOrDeploy, async (req, r
         next(err);
     }
 });
+// POST /v1/hosts/:id/rotate-token — HOST token only, and the token must
+// belong to the host in the path. Returns the NEW host token (shown once);
+// the old token stops working immediately. Emits host.token_rotated.
+// (The host_id in the URL is validated as a UUID by the DB lookup; a
+// non-existent id can never match req.auth.id, so it 403s like a mismatch.)
+exports.hostsRouter.post('/:id/rotate-token', auth_1.requireHost, async (req, res, next) => {
+    try {
+        if (req.params.id !== req.auth.id) {
+            (0, errors_1.sendError)(res, 403, 'forbidden', 'host token does not belong to this host');
+            return;
+        }
+        const pool = (0, pool_1.getPool)();
+        const { token, hash } = (0, tokens_1.generateHostToken)();
+        const { rowCount } = await pool.query(`UPDATE hosts SET token_hash = $2, updated_at = now() WHERE id = $1`, [req.auth.id, hash]);
+        if (!rowCount) {
+            next(new errors_1.HttpError(404, 'not_found', 'host not found'));
+            return;
+        }
+        await (0, events_1.appendEvent)(pool, {
+            type: 'host.token_rotated',
+            actor_type: 'host',
+            actor_id: req.auth.name,
+            host_id: req.auth.id,
+            payload: {},
+        });
+        log_1.logger.info('host token rotated', { host: req.auth.name });
+        res.json({ host_token: token });
+    }
+    catch (err) {
+        next(err);
+    }
+});
 // GET /v1/hosts — agent, read_status.
 exports.hostsRouter.get('/', auth_1.requireAgent, (0, auth_1.requirePermission)('read_status'), async (_req, res, next) => {
     try {
