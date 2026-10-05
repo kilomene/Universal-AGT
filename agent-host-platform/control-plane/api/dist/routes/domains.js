@@ -14,9 +14,14 @@ async function getDeployment(pool, id) {
     const { rows } = await pool.query('SELECT id, project_id, host_id, domains FROM deployments WHERE id = $1', [id]);
     return rows[0];
 }
-// POST /v1/domains {deployment_id, hostname}
+// POST /v1/domains {deployment_id, hostname, ingress?}
 // Records the domain on the deployment; when Cloudflare is configured,
-// creates a CNAME hostname -> PUBLIC_INGRESS_HOSTNAME (proxied).
+// creates a proxied CNAME hostname -> ingress target (tunnel hostname in
+// tunnel mode, PUBLIC_INGRESS_HOSTNAME in direct mode, the default).
+// `ingress` accepts 'tunnel' | 'direct'; tunnel mode without
+// TUNNEL_INGRESS_HOSTNAME configured is a 422. Tunnel-mode changes enqueue
+// an `ingress-sync` task for the host so the worker rebuilds its tunnel
+// routes.
 exports.domainsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermission)('manage_domains'), async (req, res, next) => {
     try {
         const { deployment_id, hostname } = req.body ?? {};
@@ -26,6 +31,14 @@ exports.domainsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermissio
         }
         if (!(0, cloudflare_1.isValidHostname)(hostname)) {
             (0, errors_1.sendError)(res, 400, 'bad_request', 'hostname is not a valid DNS name');
+            return;
+        }
+        let mode;
+        try {
+            mode = (0, cloudflare_1.resolveIngressMode)(req.body?.ingress);
+        }
+        catch (err) {
+            next(err);
             return;
         }
         const pool = (0, pool_1.getPool)();
@@ -43,11 +56,17 @@ exports.domainsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermissio
             hostname,
             status: 'dns_pending',
             added_at: new Date().toISOString(),
+            ingress: mode,
         };
         const cfg = (0, cloudflare_1.getCloudflareConfig)();
+        if (mode === 'tunnel') {
+            // 422 when the operator asked for tunnel mode without configuring it.
+            // Reads the env directly: tunnel routing doesn't need the DNS token.
+            entry.tunnel_host = (0, cloudflare_1.requireTunnelHostname)();
+        }
         if (cfg) {
             try {
-                entry.cf_record_id = await (0, cloudflare_1.ensureCnameRecord)(cfg, hostname);
+                entry.cf_record_id = await (0, cloudflare_1.ensureCnameRecord)(cfg, hostname, (0, cloudflare_1.cnameTargetFor)(cfg, mode));
                 entry.status = 'active';
             }
             catch (err) {
@@ -61,13 +80,21 @@ exports.domainsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermissio
             JSON.stringify(domains),
             deployment_id,
         ]);
+        let ingressTaskId = null;
+        if (mode === 'tunnel') {
+            ingressTaskId = await enqueueIngressSync(pool, dep.host_id, req.auth.id, { trigger: 'domain.added', hostname });
+        }
         await (0, events_1.appendEvent)(pool, {
             type: cfg ? 'domain.added' : 'domain.requested',
             actor_type: 'agent',
             actor_id: req.auth.name,
             deployment_id,
             host_id: dep.host_id,
-            payload: { hostname, status: entry.status, dns_managed: cfg !== null },
+            payload: {
+                hostname, status: entry.status, dns_managed: cfg !== null,
+                ingress: mode, tunnel_host: entry.tunnel_host ?? null,
+                ingress_task_id: ingressTaskId,
+            },
         });
         res.status(201).json({ domain: entry });
     }
@@ -75,6 +102,24 @@ exports.domainsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermissio
         next(err);
     }
 });
+/**
+ * Queue an `ingress-sync` task for a host so its worker rebuilds the
+ * tunnel route table (used when tunnel-mode domains change). Returns the
+ * task id, or null when the insert fails (logged; the domain record is the
+ * source of truth and a later manual ingress-sync heals it).
+ */
+async function enqueueIngressSync(pool, hostId, createdBy, trigger) {
+    try {
+        const { rows } = await pool.query(`INSERT INTO tasks (created_by, assigned_to, type, status, payload)
+       VALUES ($1, $2, 'ingress-sync', 'queued', $3) RETURNING id`, [createdBy, hostId, JSON.stringify(trigger)]);
+        log_1.logger.info('ingress-sync task queued', { task: rows[0].id, host: hostId, trigger });
+        return rows[0].id;
+    }
+    catch (err) {
+        log_1.logger.error('failed to queue ingress-sync task', { host: hostId, err });
+        return null;
+    }
+}
 // GET /v1/domains?deployment_id= — list domains for a deployment.
 exports.domainsRouter.get('/', auth_1.requireAgent, (0, auth_1.requirePermission)('manage_domains'), async (req, res, next) => {
     try {
@@ -124,13 +169,17 @@ exports.domainsRouter.delete('/', auth_1.requireAgent, (0, auth_1.requirePermiss
             JSON.stringify(domains),
             deployment_id,
         ]);
+        let ingressTaskId = null;
+        if ((removed.ingress ?? 'direct') === 'tunnel') {
+            ingressTaskId = await enqueueIngressSync(pool, dep.host_id, req.auth.id, { trigger: 'domain.removed', hostname: removed.hostname });
+        }
         await (0, events_1.appendEvent)(pool, {
             type: 'domain.removed',
             actor_type: 'agent',
             actor_id: req.auth.name,
             deployment_id,
             host_id: dep.host_id,
-            payload: { hostname: removed.hostname },
+            payload: { hostname: removed.hostname, ingress_task_id: ingressTaskId },
         });
         res.json({ removed: removed.hostname });
     }
