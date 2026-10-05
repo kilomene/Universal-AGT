@@ -14,6 +14,20 @@ Get the key once from `POST /v1/agents/register` (response field `api_key`,
 shown once). Store in secret storage; never in code, logs, tickets, or repos.
 Host tokens and agent keys are not interchangeable (403 if crossed).
 
+## 0.1 Credential rotation
+
+Keys rotate without downtime — the old credential stops working the moment
+the new one is issued:
+
+```
+POST /v1/agents/me/rotate          → 200 {"agent": {...}, "api_key": "<new, shown once>"}
+```
+
+SDK: JS `await client.rotateKey()` → `{agent, api_key}`;
+Python `client.rotate_agent_key()` → same. Emits `agent.key_rotated`.
+(Host tokens: `POST /v1/hosts/:id/rotate-token` with the host token —
+emits `host.token_rotated`. Agents cannot rotate host tokens.)
+
 ## 1. Register an agent
 
 ```
@@ -26,6 +40,11 @@ POST /v1/agents/register
 ```
 
 - `type` is a free-form label (default `"generic"`); it gates nothing.
+- Registration is gated: send header
+  `X-Provisioning-Token: <UAHT_PROVISIONING_TOKEN>` (the operator's token —
+  get it from whoever runs the control plane). With the env var unset, only
+  the very first registration is open (bootstrap mode); afterwards it 403s.
+  In production (`NODE_ENV=production`) the server refuses to boot without it.
 - `permissions` is an object of booleans. Valid keys:
   `deploy`, `read_status`, `read_logs`, `restart`, `stop`, `remove`,
   `manage_domains`, `approve_deployments`, `manage_secrets`.
@@ -120,8 +139,9 @@ POST /v1/deployments
   deployments compare `project_id`/`host_id`/`version`/`artifact_id`/
   `mode`/`host_port`.
 - `mode: "automatic"` (default): task flows straight through.
-  `mode: "manual"`: task parks at `awaiting_approval` until an agent with
-  `approve_deployments` approves (→ `queued`) or rejects (→ `cancelled`).
+  `mode: "manual"`: the task is *created* in `awaiting_approval` (no worker
+  can claim it there) until an agent with `approve_deployments` approves
+  (→ `queued`) or rejects (→ `cancelled`).
 - Query: `GET /v1/deployments?project_id=&host_id=&status=`;
   detail: `GET /v1/deployments/:id → {"deployment": ..., "task": ...}`.
   Deployment `status`: `requested|approved|building|starting|healthcheck|
@@ -134,7 +154,7 @@ POST /v1/deployments
 POST /v1/tasks
 {"type": "deploy|restart|stop|start|remove|rollback|logs|status|healthcheck|
           build|docker-build|docker-run|docker-compose|environment-update|
-          artifact-download|artifact-upload|system-info",
+          artifact-download|artifact-upload|system-info|ingress-sync",
  "payload": {...}, "idempotency_key": "<uuid>", "priority": 0,
  "host_id": "<uuid>", "mode": "automatic|manual"}
 → 201 {"task": {...}} ; 200 + idempotent_replay on key reuse; 409 on key conflict
@@ -147,11 +167,12 @@ POST /v1/tasks/:id/approve           → needs approve_deployments; awaiting_app
 POST /v1/tasks/:id/reject            → needs approve_deployments; awaiting_approval → cancelled
 ```
 
-Per-type permission map on `POST /v1/tasks`:
+Per-type permission map on `POST /v1/tasks` (exact, from the route code):
 `deploy` ← deploy, remove, rollback, build, docker-build, docker-run,
-docker-compose, environment-update, artifact-upload ·
+docker-compose, environment-update, artifact-upload, **ingress-sync** ·
 `restart` ← restart, start · `stop` ← stop ·
-`read_status` ← logs, status, healthcheck, system-info, artifact-download.
+`read_status` ← logs, status, healthcheck, system-info, artifact-download ·
+unknown types → `deploy` (defensive: never open).
 
 Payloads by type: `deploy {project_id, version, artifact_id?, manifest?}`;
 `rollback {deployment_id, target_deployment_id?}`;
@@ -225,7 +246,10 @@ GET /v1/tasks/<id> → {"task": {"status": "completed", "result": {"logs": "..."
 
 CLI: `agent-host logs --deployment <id>` (waits, prints text) /
 `--follow` (streams chunks). SDK: Python `get_logs(deployment_id=...)`,
-JS `getLogs({deploymentId})`; `follow=True` yields incremental chunks.
+JS `getLogs({deploymentId})`; `follow=True` (Python) / `follow: true` (JS)
+yields incremental chunks; JS also exposes `client.tailLogs({deploymentId})`
+as an async generator of chunks, and Python `client.tail_logs(deployment_id=...)`
+as an iterator.
 
 ## 7. Services — query, restart, stop, start
 
@@ -239,7 +263,44 @@ POST /v1/services/:id/start          # needs restart
 
 Each returns the created task; poll `GET /v1/tasks/:id` to terminal.
 
-## 8. Rollback
+## 8. Domains (public hostnames)
+
+Attach public hostnames to a deployment. Needs the `manage_domains`
+permission. See [`cloudflare.md`](cloudflare.md) for the three ingress
+modes — DNS alone cannot reach an outbound-only host.
+
+```
+POST   /v1/domains
+{"deployment_id": "<uuid>", "hostname": "api.example.com",
+ "ingress": "tunnel"|"direct"}            # optional; default: tunnel when
+                                          # TUNNEL_INGRESS_HOSTNAME is set on
+                                          # the control plane, else direct
+→ 201 {"domain": {"hostname": ..., "ingress": ..., "tunnel_host": ...,
+                  "cf_record_id": ..., "status": ...}, "ingress_task_id": ...}
+→ 422 if ingress=tunnel but TUNNEL_INGRESS_HOSTNAME is not configured
+→ 409 on duplicate hostname for the deployment
+
+GET    /v1/domains?deployment_id=<uuid>   → {"domains": [...]}  (manage_domains)
+DELETE /v1/domains
+{"deployment_id": "<uuid>", "hostname": "api.example.com"}   # deletes the DNS record too
+```
+
+Tunnel mode creates the proxied CNAME `hostname → TUNNEL_INGRESS_HOSTNAME`
+and queues an `ingress-sync` task for the host, which rewrites the
+worker-managed `cloudflared` route table (`hostname →
+http://127.0.0.1:<container-port>`). For dashboard-created tunnels, the
+hostname must also be added in **Zero Trust → Networks → Tunnels →
+Public hostnames** (Cloudflare reads routes from the dashboard config, not
+the worker's `config.yml`).
+
+SDK: JS `client.addDomain(deploymentId, hostname, ingress)` /
+Python `client.add_domain(deployment_id, hostname, ingress=...)`
+(`ingress`: `'tunnel'` | `'direct'`, omit for the server default);
+JS `client.listDomains(deploymentId)` / `client.removeDomain(deploymentId, hostname)`;
+Python `client.list_domains(deployment_id)` / `client.remove_domain(deployment_id, hostname)`.
+CLI: `agent-host domains add|list|rm --deployment <id> [--hostname ...] [--ingress tunnel|direct]`.
+
+## 9. Rollback
 
 ```
 POST /v1/deployments/:id/rollback    # needs deploy
@@ -251,7 +312,7 @@ the same project+host (no new deployment row). The worker's completion
 report drives `deployment.rolled_back`; event `deployment.rollback_requested`.
 `rollback` tasks never auto-retry.
 
-## 9. Manual deployments — approve / reject
+## 10. Manual deployments — approve / reject
 
 ```bash
 # as the approver (needs approve_deployments permission):
@@ -262,7 +323,7 @@ curl -s -X POST $CP/v1/tasks/<task-id>/reject -H "Authorization: Bearer $APPROVE
 # approving/rejecting a task NOT in awaiting_approval → 409 conflict
 ```
 
-## 10. Secrets
+## 11. Secrets
 
 ```
 POST   /v1/projects/:id/secrets {"name": "DB_PASS", "value": "..."}  # manage_secrets
@@ -274,7 +335,7 @@ Values are encrypted at rest and never returned, logged, or emitted in
 events. The worker receives decrypted values only inside the deploy task
 payload over its authenticated channel.
 
-## 11. Error codes — what to do
+## 12. Error codes — what to do
 
 | HTTP | code | Meaning | Agent action |
 |------|------|---------|--------------|
@@ -293,7 +354,7 @@ Timeout-with-unknown-outcome on any mutating call → re-send the *identical*
 body with the *same* idempotency key. Result is exactly-once: either the
 original object (200 replay) or the first creation (201).
 
-## 12. Task state diagram
+## 13. Task state diagram
 
 ```
                         ┌─────────────┐
@@ -306,14 +367,21 @@ original object (200 replay) or the first creation (201).
                  │  claimed   │────────┘
                  └──────┬─────┘
                         ▼
-                 ┌────────────┐   manual mode    ┌──────────────────┐
-                 │  running   │─────────────────►│ awaiting_approval│
-                 └──────┬─────┘                  └────────┬─────────┘
-                        │                        approve│ │reject
-        ┌───────────────┼───────────────┐               ▼ ▼
-        ▼               ▼               ▼         queued │ cancelled
-  completed          failed        cancelled ◄──────────┘
+                 ┌────────────┐
+                 │  running   │
+                 └──────┬─────┘
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+  completed          failed        cancelled
   (terminal)       (terminal)      (terminal)
+
+Manual mode: the task is CREATED in awaiting_approval (before queued):
+┌──────────────────┐ approve            ┌─────────┐
+│ awaiting_approval ├──────────▶ queued │  …      │
+└────────┬─────────┘ reject     └─────────┘
+         ▼
+     cancelled
+(approving/rejecting a non-awaiting_approval task → 409)
 
 Terminal: completed | failed | cancelled.
 `failed` may pass through `retrying` (then back to `queued`) when
@@ -322,7 +390,7 @@ deploy/restart/start/stop/build only if the attempt never reached running;
 remove/rollback never).
 ```
 
-## 13. Worked example — deploy url-shortener end to end
+## 14. Worked example — deploy url-shortener end to end
 
 Uses `examples/url-shortener` (Node http, zero deps; manifest
 `agent.deploy.json` declares port 3000, `/health` check).
@@ -433,7 +501,7 @@ Note: Python `deploy()` accepts `idempotency_key` on `create_deployment`;
 the `deploy()` convenience helper does not mint one — pass your own key
 when calling `create_deployment` directly.
 
-## 14. CLI quick map
+## 15. CLI quick map
 
 `agent-host` (env `UAHT_BASE_URL`, `UAHT_API_KEY`; global `--json` before the
 subcommand): `agents register|me`, `projects create|list|get|update`,
