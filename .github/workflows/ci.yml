@@ -10,6 +10,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# NOTE (2026-10-05): GitHub cannot currently acquire hosted runners for this
+# repo ("The job was not acquired by Runner of type hosted even after multiple
+# attempts" — runs queue ~15 min then auto-cancel). Every job below was
+# validated locally (YAML parse + each embedded check script runs green
+# against the repo) so the workflow is ready the moment runners are.
+
 jobs:
   control-plane:
     name: Control Plane API (tsc + vitest)
@@ -27,6 +33,120 @@ jobs:
         working-directory: agent-host-platform/control-plane/api
       - run: npm test
         working-directory: agent-host-platform/control-plane/api
+
+  migration-validation:
+    name: Migrations (numbering + parse + schema coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Validate migration chain 001..N
+        # Checks (fail the job on any violation):
+        #   1. filenames match ^NNN_name.sql and numbers run 001..N with NO gaps
+        #   2. every file parses as valid PostgreSQL — pglast (true PG grammar)
+        #      when installable, else a structural fallback (dollar-quote
+        #      balance + top-level statement counting)
+        #   3. every file yields >= 1 statement
+        #   4. database/schema/schema.sql contains every table the migrations
+        #      CREATE (canonical schema stays the superset of the chain)
+        run: |
+          set -euo pipefail
+          pip install -q pglast || echo "pglast unavailable — validator will use the structural fallback"
+          python3 - <<'PYEOF'
+          import re, sys
+          from pathlib import Path
+
+          ROOT = Path(".").resolve()
+          MIG_DIR = ROOT / "agent-host-platform" / "database" / "migrations"
+          SCHEMA = ROOT / "agent-host-platform" / "database" / "schema" / "schema.sql"
+          failures = []
+
+          def fail(msg):
+              print("FAIL:", msg); failures.append(msg)
+
+          def strip_line_comments(sql):
+              return re.sub(r"--[^\n]*", "", sql)
+
+          def iter_statements_fallback(sql):
+              # split on top-level semicolons, ignoring -- comments and $$..$$ bodies
+              buf, stmts, i, n = [], [], 0, len(sql)
+              while i < n:
+                  if sql.startswith("--", i):
+                      j = sql.find("\n", i); i = n if j == -1 else j; continue
+                  if sql.startswith("$$", i):
+                      j = sql.find("$$", i + 2)
+                      if j == -1: return None
+                      buf.append(sql[i:j+2]); i = j + 2; continue
+                  ch = sql[i]; buf.append(ch)
+                  if ch == ";":
+                      stmt = "".join(buf).strip()
+                      if stmt.strip(";").strip(): stmts.append(stmt)
+                      buf = []
+                  i += 1
+              return stmts
+
+          files = sorted(MIG_DIR.glob("*.sql"))
+          if not files: fail("no migration files found")
+
+          nums = []
+          for f in files:
+              m = re.fullmatch(r"(\d{3})_.+\.sql", f.name)
+              if not m:
+                  fail("bad migration filename (expected NNN_name.sql): " + f.name); continue
+              nums.append(int(m.group(1)))
+          nums.sort()
+          if nums != list(range(1, len(nums) + 1)):
+              fail("migration numbering gap/duplicate: found %s, expected %s"
+                   % (nums, list(range(1, len(nums) + 1))))
+          else:
+              print("ok: numbering 001..%03d, no gaps (%d files)" % (len(nums), len(files)))
+
+          try:
+              import pglast
+              HAVE_PGLAST = True
+          except ImportError:
+              HAVE_PGLAST = False
+              print("note: pglast unavailable, using structural fallback parser")
+
+          created = {}
+          for f in sorted(files):
+              sql = f.read_text()
+              if HAVE_PGLAST:
+                  try:
+                      stmts = pglast.parse_sql(sql)
+                  except Exception as e:
+                      fail("%s: SQL parse error: %s" % (f.name, e)); continue
+                  if not stmts:
+                      fail("%s: parses to zero statements" % f.name); continue
+                  print("ok: %s: pglast parsed %d statement(s)" % (f.name, len(stmts)))
+              else:
+                  stmts = iter_statements_fallback(sql)
+                  if stmts is None:
+                      fail("%s: unbalanced $$ dollar-quoting" % f.name); continue
+                  if not stmts:
+                      fail("%s: zero statements found" % f.name); continue
+                  print("ok: %s: structural check passed (%d statement(s))"
+                        % (f.name, len(stmts)))
+              for t in re.findall(r"(?i)\bcreate\s+table\s+(?:if\s+not\s+exists\s+)?(\w+)", sql):
+                  created.setdefault(t.lower(), f.name)
+
+          schema_tables = {t.lower() for t in re.findall(
+              r"(?i)\bcreate\s+table\s+(?:if\s+not\s+exists\s+)?(\w+)", SCHEMA.read_text())}
+          missing = sorted(t for t in created if t not in schema_tables)
+          if missing:
+              fail("schema.sql missing tables created by migrations: " +
+                   ", ".join("%s (from %s)" % (t, created[t]) for t in missing))
+          else:
+              print("ok: schema.sql covers all %d tables created by migrations" % len(created))
+
+          print()
+          if failures:
+              print("%d migration check(s) FAILED" % len(failures)); sys.exit(1)
+          print("all migration validation checks passed")
+          PYEOF
 
   js-sdk:
     name: JS SDK (node:test)
@@ -114,6 +234,108 @@ jobs:
           python-version: "3.12"
       - run: python3 dashboard/check.py
         working-directory: agent-host-platform
+      - name: Dashboard API endpoints match real routes
+        # Every path the dashboard calls (api()/apiWrite()/PANELS, with the
+        # dashboard's `var API = 'v1'` base) must be served by a real route in
+        # control-plane/api/src/routes (+ index.ts mounts). Fails on mismatch.
+        # Runs from the repo root — paths below are repo-root-relative.
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import re, sys
+          from pathlib import Path
+
+          ROOT = Path(".").resolve()
+          DASH = ROOT / "agent-host-platform" / "dashboard" / "js" / "app.js"
+          ROUTES_DIR = ROOT / "agent-host-platform" / "control-plane" / "api" / "src" / "routes"
+          INDEX_TS = ROOT / "agent-host-platform" / "control-plane" / "api" / "src" / "index.ts"
+          ROUTER_FILES = {
+              "agentsRouter": "agents.ts", "tasksRouter": "tasks.ts",
+              "hostsRouter": "hosts.ts", "workerRouter": "worker.ts",
+              "projectsRouter": "projects.ts", "artifactsRouter": "artifacts.ts",
+              "deploymentsRouter": "deployments.ts", "domainsRouter": "domains.ts",
+              "servicesRouter": "services.ts", "eventsRouter": "events.ts",
+              "healthRouter": "health.ts",
+          }
+          failures = []
+          js = DASH.read_text(); index_src = INDEX_TS.read_text()
+
+          routes = set()
+          for m, p in re.findall(r"app\.(get|post|put|delete|patch)\(\s*'([^']+)'", index_src):
+              routes.add((m.upper(), p))
+          for prefix, var in re.findall(r"v1\.use\('([^']+)',\s*(\w+)\)", index_src):
+              fname = ROUTER_FILES.get(var)
+              if not fname:
+                  print("note: no route file mapping for %s; skipping" % var); continue
+              src = (ROUTES_DIR / fname).read_text()
+              for m, p in re.findall(r"\w+\.(get|post|put|delete|patch)\(\s*['\"`]([^'\"`]+)['\"`]", src):
+                  routes.add((m.upper(), "/v1" + prefix + ("" if p == "/" else p)))
+          hsrc = (ROUTES_DIR / "health.ts").read_text()
+          for m, p in re.findall(r"\w+\.(get|post|put|delete|patch)\(\s*['\"`]([^'\"`]+)['\"`]", hsrc):
+              routes.add((m.upper(), "/v1/health" + ("" if p == "/" else p)))
+
+          calls = set()
+          for line in js.splitlines():
+              s = line.strip()
+              mg = re.match(r"(?:return\s+)?api\(\s*'([^']*)'", s)
+              if mg:
+                  calls.add(("GET", "/v1" + mg.group(1).split("?")[0])); continue
+              mw = re.match(r"apiWrite\(\s*'([A-Z]+)'\s*,\s*(.+)$", s)
+              if mw:
+                  tmpl = ""
+                  for tok in mw.group(2).split("+"):
+                      tok = tok.strip()
+                      m2 = re.match(r"'([^']*)'", tok)
+                      tmpl += m2.group(1) if m2 else ":p"
+                  calls.add((mw.group(1), "/v1" + tmpl.split("?")[0])); continue
+              mp = re.match(r"\{\s*id:\s*'[^']+'\s*,\s*path:\s*'([^']+)'", s)
+              if mp:
+                  calls.add(("GET", "/v1" + mp.group(1).split("?")[0]))
+
+          for method, tmpl in sorted(calls):
+              rx = re.compile("^" + tmpl.replace(":p", "[^/]+") + "$")
+              hit = any(rm == method and rx.match(rp) for rm, rp in sorted(routes))
+              if not hit:
+                  print("FAIL: dashboard calls %s %s - no matching API route" % (method, tmpl))
+                  failures.append((method, tmpl))
+              else:
+                  print("ok: %s %s" % (method, tmpl))
+
+          print()
+          if failures:
+              print("%d dashboard endpoint check(s) FAILED" % len(failures)); sys.exit(1)
+          print("all %d dashboard API calls match real routes (%d routes served)"
+                % (len(calls), len(routes)))
+          PYEOF
+
+  security:
+    name: Security tests (API + host worker)
+    # Dedicated security signal: the API security suite runs inside the full
+    # vitest suite too, but this job isolates it (plus the worker's security
+    # suites) so a security regression is visible on its own.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: agent-host-platform/control-plane/api/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: agent-host-platform/host-worker/requirements.txt
+      - run: npm ci
+        working-directory: agent-host-platform/control-plane/api
+      - run: pip install -r requirements.txt
+        working-directory: agent-host-platform/host-worker
+      - name: API security suite (vitest)
+        run: npx vitest run test/security.test.ts
+        working-directory: agent-host-platform/control-plane/api
+      - name: Worker security suites (pytest)
+        run: python -m pytest tests/test_compose_security.py tests/test_security_phase6.py tests/test_secrets_scrub.py -q
+        working-directory: agent-host-platform/host-worker
 
   secrets-sweep:
     name: Secrets sweep
@@ -158,3 +380,134 @@ jobs:
           npm run build
           test -f dist/index.js || { echo "ERROR: build did not produce dist/index.js"; exit 1; }
           echo "clean source build OK"
+
+  e2e:
+    name: E2E smoke (API + real PostgreSQL)
+    runs-on: ubuntu-latest
+    # COVERAGE (this job):
+    #   - the 001..007 migration chain applies cleanly to a REAL PostgreSQL 16
+    #     (service container) via `npm run migrate`
+    #   - the API boots against that database: startup config validation,
+    #     migration auto-apply, event bus, host/task sweepers
+    #   - HTTP smoke: register agent -> register host -> create task ->
+    #     host claim (FOR UPDATE SKIP LOCKED) -> claim exclusivity (2nd claim 204)
+    # NOT covered here — still needs a live persistent Linux host (see
+    # agent-host-platform/docs/e2e-live-checklist.md):
+    #   - the host-worker container lifecycle (docker build/run, health checks,
+    #     rollback) — covered in CI by host-worker/tests/test_e2e.py against a
+    #     fake control plane + subprocess-backed fake docker client
+    #   - Cloudflare tunnel provisioning, Tailscale join, multi-host leases
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      # 64 hex chars; throwaway value for the ephemeral CI database only
+      DATA_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      UAHT_PROVISIONING_TOKEN: e2e-provisioning-token
+      PORT: "3100"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: agent-host-platform/control-plane/api/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+        working-directory: agent-host-platform/control-plane/api
+      - run: npm run build
+        working-directory: agent-host-platform/control-plane/api
+      - name: Apply migration chain to real PostgreSQL
+        run: npm run migrate
+        working-directory: agent-host-platform/control-plane/api
+      - name: Start API in background
+        working-directory: agent-host-platform/control-plane/api
+        run: |
+          set -euo pipefail
+          node dist/index.js > /tmp/uagt-api.log 2>&1 &
+          echo $! > /tmp/uagt-api.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3100/v1/health >/dev/null 2>&1; then
+              echo "API up after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -fsS http://localhost:3100/v1/health \
+            || { echo "API never came up:"; tail -50 /tmp/uagt-api.log; exit 1; }
+      - name: Smoke — register agent, register host, create task, claim task
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, urllib.error
+
+          BASE = "http://localhost:3100"
+          PROV = os.environ["UAHT_PROVISIONING_TOKEN"]
+
+          def req(method, path, body=None, token=None, prov=False):
+              data = json.dumps(body).encode() if body is not None else None
+              r = urllib.request.Request(BASE + path, data=data, method=method)
+              r.add_header("Content-Type", "application/json")
+              if token:
+                  r.add_header("Authorization", "Bearer " + token)
+              if prov:
+                  r.add_header("X-Provisioning-Token", PROV)
+              try:
+                  with urllib.request.urlopen(r) as resp:
+                      raw = resp.read()
+                      return resp.status, (json.loads(raw) if raw else None)
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode()[:500]
+
+          # 1. register an agent (provisioning token; bootstrap path)
+          s, b = req("POST", "/v1/agents/register",
+                     {"name": "e2e-agent",
+                      "permissions": {"read_status": True, "deploy": True}},
+                     prov=True)
+          assert s == 201, ("agent register", s, b)
+          agent_key = b["api_key"]
+          print("ok: agent registered")
+
+          # 2. register a host
+          s, b = req("POST", "/v1/hosts/register", {"name": "e2e-host"}, prov=True)
+          assert s == 201, ("host register", s, b)
+          host_token, host_id = b["host_token"], b["host"]["id"]
+          print("ok: host registered", host_id)
+
+          # 3. agent creates a task
+          s, b = req("POST", "/v1/tasks",
+                     {"type": "healthcheck", "payload": {}}, token=agent_key)
+          assert s == 201, ("task create", s, b)
+          task_id = b["task"]["id"]
+          assert b["task"]["status"] == "queued", b["task"]
+          print("ok: task created", task_id)
+
+          # 4. host claims it (atomic claim, FOR UPDATE SKIP LOCKED)
+          s, b = req("POST", "/v1/worker/tasks/claim",
+                     {"host_id": host_id}, token=host_token)
+          assert s == 200, ("task claim", s, b)
+          assert b["task"]["id"] == task_id, b
+          print("ok: host claimed the task")
+
+          # 5. nothing left to claim -> 204
+          s, b = req("POST", "/v1/worker/tasks/claim",
+                     {"host_id": host_id}, token=host_token)
+          assert s == 204, ("second claim", s, b)
+          print("ok: second claim correctly returned 204")
+
+          print("E2E smoke passed: register -> create -> claim against real PostgreSQL")
+          PYEOF
+      - name: Stop API
+        if: always()
+        run: kill "$(cat /tmp/uagt-api.pid)" 2>/dev/null || true
