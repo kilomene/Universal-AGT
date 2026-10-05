@@ -216,7 +216,7 @@ Canonical event types (PROTOCOL §3.8): `agent.connected`, `agent.disconnected`,
 `deployment.failed`, `deployment.rolled_back`, `service.started`,
 `service.stopped`, `service.restarted`, `host.registered`, `host.online`,
 `host.offline`, `healthcheck.passed`, `healthcheck.failed`,
-`worker.updated`, `secret.updated`.
+`worker.updated`, `secret.changed`, `secret.deleted`.
 The server additionally emits (beyond the canonical list):
 `task.retrying`, `task.requeued`, `deployment.rollback_requested`,
 `deployment.rollback_failed`, `domain.requested`, `domain.added`,
