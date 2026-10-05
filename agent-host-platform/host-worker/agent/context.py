@@ -23,6 +23,7 @@ class WorkerContext:
     log_store: object       # logs.store.LogStore
     deployment_store: object  # deployments.state.DeploymentStore
     scrub: Callable[[str], str] = field(default=_identity)
+    ingress: object = field(default=None)  # ingress.IngressProvider or None
 
     def log(self, task_id: str, line: str) -> str:
         """Timestamped, secret-scrubbed append to the task log. Returns the line."""
