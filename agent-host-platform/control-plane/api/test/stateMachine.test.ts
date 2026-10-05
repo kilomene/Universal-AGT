@@ -8,8 +8,8 @@ import {
 
 // Mirrors the check constraint in database/schema/schema.sql and PROTOCOL §3.2:
 //   queued -> claimed | cancelled
-//   claimed -> running | failed | cancelled
-//   running -> completed | failed | awaiting_approval | cancelled
+//   claimed -> running | failed | retrying | cancelled
+//   running -> completed | failed | retrying | awaiting_approval | cancelled
 //   awaiting_approval -> queued | cancelled
 //   retrying -> queued
 //   completed | failed | cancelled are terminal
@@ -18,15 +18,16 @@ describe('allowedTaskTransitions', () => {
   it('queued can go to claimed or cancelled only', () => {
     expect(allowedTaskTransitions('queued').sort()).toEqual(['cancelled', 'claimed']);
   });
-  it('claimed can go to running, failed, or cancelled', () => {
-    expect(allowedTaskTransitions('claimed').sort()).toEqual(['cancelled', 'failed', 'running']);
+  it('claimed can go to running, failed, retrying, or cancelled', () => {
+    expect(allowedTaskTransitions('claimed').sort()).toEqual(['cancelled', 'failed', 'retrying', 'running']);
   });
-  it('running can complete, fail, await approval, or cancel', () => {
+  it('running can complete, fail, retry, await approval, or cancel', () => {
     expect(allowedTaskTransitions('running').sort()).toEqual([
       'awaiting_approval',
       'cancelled',
       'completed',
       'failed',
+      'retrying',
     ]);
   });
   it('awaiting_approval can be approved (queued) or rejected (cancelled)', () => {
@@ -57,9 +58,11 @@ describe('canTransitionTask', () => {
     ['queued', 'cancelled'],
     ['claimed', 'running'],
     ['claimed', 'failed'],
+    ['claimed', 'retrying'],
     ['claimed', 'cancelled'],
     ['running', 'completed'],
     ['running', 'failed'],
+    ['running', 'retrying'],
     ['running', 'awaiting_approval'],
     ['running', 'cancelled'],
     ['awaiting_approval', 'queued'],
