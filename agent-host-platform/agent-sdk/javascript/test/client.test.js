@@ -492,3 +492,72 @@ describe("streamEvents query params", () => {
     for await (const _ of client.streamEvents()) { /* drain */ }
   });
 });
+
+describe("JS/Python parity (Phase 8)", () => {
+  // Canonical agent-facing method table. The Python SDK must expose the
+  // snake_case twin of every entry; test_client.py asserts the same table.
+  // Add new API methods to BOTH clients and extend this table.
+  const PARITY_METHODS = [
+    "registerAgent", "me", "rotateKey",
+    "createTask", "getTask", "listTasks", "cancelTask", "approveTask", "rejectTask",
+    "getLogs", "tailLogs",
+    "listHosts", "getHost",
+    "createProject", "listProjects", "getProject", "updateProject",
+    "listArtifacts", "getArtifact", "initArtifact", "uploadArtifact", "downloadArtifact",
+    "createDeployment", "getDeployment", "listDeployments", "rollbackDeployment",
+    "listServices", "restartService", "stopService", "startService",
+    "setSecret", "listSecrets", "deleteSecret",
+    "addDomain", "listDomains", "removeDomain",
+    "listEvents", "streamEvents",
+    "deploy", "health",
+  ];
+
+  it("exposes every parity-table method", () => {
+    const client = new UahtClient({ baseUrl: "https://cp.example.com", apiKey: "k" });
+    const missing = PARITY_METHODS.filter((m) => typeof client[m] !== "function");
+    assert.deepEqual(missing, [], `methods missing from the JS SDK: ${missing.join(", ")}`);
+  });
+
+  it("rotateKey posts to /agents/me/rotate and adopts the new key", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { api_key: "new-key" })),
+    });
+    const res = await client.rotateKey();
+    assert.equal(calls.length, 1);
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/agents/me/rotate");
+    assert.equal(opts.method, "POST");
+    assert.equal(opts.headers.Authorization, "Bearer k");
+    assert.deepEqual(res, { api_key: "new-key" });
+    // the server invalidates the old key immediately, so the client must
+    // adopt the new one or every later call breaks
+    assert.equal(client.apiKey, "new-key");
+  });
+
+  it("tailLogs yields incremental chunks until the logs task terminates", async () => {
+    const states = [
+      { task: { id: "t-8", status: "running", result: { logs: "a" } } },
+      { task: { id: "t-8", status: "running", result: { logs: "ab" } } },
+      { task: { id: "t-8", status: "completed", result: { logs: "abc" } } },
+    ];
+    let idx = 0;
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: async (url, opts) => {
+        calls.push({ url, opts });
+        assert.ok(url.endsWith("/v1/tasks/t-8"));
+        const body = states[Math.min(idx, states.length - 1)];
+        idx += 1;
+        return jsonResponse(200, body);
+      },
+    });
+    const chunks = [];
+    for await (const chunk of client.tailLogs({ taskId: "t-8", pollIntervalMs: 1 })) {
+      chunks.push(chunk);
+    }
+    assert.deepEqual(chunks, ["a", "b", "c"]);
+  });
+});
