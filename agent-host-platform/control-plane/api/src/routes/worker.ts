@@ -484,6 +484,40 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
 });
 
 // ---------------------------------------------------------------------------
+// GET /v1/worker/domains — HOST token only.
+// Every domain entry on this host's non-terminal deployments, so the worker
+// can rebuild its ingress route table (Phase 7):
+//   {domains: [{deployment_id, hostname, ingress}]}
+// 'ingress' defaults to 'direct' for entries recorded before Phase 7.
+// ---------------------------------------------------------------------------
+workerRouter.get('/domains', requireHost, async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT id AS deployment_id, domains FROM deployments
+       WHERE host_id = $1 AND status NOT IN ('removed', 'rolled_back', 'failed')`,
+      [req.auth!.id],
+    );
+    const out: Array<{ deployment_id: string; hostname: string; ingress: string }> = [];
+    for (const row of rows) {
+      const entries = Array.isArray(row.domains) ? row.domains : [];
+      for (const e of entries) {
+        if (e && typeof e.hostname === 'string') {
+          out.push({
+            deployment_id: row.deployment_id,
+            hostname: e.hostname,
+            ingress: e.ingress === 'tunnel' ? 'tunnel' : 'direct',
+          });
+        }
+      }
+    }
+    res.json({ domains: out });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /v1/worker/projects/:project_id/secrets — HOST token only.
 // Returns the DECRYPTED project secrets, scoped (2026-10-05): only when
 // this host has an active (claimed/running/awaiting_approval) task for the
