@@ -6,9 +6,9 @@ import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { decideIdempotency, deploymentIdempotencyBody } from '../lib/idempotency';
 import { logger } from '../lib/log';
-import { allocatePort, isValidServicePort } from '../lib/ports';
+import { allocatePort, isValidServicePort, settleRollbackPorts } from '../lib/ports';
 import { selectRollbackTarget } from '../lib/rollback';
-import { requireAgent, requirePermission } from '../middleware/auth';
+import { requireAgent, requireHost, requirePermission } from '../middleware/auth';
 import { isUuid, parseLimit } from './_helpers';
 
 export const deploymentsRouter = Router();
@@ -382,6 +382,76 @@ deploymentsRouter.post('/:id/rollback', requireAgent, requirePermission('deploy'
     });
     logger.info('rollback task created', { deployment: current.id, task: task.id, target: prev.id });
     res.status(201).json({ deployment: current, task });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /v1/deployments/:id/settle-rollback-ports — HOST token only; the
+// host must own the deployment. Called by the worker after it completes a
+// rollback: releases the rolled-back deployment's port reservations and
+// re-reserves the rollback target's host ports for the target deployment
+// (its reservation was dropped when the newer deployment superseded it,
+// but its container is running again on those same ports). Best-effort
+// from the worker's side — it never fails the rollback itself.
+deploymentsRouter.post('/:id/settle-rollback-ports', requireHost, async (req, res, next) => {
+  try {
+    if (!isUuid(req.params.id)) {
+      sendError(res, 400, 'bad_request', 'id must be a UUID');
+      return;
+    }
+    const { target_deployment_id } = req.body ?? {};
+    if (!isUuid(target_deployment_id)) {
+      sendError(res, 400, 'bad_request', 'target_deployment_id (UUID) is required');
+      return;
+    }
+    const pool = getPool();
+    const { rows } = await pool.query(
+      'SELECT id, project_id, host_id FROM deployments WHERE id = $1',
+      [req.params.id],
+    );
+    const deployment = rows[0];
+    if (!deployment) {
+      next(new HttpError(404, 'not_found', 'deployment not found'));
+      return;
+    }
+    if (deployment.host_id !== req.auth!.id) {
+      sendError(res, 403, 'forbidden', 'host token does not own this deployment');
+      return;
+    }
+    const trows = (
+      await pool.query('SELECT id, project_id, host_id FROM deployments WHERE id = $1', [
+        target_deployment_id,
+      ])
+    ).rows;
+    const target = trows[0];
+    if (!target) {
+      next(new HttpError(404, 'not_found', 'rollback target deployment not found'));
+      return;
+    }
+    if (target.project_id !== deployment.project_id || target.host_id !== deployment.host_id) {
+      sendError(res, 422, 'unprocessable', 'rollback target must belong to the same project and host');
+      return;
+    }
+    const settlement = await settleRollbackPorts(pool, deployment.id, target.id);
+    await appendEvent(pool, {
+      type: 'deployment.ports_settled',
+      actor_type: 'host',
+      actor_id: req.auth!.name,
+      deployment_id: deployment.id,
+      host_id: deployment.host_id,
+      payload: { target_deployment_id: target.id, ...settlement },
+    });
+    logger.info('rollback ports settled', {
+      deployment: deployment.id,
+      target: target.id,
+      ...settlement,
+    });
+    res.json({
+      deployment_id: deployment.id,
+      target_deployment_id: target.id,
+      ...settlement,
+    });
   } catch (err) {
     next(err);
   }
