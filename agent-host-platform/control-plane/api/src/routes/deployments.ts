@@ -73,7 +73,7 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     }
 
     const pool = getPool();
-    const project = await pool.query('SELECT id FROM projects WHERE id = $1', [project_id]);
+    const project = await pool.query('SELECT id, name FROM projects WHERE id = $1', [project_id]);
     if (!project.rows[0]) {
       sendError(res, 404, 'not_found', 'project not found');
       return;
@@ -85,8 +85,13 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
         return;
       }
     }
+    // The worker refuses to deploy an artifact without artifact_checksum in
+    // the task payload (verified before any docker call), so the control
+    // plane injects the verified checksum + size from the artifact row.
+    let artifactChecksum: string | null = null;
+    let artifactSize: number | null = null;
     if (artifact_id) {
-      const art = await pool.query('SELECT id, project_id, status FROM artifacts WHERE id = $1', [artifact_id]);
+      const art = await pool.query('SELECT id, project_id, status, checksum, size FROM artifacts WHERE id = $1', [artifact_id]);
       if (!art.rows[0]) {
         sendError(res, 404, 'not_found', 'artifact not found');
         return;
@@ -99,6 +104,13 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
         sendError(res, 422, 'unprocessable', `artifact is ${art.rows[0].status}; only ready artifacts can be deployed`);
         return;
       }
+      if (typeof art.rows[0].checksum !== 'string' || !art.rows[0].checksum) {
+        sendError(res, 422, 'unprocessable', 'artifact has no verified checksum; re-upload it');
+        return;
+      }
+      artifactChecksum = art.rows[0].checksum;
+      artifactSize = art.rows[0].size === null || art.rows[0].size === undefined
+        ? null : Number(art.rows[0].size);
     }
 
     const incomingBody = deploymentIdempotencyBody({
@@ -146,6 +158,7 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     const taskStatus = deployMode === 'manual' ? 'awaiting_approval' : 'queued';
     const taskPayload: Record<string, unknown> = {
       project_id,
+      project_name: project.rows[0].name, // the worker requires project_name
       host_id: host_id ?? null,
       version,
       artifact_id: artifact_id ?? null,
@@ -153,6 +166,12 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     };
     if (requestedHostPort !== null) {
       taskPayload.requested_host_port = requestedHostPort;
+    }
+    if (artifactChecksum !== null) {
+      taskPayload.artifact_checksum = artifactChecksum;
+      if (artifactSize !== null) {
+        taskPayload.artifact_size = artifactSize;
+      }
     }
 
     const client = await pool.connect();
