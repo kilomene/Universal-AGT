@@ -100,8 +100,8 @@ export class UahtClient {
   _put(path, body) {
     return this._request("PUT", path, { body });
   }
-  _delete(path) {
-    return this._request("DELETE", path);
+  _delete(path, body) {
+    return this._request("DELETE", path, { body });
   }
 
   // ---- §3.1 Agents ----
@@ -255,6 +255,17 @@ export class UahtClient {
   }
   rollbackDeployment(id) {
     return this._post(`/deployments/${id}/rollback`, {});
+  }
+
+  // ---- §3.10 Domains ----
+  addDomain(deploymentId, hostname) {
+    return this._post("/domains", { deployment_id: deploymentId, hostname });
+  }
+  listDomains(deploymentId) {
+    return this._get("/domains", { deployment_id: deploymentId });
+  }
+  removeDomain(deploymentId, hostname) {
+    return this._delete("/domains", { deployment_id: deploymentId, hostname });
   }
 
   // ---- §3.6 Services ----
