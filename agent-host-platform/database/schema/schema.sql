@@ -260,3 +260,30 @@ begin
                         for each row execute function touch_updated_at()', t, t);
     end loop;
 end $$;
+
+-- ----------------------------------------------------------------------------
+-- events TRUNCATE block (see migrations/005_events_truncate_block.sql).
+-- A row-level trigger cannot block TRUNCATE, so an event trigger aborts
+-- any TRUNCATE touching public.events. NOTE: CREATE EVENT TRIGGER needs
+-- superuser; if this schema is applied as a non-superuser, run this block
+-- separately as superuser.
+-- ----------------------------------------------------------------------------
+create or replace function forbid_events_truncate() returns event_trigger as $$
+declare
+    obj record;
+begin
+    for obj in select * from pg_event_trigger_ddl_commands() loop
+        if obj.command_tag = 'TRUNCATE TABLE'
+           and obj.object_identity ilike 'public.events%' then
+            raise exception 'events table is append-only: TRUNCATE not allowed';
+        end if;
+    end loop;
+end;
+$$ language plpgsql;
+
+drop event trigger if exists trg_no_truncate_events;
+
+create event trigger trg_no_truncate_events
+    on ddl_command_end
+    when tag in ('TRUNCATE TABLE')
+    execute function forbid_events_truncate();
