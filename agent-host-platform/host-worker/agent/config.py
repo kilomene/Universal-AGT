@@ -82,8 +82,9 @@ class WorkerConfig:
     # Public ingress (Phase 7; disabled by default). When enabled, the
     # worker supervises an outbound-only ingress provider (e.g. a
     # cloudflared tunnel) and syncs tunnel routes from deployment domains.
-    # The tunnel token comes from the UAHT_TUNNEL_TOKEN environment variable
-    # (never from the repo, never logged).
+    # The tunnel token is WORKER_TUNNEL_TOKEN (runtime config name). The
+    # host installer accepts the operator-facing input UAHT_TUNNEL_TOKEN
+    # and writes it into worker.env as WORKER_TUNNEL_TOKEN (never logged).
     ingress_enabled: bool = False
     ingress_provider: str = ""
     tunnel_token: str = ""
@@ -122,18 +123,15 @@ class WorkerConfig:
             "crash_loop_window_s": ENV_PREFIX + "CRASH_LOOP_WINDOW_S",
             "ingress_enabled": ENV_PREFIX + "INGRESS_ENABLED",
             "ingress_provider": ENV_PREFIX + "INGRESS_PROVIDER",
-            # tunnel_token deliberately NOT WORKER_-prefixed: it comes from
-            # the UAHT_TUNNEL_TOKEN environment variable (see below).
+            # Runtime name is WORKER_TUNNEL_TOKEN (see the UAHT_TUNNEL_TOKEN ->
+            # WORKER_TUNNEL_TOKEN installer mapping in docs/CONFIG.md). The
+            # worker.env file key is WORKER_TUNNEL_TOKEN, normalized to
+            # "tunnel_token" by the WORKER_ prefix strip above.
+            "tunnel_token": ENV_PREFIX + "TUNNEL_TOKEN",
         }
         for field_name, env_name in env_map.items():
             if env_name in os.environ:
                 values[field_name] = os.environ[env_name]
-        # Tunnel token precedence: explicit kwarg override > UAHT_TUNNEL_TOKEN
-        # env > worker.env file keys (tunnel_token / uaht_tunnel_token).
-        if "UAHT_TUNNEL_TOKEN" in os.environ:
-            values["tunnel_token"] = os.environ["UAHT_TUNNEL_TOKEN"]
-        elif "tunnel_token" not in values and "uaht_tunnel_token" in values:
-            values["tunnel_token"] = values["uaht_tunnel_token"]
         values.update({k: v for k, v in overrides.items() if v is not None})
 
         cfg = cls(
