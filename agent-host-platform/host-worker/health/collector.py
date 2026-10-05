@@ -1,9 +1,26 @@
-"""Host resource metrics from /proc and the OS (no external tools)."""
+"""Host resource metrics from /proc and the OS (no external tools).
+
+Two distinct resource views are reported:
+
+  * UTILIZATION (instantaneous, measured): cpu_pct / ram_pct / disk_pct —
+    what the host is consuming right now.
+  * RESERVATION (accounting, from deployment manifests): allocated_cpu /
+    allocated_ram_mb — the sum of cpu/memory reservations of running
+    deployments; available_* = total - allocated. Admission control
+    (deployments.pipeline) decides on reservations, never on instantaneous
+    utilization: a host at 2% CPU still refuses a deployment when its
+    reservations are full.
+"""
 from __future__ import annotations
 
 import os
 import time
 from typing import Optional
+
+from deployments.manifest import parse_memory_mb
+
+# Deployment statuses that hold a resource reservation on this host.
+RESERVING_STATUSES = ("running", "starting", "healthcheck")
 
 
 def _read_cpu_times() -> tuple[int, int]:
@@ -64,8 +81,49 @@ def total_disk_gb(path: str = "/") -> float:
     return round(st.f_blocks * st.f_frsize / (1024.0 ** 3), 1)
 
 
+def disk_free_gb(path: str = "/") -> float:
+    st = os.statvfs(path)
+    return round(st.f_bavail * st.f_frsize / (1024.0 ** 3), 1)
+
+
 def total_cpu() -> float:
     return float(os.cpu_count() or 1)
+
+
+def allocated_resources(deployment_store=None) -> dict:
+    """Sum of resource RESERVATIONS from deployment manifests.
+
+    allocated != utilized: this is what running deployments reserved in
+    their manifests (persisted on each deployment's state by the deploy
+    pipeline), not what they are currently consuming. Deployments with no
+    reservation — or with malformed values — contribute 0. A corrupt or
+    unreadable store degrades to zero reservations, never to a crash.
+
+    Returns {"cpu": float, "ram_mb": float}.
+    """
+    cpu = 0.0
+    ram_mb = 0.0
+    if deployment_store is None:
+        return {"cpu": cpu, "ram_mb": ram_mb}
+    try:
+        states = deployment_store.list_all()
+    except Exception:
+        return {"cpu": cpu, "ram_mb": ram_mb}
+    for state in states or []:
+        if state.get("status") not in RESERVING_STATUSES:
+            continue
+        resources = state.get("resources") or {}
+        try:
+            if resources.get("cpu") is not None:
+                cpu += float(resources["cpu"])
+        except (TypeError, ValueError):
+            pass
+        try:
+            if resources.get("memory"):
+                ram_mb += parse_memory_mb(resources["memory"])
+        except (TypeError, ValueError):
+            pass
+    return {"cpu": round(cpu, 3), "ram_mb": round(ram_mb, 1)}
 
 
 def collect_metrics(docker_client=None, deployment_store=None,
@@ -90,21 +148,38 @@ def collect_metrics(docker_client=None, deployment_store=None,
     running_apps = []
     if deployment_store is not None:
         for state in deployment_store.list_all():
-            if state.get("status") in ("running", "starting", "healthcheck"):
+            if state.get("status") in RESERVING_STATUSES:
                 running_apps.append({
                     "deployment_id": state.get("deployment_id"),
                     "project": state.get("project_name"),
                     "status": state.get("status"),
                 })
 
+    # Reservation accounting (manifest sums) — computed once, reused by
+    # the payload and kept separate from instantaneous utilization.
+    allocated = allocated_resources(deployment_store)
+    total_cpus = total_cpu()
+    total_ram = total_ram_mb()
+
     payload = {
+        # Instantaneous UTILIZATION (measured right now) ...
         "cpu_pct": cpu_percent(),
         "ram_pct": memory_percent(),
         "disk_pct": disk_percent(disk_path),
+        # ... kept SEPARATE from RESERVATION accounting (manifest sums):
+        "allocated_cpu": allocated["cpu"],
+        "allocated_ram_mb": allocated["ram_mb"],
+        # Manifests carry no disk reservations, so disk allocated is 0 and
+        # available is simply free space; reported explicitly so consumers
+        # never confuse it with disk_pct (utilization).
+        "allocated_disk_gb": 0.0,
+        "available_cpu": max(0.0, round(total_cpus - allocated["cpu"], 3)),
+        "available_ram_mb": max(0.0, round(total_ram - allocated["ram_mb"], 1)),
+        "available_disk_gb": disk_free_gb(disk_path),
         "docker_status": docker_status,
         "running_apps": running_apps,
-        "total_cpu": total_cpu(),
-        "total_ram_mb": total_ram_mb(),
+        "total_cpu": total_cpus,
+        "total_ram_mb": total_ram,
         "total_disk_gb": total_disk_gb(disk_path),
     }
     if config is not None and getattr(config, "worker_version", None):
