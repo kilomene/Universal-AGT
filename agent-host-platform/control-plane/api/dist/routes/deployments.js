@@ -8,6 +8,8 @@ const errors_1 = require("../lib/errors");
 const events_1 = require("../lib/events");
 const idempotency_1 = require("../lib/idempotency");
 const log_1 = require("../lib/log");
+const ports_1 = require("../lib/ports");
+const rollback_1 = require("../lib/rollback");
 const auth_1 = require("../middleware/auth");
 const _helpers_1 = require("./_helpers");
 exports.deploymentsRouter = (0, express_1.Router)();
@@ -23,7 +25,7 @@ async function latestTaskForDeployment(pool, deployment) {
 // dedupes across BOTH rows.
 exports.deploymentsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermission)('deploy'), async (req, res, next) => {
     try {
-        const { project_id, host_id, version, artifact_id, mode, idempotency_key } = req.body ?? {};
+        const { project_id, host_id, version, artifact_id, mode, idempotency_key, host_port } = req.body ?? {};
         if (!(0, _helpers_1.isUuid)(project_id)) {
             (0, errors_1.sendError)(res, 400, 'bad_request', 'project_id (UUID) is required');
             return;
@@ -48,6 +50,21 @@ exports.deploymentsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermi
         if (idempotency_key !== undefined && typeof idempotency_key !== 'string') {
             (0, errors_1.sendError)(res, 400, 'bad_request', 'idempotency_key must be a string');
             return;
+        }
+        // Optional fixed host port: reserved in the port registry for this
+        // deployment. The worker verifies it is actually free before `docker
+        // run` and fails the task with a clear error on collision.
+        let requestedHostPort = null;
+        if (host_port !== undefined && host_port !== null) {
+            if (!(0, ports_1.isValidServicePort)(host_port)) {
+                (0, errors_1.sendError)(res, 400, 'bad_request', 'host_port must be an integer 1-65535');
+                return;
+            }
+            if (!host_id) {
+                (0, errors_1.sendError)(res, 422, 'unprocessable', 'host_port requires host_id — a port can only be reserved on a specific host');
+                return;
+            }
+            requestedHostPort = host_port;
         }
         const pool = (0, pool_1.getPool)();
         const project = await pool.query('SELECT id FROM projects WHERE id = $1', [project_id]);
@@ -77,12 +94,31 @@ exports.deploymentsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermi
                 return;
             }
         }
-        const incomingBody = (0, idempotency_1.deploymentIdempotencyBody)({ project_id, host_id, version, artifact_id, mode: deployMode });
+        const incomingBody = (0, idempotency_1.deploymentIdempotencyBody)({
+            project_id,
+            host_id,
+            version,
+            artifact_id,
+            mode: deployMode,
+            host_port: requestedHostPort,
+        });
         if (typeof idempotency_key === 'string' && idempotency_key) {
             const { rows } = await pool.query('SELECT * FROM deployments WHERE idempotency_key = $1', [idempotency_key]);
             const existing = rows[0];
             if (existing) {
-                const decision = (0, idempotency_1.decideIdempotency)({ body: (0, idempotency_1.deploymentIdempotencyBody)(existing) }, incomingBody);
+                // host_port is part of the compared body: it lives in the port
+                // registry, not on the deployment row.
+                const alloc = (await pool.query('SELECT port FROM port_allocations WHERE deployment_id = $1', [existing.id])).rows[0];
+                const decision = (0, idempotency_1.decideIdempotency)({
+                    body: (0, idempotency_1.deploymentIdempotencyBody)({
+                        project_id: existing.project_id,
+                        host_id: existing.host_id,
+                        version: existing.version,
+                        artifact_id: existing.artifact_id,
+                        mode: existing.mode,
+                        host_port: alloc ? alloc.port : null,
+                    }),
+                }, incomingBody);
                 if (decision === 'replay') {
                     const task = await latestTaskForDeployment(pool, existing);
                     res.status(200).json({ deployment: existing, task, idempotent_replay: true });
@@ -101,20 +137,39 @@ exports.deploymentsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermi
             artifact_id: artifact_id ?? null,
             deployment_id: deploymentId,
         };
+        if (requestedHostPort !== null) {
+            taskPayload.requested_host_port = requestedHostPort;
+        }
         const client = await pool.connect();
         let deployment;
         let task;
         try {
             await client.query('BEGIN');
-            const depRows = await client.query(`INSERT INTO deployments (id, idempotency_key, project_id, host_id, version, status)
-         VALUES ($1,$2,$3,$4,$5,'requested') RETURNING *`, [
+            const depRows = await client.query(`INSERT INTO deployments (id, idempotency_key, project_id, host_id, version, artifact_id, mode, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'requested') RETURNING *`, [
                 deploymentId,
                 typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null,
                 project_id,
                 host_id ?? null,
                 version,
+                artifact_id ?? null,
+                deployMode,
             ]);
             deployment = depRows.rows[0];
+            if (requestedHostPort !== null) {
+                // host_id is guaranteed non-null here (validated above).
+                try {
+                    await (0, ports_1.allocatePort)(client, host_id, requestedHostPort, deploymentId);
+                }
+                catch (portErr) {
+                    await client.query('ROLLBACK');
+                    if (portErr.code === '23505') {
+                        (0, errors_1.sendError)(res, 409, 'conflict', `host port ${requestedHostPort} is already allocated on this host`);
+                        return;
+                    }
+                    throw portErr;
+                }
+            }
             const taskRows = await client.query(`INSERT INTO tasks (idempotency_key, created_by, assigned_to, type, status, payload)
          VALUES ($1,$2,$3,'deploy',$4,$5) RETURNING *`, [
                 typeof idempotency_key === 'string' && idempotency_key ? `deploy:${idempotency_key}` : null,
@@ -146,7 +201,7 @@ exports.deploymentsRouter.post('/', auth_1.requireAgent, (0, auth_1.requirePermi
             task_id: task.id,
             deployment_id: deploymentId,
             host_id: host_id ?? null,
-            payload: { version, mode: deployMode },
+            payload: { version, mode: deployMode, host_port: requestedHostPort },
         });
         await (0, events_1.appendEvent)(pool, {
             type: 'task.created',
@@ -221,9 +276,17 @@ exports.deploymentsRouter.get('/:id', auth_1.requireAgent, (0, auth_1.requirePer
         next(err);
     }
 });
-// POST /v1/deployments/:id/rollback — needs deploy; deploys the previous
-// healthy version of the same project+host as a new deployment row linked
-// via rollback_of. The worker's completion report emits deployment.rolled_back.
+// POST /v1/deployments/:id/rollback — needs deploy.
+//
+// Redesign (2026-10-05, Phase 3 — see PROTOCOL changelog): the old design
+// INSERTed a new deployment row with the previous version, which violated
+// the unique(project_id, host_id, version) constraint and returned 500.
+// Now no deployment row is created. Instead a NEW TASK (type=rollback,
+// payload {deployment_id, target_deployment_id}) is queued, targeting the
+// last healthy deployment of the same project+host. The worker's rollback
+// handler performs the restore and reports; the control plane emits
+// `deployment.rollback_requested` here and `deployment.rolled_back` on
+// worker completion (see mirrorDeploymentState).
 exports.deploymentsRouter.post('/:id/rollback', auth_1.requireAgent, (0, auth_1.requirePermission)('deploy'), async (req, res, next) => {
     try {
         if (!(0, _helpers_1.isUuid)(req.params.id)) {
@@ -237,56 +300,32 @@ exports.deploymentsRouter.post('/:id/rollback', auth_1.requireAgent, (0, auth_1.
             next(new errors_1.HttpError(404, 'not_found', 'deployment not found'));
             return;
         }
-        const prev = (await pool.query(`SELECT * FROM deployments
-         WHERE project_id = $1 AND host_id = $2 AND id <> $3
-           AND status = 'running' AND health_status = 'healthy'
-         ORDER BY created_at DESC LIMIT 1`, [current.project_id, current.host_id, current.id])).rows[0];
+        const candidates = (await pool.query(`SELECT * FROM deployments
+         WHERE project_id = $1 AND host_id = $2 AND id <> $3 AND status = 'running'`, [current.project_id, current.host_id, current.id])).rows;
+        const prev = (0, rollback_1.selectRollbackTarget)(current, candidates);
         if (!prev) {
             (0, errors_1.sendError)(res, 409, 'conflict', 'no previous healthy deployment of this project+host to roll back to');
             return;
         }
-        const artForPrev = (await pool.query(`SELECT id FROM artifacts WHERE project_id = $1 AND version = $2 ORDER BY created_at DESC LIMIT 1`, [current.project_id, prev.version])).rows[0];
-        const deploymentId = (0, crypto_1.randomUUID)();
         const taskPayload = {
-            project_id: current.project_id,
-            host_id: current.host_id,
-            version: prev.version,
-            artifact_id: artForPrev ? artForPrev.id : null,
-            deployment_id: deploymentId,
-            rollback: true,
-            rollback_of: current.id,
-            rollback_to_deployment_id: prev.id,
+            deployment_id: current.id,
+            target_deployment_id: prev.id,
         };
-        const client = await pool.connect();
-        let deployment;
-        let task;
-        try {
-            await client.query('BEGIN');
-            const depRows = await client.query(`INSERT INTO deployments (id, idempotency_key, project_id, host_id, version, status, rollback_of)
-         VALUES ($1,$2,$3,$4,$5,'requested',$6) RETURNING *`, [deploymentId, `rollback:${(0, crypto_1.randomUUID)()}`, current.project_id, current.host_id, prev.version, current.id]);
-            deployment = depRows.rows[0];
-            const taskRows = await client.query(`INSERT INTO tasks (created_by, assigned_to, type, status, payload)
-         VALUES ($1,$2,'deploy','queued',$3) RETURNING *`, [req.auth.id, current.host_id, JSON.stringify(taskPayload)]);
-            task = taskRows.rows[0];
-            await client.query('UPDATE deployments SET task_id = $2 WHERE id = $1', [deploymentId, task.id]);
-            deployment.task_id = task.id;
-            await client.query('COMMIT');
-        }
-        catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        }
-        finally {
-            client.release();
-        }
+        const taskRows = await pool.query(`INSERT INTO tasks (created_by, assigned_to, type, status, payload)
+       VALUES ($1,$2,'rollback','queued',$3) RETURNING *`, [req.auth.id, current.host_id, JSON.stringify(taskPayload)]);
+        const task = taskRows.rows[0];
         await (0, events_1.appendEvent)(pool, {
-            type: 'deployment.requested',
+            type: 'deployment.rollback_requested',
             actor_type: 'agent',
             actor_id: req.auth.name,
             task_id: task.id,
-            deployment_id: deploymentId,
+            deployment_id: current.id,
             host_id: current.host_id,
-            payload: { version: prev.version, rollback: true, rollback_of: current.id },
+            payload: {
+                version: current.version,
+                target_deployment_id: prev.id,
+                target_version: prev.version,
+            },
         });
         await (0, events_1.appendEvent)(pool, {
             type: 'task.created',
@@ -294,10 +333,10 @@ exports.deploymentsRouter.post('/:id/rollback', auth_1.requireAgent, (0, auth_1.
             actor_id: req.auth.name,
             task_id: task.id,
             host_id: current.host_id,
-            payload: { type: 'deploy', rollback: true },
+            payload: { type: 'rollback' },
         });
-        log_1.logger.info('rollback deployment created', { deployment: deploymentId, from: current.id, to: prev.id });
-        res.status(201).json({ deployment, task });
+        log_1.logger.info('rollback task created', { deployment: current.id, task: task.id, target: prev.id });
+        res.status(201).json({ deployment: current, task });
     }
     catch (err) {
         next(err);
