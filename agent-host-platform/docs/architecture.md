@@ -208,6 +208,48 @@ Retries are therefore safe by construction: the agent retries the exact
 same request until it gets a response, and the worst case is a replay of
 the already-recorded answer.
 
+## Multi-app hosting & isolation
+
+One worker host runs many applications side by side. Every deployment is
+isolated on four axes, and lifecycle operations are scoped to the
+deployment's own recorded resources — never by name-prefix matching:
+
+- **Container names** are unique per deployment attempt
+  (`uaht-<project>-<version>-<deployment[:8]>`), so redeploying the same
+  version never stops the live container before the new one passes health.
+  Compose deployments share one project name per project
+  (`uaht-<project>`); a redeploy replaces its own stack in place.
+- **Directories**: each deployment owns
+  `<work_dir>/deployments/<deployment_id>/` (state.json, extracted
+  source, compose file). Stopping or removing one deployment never touches
+  another's directory.
+- **Ports**: every host port is verified free at OS level (bind test) and
+  Docker level (`docker ps` published-port scan) before `docker run` — and,
+  since Phase 4, before `docker compose up` too (ports are read from
+  `docker compose config --format json`; ports already held by the same
+  compose project's stack are skipped, since redeploy replaces it). A
+  collision fails the task before anything starts. The control plane's
+  `port_allocations` registry reserves fixed ports per deployment.
+- **Env & logs**: non-secret env is persisted in state.json, secret env is
+  injected at run time and never written to disk; logs are per deployment
+  (`logs/deployments/<deployment_id>.log`).
+- **Resource limits** from the manifest (memory/cpu) are passed to
+  `docker run`.
+
+**Compose rollback.** On healthcheck failure the worker tears down the new
+unhealthy stack (`compose down`) and restores the previous one
+(`compose up` with the compose file recorded in the previous deployment's
+state). The `rollback` task handler restores compose targets the same way;
+container targets are still restored with `docker start`.
+
+**Garbage collection.** After every successful deploy (never during one)
+the worker keeps `DEPLOY_KEEP_GENERATIONS` (default 2) newest generations
+per project and collects the rest: stopped containers are `docker rm`'d,
+worker-built images are `docker rmi`'d, compose generations get
+`compose down`. GC never removes an image still referenced by a kept
+generation, never removes a prebuilt/external image, and never touches a
+container docker still reports as running. State directories are kept.
+
 ## Why no inbound connections to the host
 
 The host worker only ever makes outbound HTTPS calls. There is no open
