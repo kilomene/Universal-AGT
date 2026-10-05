@@ -52,6 +52,17 @@ def _as_int(value, field_name: str) -> int:
         raise ConfigError(f"{field_name} must be an integer, got {value!r}")
 
 
+def _as_bool(value, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    raise ConfigError(f"{field_name} must be a boolean, got {value!r}")
+
+
 @dataclass
 class WorkerConfig:
     control_plane_url: str = ""
@@ -68,6 +79,14 @@ class WorkerConfig:
     # Crash-loop detection (see deployments.crashloop).
     crash_loop_threshold: int = 5    # restarts inside the window -> crash loop
     crash_loop_window_s: int = 300   # observation window, seconds
+    # Public ingress (Phase 7; disabled by default). When enabled, the
+    # worker supervises an outbound-only ingress provider (e.g. a
+    # cloudflared tunnel) and syncs tunnel routes from deployment domains.
+    # The tunnel token comes from the UAHT_TUNNEL_TOKEN environment variable
+    # (never from the repo, never logged).
+    ingress_enabled: bool = False
+    ingress_provider: str = ""
+    tunnel_token: str = ""
 
     @classmethod
     def load(cls, config_path: str | None = None, **overrides) -> "WorkerConfig":
@@ -101,10 +120,20 @@ class WorkerConfig:
             "capabilities": ENV_PREFIX + "CAPABILITIES",  # comma-separated
             "crash_loop_threshold": ENV_PREFIX + "CRASH_LOOP_THRESHOLD",
             "crash_loop_window_s": ENV_PREFIX + "CRASH_LOOP_WINDOW_S",
+            "ingress_enabled": ENV_PREFIX + "INGRESS_ENABLED",
+            "ingress_provider": ENV_PREFIX + "INGRESS_PROVIDER",
+            # tunnel_token deliberately NOT WORKER_-prefixed: it comes from
+            # the UAHT_TUNNEL_TOKEN environment variable (see below).
         }
         for field_name, env_name in env_map.items():
             if env_name in os.environ:
                 values[field_name] = os.environ[env_name]
+        # Tunnel token precedence: explicit kwarg override > UAHT_TUNNEL_TOKEN
+        # env > worker.env file keys (tunnel_token / uaht_tunnel_token).
+        if "UAHT_TUNNEL_TOKEN" in os.environ:
+            values["tunnel_token"] = os.environ["UAHT_TUNNEL_TOKEN"]
+        elif "tunnel_token" not in values and "uaht_tunnel_token" in values:
+            values["tunnel_token"] = values["uaht_tunnel_token"]
         values.update({k: v for k, v in overrides.items() if v is not None})
 
         cfg = cls(
@@ -126,6 +155,10 @@ class WorkerConfig:
             crash_loop_window_s=_as_int(
                 values.get("crash_loop_window_s", 300), "crash_loop_window_s"
             ),
+            ingress_enabled=_as_bool(
+                values.get("ingress_enabled", False), "ingress_enabled"),
+            ingress_provider=str(values.get("ingress_provider", "") or ""),
+            tunnel_token=str(values.get("tunnel_token", "") or ""),
         )
         caps = values.get("capabilities", "")
         if isinstance(caps, str) and caps.strip():
@@ -187,4 +220,7 @@ class WorkerConfig:
             "config_path": self.config_path,
             "crash_loop_threshold": self.crash_loop_threshold,
             "crash_loop_window_s": self.crash_loop_window_s,
+            "ingress_enabled": self.ingress_enabled,
+            "ingress_provider": self.ingress_provider,
+            "tunnel_token": "***" if self.tunnel_token else "",
         }
