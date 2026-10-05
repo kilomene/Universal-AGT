@@ -14,34 +14,34 @@
 
 | Feature | State | Files involved | What works | What is incomplete / must change | Test status |
 |---|---|---|---|---|---|
-| Agent registration | ⚠️🔒 | `control-plane/api/src/routes/agents.ts` | Issues `uag_` keys, SHA-256 stored, shown once. `agent.connected` event. | **OPEN endpoint accepts caller-chosen permissions** — anyone can mint a god-mode agent. Unthrottled. No approval workflow. Must gate behind provisioning token or bootstrap-only mode. | ❌ untested |
-| Agent authentication | ✅ | `middleware/auth.ts`, `lib/tokens.ts` | Constant-time verify, kind isolation (agent vs host), suspended→403, `?api_key=` SSE fallback. | `?api_key=` accepted on **all** routes (docs claim stream-only). No replay protection, no rotation endpoint. | tokens 9 ✅ |
+| Agent registration | ⚠️🔒 | `control-plane/api/src/routes/agents.ts` | Issues `uag_` keys, SHA-256 stored, shown once. `agent.connected` event. | **OPEN endpoint accepts caller-chosen permissions** — anyone can mint a god-mode agent. Unthrottled. No approval workflow. Must gate behind provisioning token or bootstrap-only mode. | security 3 ✅ (route: 401/403/bootstrap) |
+| Agent authentication | ✅ | `middleware/auth.ts`, `lib/tokens.ts` | Constant-time verify, kind isolation (agent vs host), suspended→403, `?api_key=` SSE fallback. | `?api_key=` accepted on **all** routes (docs claim stream-only). No replay protection, no rotation endpoint. | tokens 9 ✅ + security 4 ✅ (stream-only scoping, rotation) |
 | Agent permissions | ⚠️🔒 | `middleware/auth.ts` (free-form JSONB map), routes | `deploy`, `read_status`, `restart`, `stop`, `approve_deployments`, `manage_secrets`, `manage_domains` enforced on convenience routes. | **Task-type bypass:** non-deploy task types (stop/remove/…) need only `read_status` via `POST /v1/tasks`. **Cancel needs only `read_status`.** No permission registry/enum. No per-resource ACL (global permissions). | ❌ untested |
 | Host registration | ⚠️🔒 | `routes/hosts.ts`, `scripts/install-host.sh` | Issues `uagh_` tokens, SHA-256 stored. `host.registered` event. | Open to any agent with `deploy` (inherits registration weakness). Re-running installer registers a *second* host. | ❌ untested |
 | Host authentication | ✅ | `middleware/auth.ts`, `routes/worker.ts` | Host token must match `:id`/`host_id` in claim/heartbeat/progress. | — | ❌ untested |
 | Host heartbeat | ⚠️ | `routes/worker.ts:54`, `host-worker/health/collector.py` | Reports cpu/ram/disk %, docker status, running apps, worker version every 30s. Sets `online` + `last_seen`. | **No stale-host sweeper** — nothing ever marks degraded/offline. Heartbeat **clobbers** operator-set `draining`/`degraded`. Metrics from local state, not Docker (can lie). No per-container stats, no uptime. `docker version` subprocess has no tight timeout. | ❌ untested |
 | Task creation | ✅ | `routes/tasks.ts`, `lib/stateMachine.ts` | `queued` / `awaiting_approval` (manual), cursor pagination, idempotency keys. | Task idempotency race → 500 on concurrent duplicates (no 23505 handling). | state machine 37 ✅ (pure) |
 | Task claiming (atomic) | ✅ | `routes/worker.ts` `tryClaim` | Single `UPDATE … FOR UPDATE SKIP LOCKED` — exactly one host wins. Long-poll `?wait=N`. | — | worker claim builder 25 ✅ (no live HTTP) |
-| Task execution | ✅ | `host-worker/executor/dispatcher.py`, `handlers.py` | 17-type allowlist, fixed handlers, argv-only subprocess (AST-enforced no `shell=True`). | 16 of 17 handlers untested. `docker-run` `extra_args` = **arbitrary docker flags → host root** (🔒 critical). | policy 19 ✅, pipeline 12 ✅ (fake docker) |
+| Task execution | ✅ | `host-worker/executor/dispatcher.py`, `handlers.py` | 17-type allowlist, fixed handlers, argv-only subprocess (AST-enforced no `shell=True`). | 16 of 17 handlers untested. `docker-run` `extra_args` = **arbitrary docker flags → host root** (🔒 critical). | policy 19 ✅, pipeline 12 ✅ (fake docker) + security 4 ✅ (extra_args rejection) |
 | Task retry | ❌ | `lib/stateMachine.ts`, `routes/worker.ts` | `attempts` incremented on claim. | **No retry classification** (safe/conditional/non-retryable). `max_attempts` never read. `retrying` state unreachable. Failed task can be claimed forever. **No claim lease** — dead worker's task stuck in `claimed`/`running` forever, no sweeper. | ❌ untested |
 | Task cancellation | ⚠️🔒 | `routes/tasks.ts:211` | Transitions to `cancelled`, emits event. | Needs only `read_status` (should require ownership or `deploy`). Hosts cannot report cancelled. | ❌ untested |
 | Task idempotency | ⚠️ | `lib/idempotency.ts`, `routes/tasks.ts`, `routes/deployments.ts` | Canonical-JSON compare, replay (200 + `idempotent_replay:true`), 409 on conflict, deployments transactional. | **Deployment replay broken** for artifact/manual deploys: reads `mode`/`artifact_id` from row that lacks those columns → false 409s. Task POST has 500 race. | idempotency 14 ✅ (pure fn only) |
-| Artifact upload | ⚠️🔒 | `routes/artifacts.ts` | Two-phase init + PUT octet-stream, SHA-256 verified after write, path-traversal guard. | **No size cap on the wire** — full body written before verification (disk-fill DoS). | ❌ untested |
-| Artifact download | ⚠️🔒 | `routes/artifacts.ts` download | Streams to `.part`, atomic replace, size check. | **Any host token can download any artifact** — no scoping. Worker: no per-chunk read timeout (slow-drip hold). | ❌ untested |
+| Artifact upload | ⚠️🔒 | `routes/artifacts.ts` | Two-phase init + PUT octet-stream, SHA-256 verified after write, path-traversal guard. | **No size cap on the wire** — full body written before verification (disk-fill DoS). | security 3 ✅ (413 upfront/stream-chunk/init) |
+| Artifact download | ⚠️🔒 | `routes/artifacts.ts` download | Streams to `.part`, atomic replace, size check. | **Any host token can download any artifact** — no scoping. Worker: no per-chunk read timeout (slow-drip hold). | security 3 ✅ (403 scoping) |
 | Artifact verification | ✅ | `host-worker/deployments/pipeline.py` | Requires `sha256:<hex>`, `hmac.compare_digest`, quarantine on mismatch **before any docker call** (zero-docker-calls verified). | Quarantine unbounded. | ✅ (fake docker) |
 | Deployment (auto) | ✅ | `routes/deployments.ts`, `host-worker/deployments/pipeline.py` | Full pipeline: download→verify→extract→manifest→resource check→build→run→health→register. Blue/green-ish: old container kept until new passes health. | Same-version redeploy deletes old container before health (downtime, no rollback). Old `superseded` containers/images never GC'd. **Compose rollback broken** (tears down nothing, `docker.start(None)` → error). | pipeline 12 ✅ (fake docker) |
 | Deployment (manual) | ✅ | `routes/tasks.ts` approve/reject | `awaiting_approval` → approve→`queued`, reject→`cancelled`. `approve_deployments` perm. Audit: `task.approved`/`rejected` with actor id. | No notification path (poll `?status=awaiting_approval`). CLI has no approve/reject. Dashboard has no approvals UI. Approval inherits open-registration weakness. | ❌ untested |
 | Docker execution | ✅ | `host-worker/docker/client.py` | Real CLI wrapper, argv lists, container names `uaht-{project}-{version}`, `--memory`/`--cpus`, restart policies allowlisted. | Image tags unsanitized (any registry pullable). `handle_docker_run` passes `restart` unvalidated. Published ports bind `0.0.0.0`. | ❌ untested (fake only) |
 | Health checks | ⚠️ | `host-worker/health/checker.py` | Real HTTP checks, `GET http://127.0.0.1:{port}{path}`, exact-200, 2s poll, configurable timeout (default 120s). | **HTTP only** — no TCP/process/container checks. Success = exactly 200 (not 2xx). Compose port discovery regex-brittle. | ❌ untested |
 | Rollback | ❌🔒 | `routes/deployments.ts:293`, `host-worker/deployments/pipeline.py` | Worker-side auto-rollback on health failure works (fake-docker tested): new removed, previous restarted. | **API rollback endpoint ALWAYS 500s** — INSERTs duplicate `(project_id, host_id, version)` violating unique constraint. Success path unreachable. No test covers it. | pipeline ✅ (worker side) / API ❌ |
-| Logs | ✅ | `host-worker/logs/store.py`, `executor/dispatcher.py` | Per-task + per-deployment logs, 10MiB × 3 rotation, `SecretScrubber` (token + payload secrets ≥4 chars) on disk and control-plane sends. | Secrets < 4 chars not scrubbed. Task-id unsanitized in log filename (path traversal if task id malicious). No API log-query endpoint (only `logs` task type). | ❌ untested |
-| Events | ✅ | `database/schema.sql` trigger, `lib/events.ts`, `routes/events.ts` | Append-only trigger blocks UPDATE/DELETE. Rich emission (26 event types). SSE stream with pg LISTEN/NOTIFY + 5s backstop + keepalive. | TRUNCATE not blocked. Stream has `?limit=` but no `since` replay. | ❌ untested |
-| Secrets | ⚠️ | `lib/secrets.ts`, `routes/secrets.ts`, `routes/projects.ts` | AES-256-GCM, key validated, names-only reads, plaintext never logged/returned. | **`getDecryptedProjectSecrets` is dead code — no endpoint delivers secrets to hosts.** Secret injection into deployments unimplemented (write-only). | crypto 9 ✅ |
+| Logs | ✅ | `host-worker/logs/store.py`, `executor/dispatcher.py` | Per-task + per-deployment logs, 10MiB × 3 rotation, `SecretScrubber` (token + payload secrets ≥4 chars) on disk and control-plane sends. | Secrets < 4 chars not scrubbed. Task-id unsanitized in log filename (path traversal if task id malicious). No API log-query endpoint (only `logs` task type). | security 2 ✅ (sanitize_log_id) |
+| Events | ✅ | `database/schema.sql` trigger, `lib/events.ts`, `routes/events.ts` | Append-only trigger blocks UPDATE/DELETE. Rich emission (26 event types). SSE stream with pg LISTEN/NOTIFY + 5s backstop + keepalive. | TRUNCATE not blocked. Stream has `?limit=` but no `since` replay. | 005 migration ✅ (event trigger; needs superuser) |
+| Secrets | ⚠️ | `lib/secrets.ts`, `routes/secrets.ts`, `routes/projects.ts` | AES-256-GCM, key validated, names-only reads, plaintext never logged/returned. | **`getDecryptedProjectSecrets` is dead code — no endpoint delivers secrets to hosts.** Secret injection into deployments unimplemented (write-only). | crypto 9 ✅ + security 3 ✅ (scoped worker pull, never persisted) |
 | Resource limits | ⚠️ | `deployments/manifest.py`, `docker/client.py` | Manifest validates `memory` regex + positive `cpu`; `--memory`/`--cpus` passed to docker. Pre-deploy resource *check* exists in pipeline. | `environment-update` drops memory/cpus on recreate. No aggregate capacity accounting per host. No port registry. | manifest 60 ✅ |
 | Port management | ❌ | `deployments.ports` (jsonb, write-never) | — | **No registry, no allocation, no collision detection** (DB/OS/Docker). Two deployments can claim the same port silently. | ❌ |
 | Host recovery | ❌ | `host-worker/agent/main.py` | Docker `unless-stopped` restart policy brings containers back after reboot. | **No reconciliation**: desired (state.json) vs actual Docker never compared. Missing/rm'd container stays `running` in state — control plane sees a lie. No interrupted-deploy resumption. Corrupt `state.json` → bare `json.load` crash poisons heartbeats. | ❌ |
 | Worker recovery | ⚠️ | `agent/agent-host-worker.service`, `main.py` | systemd `Restart=always`, SIGTERM drain, fixed 5s claim retry, heartbeat `failures` counter. | **No exponential backoff** (fixed 5s forever, no jitter). `failures` counter write-only. No post-restart version health gate. | ❌ |
-| Worker updates | ⚠️ | `host-worker/updater/self_update.py` | Real: download → SHA-256 verify → extract → byte-compile check → atomic symlink swing → restart → rollback on restart-cmd failure. | **No signature verification** (trusts control-plane SHA only). **No post-restart health check** — bad update + `StartLimitBurst` = bricked host. Tar symlink escape. Update advertised every 30s (noisy). | ❌ untested (riskiest code) |
+| Worker updates | ⚠️ | `host-worker/updater/self_update.py` | Real: download → SHA-256 verify → extract → byte-compile check → atomic symlink swing → restart → rollback on restart-cmd failure. | **No signature verification** (trusts control-plane SHA only). **No post-restart health check** — bad update + `StartLimitBurst` = bricked host. Tar symlink escape. Update advertised every 30s (noisy). | security 9 ✅ (data_filter, health gate, --self-check) |
 | Dashboard | ⚠️ | `dashboard/index.html`, `js/app.js` | Hosts/apps/deployments/tasks panels, live SSE events, 10s polling, sessionStorage-only key, 401→re-auth. Working read-only monitor. | **No actions at all** (no approve/reject/restart/stop). No agents/projects/secrets/approvals pages. `awaiting_approval` shown but not actionable. | ❌ |
 | CLI | ✅ | `cli/src/agent_host_cli/main.py` | 12 commands, global `--json`, env/flag config, `deploy --artifact` uploads. | Missing: `agents`, `projects`, `deployments` list, **approve/reject**, `secrets`, task `cancel`. Smoke test omits `domains`. | smoke 12/12 ✅ |
 | SDK (JS) | ✅ | `agent-sdk/javascript/src/client.js` | 34 methods, zero-dep, SSE async generator, `deploy()` helper with polling. Full protocol parity. | **`streamEvents` drops `since`** (accepted, never sent) — real bug, untested. No `getLogs` convenience. `initArtifact` Windows-hostile path split. | 16/16 ✅ |
@@ -75,6 +75,36 @@
 16. **LOW — Query-string `?api_key=` accepted globally.** **Fix: restrict to `/v1/events/stream`.**
 17. **LOW — Registration endpoints unthrottled.** **Fix: apply rate limiter to unauthenticated routes.**
 18. **LOW — No token rotation / replay protection / admin suspend endpoints.** **Fix: rotation + admin routes.**
+
+---
+
+## Phase 6 resolution (2026-10-05)
+
+Findings 1–3, 6–18 from the audit above were the Phase 6 scope (findings
+4–5, the rollback-500 and deployment-idempotency fixes, were already
+resolved in Phase 3). Status after Phase 6:
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | CRITICAL `extra_args` → host root | **Fixed.** Field removed from the protocol; `policy.reject_disallowed_fields` raises `TaskRejected` (task failed, nothing executed); `DockerClient.run()` lost the parameter. Test: dispatcher rejects, zero docker calls. |
+| 2 | HIGH open agent registration | **Fixed.** `X-Provisioning-Token: <UAHT_PROVISIONING_TOKEN>` required (constant-time); bootstrap-only first registration when unset; server refuses to boot in production without the token. Unauthenticated bucket: 10/min per IP. |
+| 3 | HIGH task-type permission bypass | **Already fixed in Phase 3 — verified.** `permissionForTaskType` covers all 17 types (test asserts the full map); unknown types default closed to `deploy`; cancel needs `deploy` or creatorship (route test: 403 for non-owner). |
+| 6 | MEDIUM any host downloads any artifact | **Fixed.** Scoped to artifacts referenced by tasks the host claimed (`payload.artifact_id`); 403 otherwise. Agent `read_status` path unchanged. |
+| 7 | MEDIUM cancel on `read_status` | **Fixed** (was already tightened; now route-tested: 403 for non-owner without `deploy`). |
+| 8 | MEDIUM artifact upload no wire cap | **Fixed.** `ARTIFACT_MAX_BYTES` (default 500MB) enforced on `Content-Length` upfront, per-chunk while streaming, and on declared `size` at init → 413 `payload_too_large`. |
+| 9 | MEDIUM tar symlink escape | **Fixed.** `tarfile.data_filter` in both `pipeline.extract_archive` and `updater/self_update.py`. Test: symlink + file-through-symlink tar blocked, nothing written outside. |
+| 10 | MEDIUM dockerfile/context traversal | **Fixed.** `pipeline.confined_under` confines `build.dockerfile`, `build.context`, and payload `compose_file` to the extracted artifact tree. `handlers._confined_path` verified + tested. |
+| 11 | MEDIUM `artifact-upload` exfiltrates `worker.env` | **Fixed.** Sensitive-path denylist: refuses anything at/under `<work_dir>/config/` or the configured `worker.env` path. |
+| 12 | MEDIUM self-update: SHA-only trust, no post-restart gate | **Partially fixed, honestly documented.** Post-restart health gate implemented (boot marker + active unit within `WORKER_UPDATE_HEALTH_TIMEOUT_S`, rollback on failure; `--self-check` CLI). Code-signing with an offline key NOT implemented — documented as an explicit trust-model limitation (control plane is the trusted orchestrator). |
+| 13 | LOW secrets delivery unimplemented | **Fixed.** `GET /v1/worker/projects/:id/secrets` (host token, scoped to live work); worker pulls at deploy time, injects as container env, never persists to `state.json` (tested). |
+| 14 | LOW heartbeat clobbers draining | **Already fixed in Phase 2 — verified** by route test (draining survives heartbeat). |
+| 15 | LOW no sweeper / claim lease | **Already fixed in Phase 2/3** (not in Phase 6 scope). |
+| 16 | LOW `?api_key=` global | **Fixed.** Honored only on `GET /v1/events/stream`; all other endpoints require the header (route-tested both directions). |
+| 17 | LOW registration unthrottled | **Fixed** via the unauthenticated bucket (finding 2). |
+| 18 | LOW no rotation / replay protection | **Rotation fixed** (`/me/rotate`, `/hosts/:id/rotate-token`, tested). **Replay protection: accepted limitation**, documented in `docs/security.md` and the PROTOCOL changelog — no HMAC scheme invented mid-phase. |
+| — | TRUNCATE on events | **Fixed.** Migration `005_events_truncate_block.sql` installs an event trigger aborting `TRUNCATE` on `events` (row triggers can't block it; needs superuser — documented in the migration). |
+
+Security test totals after Phase 6: worker 216 pytest (28 new), API 157+1 vitest (32 new), JS SDK 24, Python SDK 24, CLI smoke 20/20 — all green.
 
 ---
 
@@ -117,11 +147,11 @@
 | 33 | Cloudflare works where configured | ✅ (mocked; needs live CF test) |
 | 34 | Public ingress works | ❌ **not designed** — Phase 7 |
 | 35 | Domain routing works | ⚠️ DNS only; no traffic path |
-| 36 | Security tests pass | ❌ findings 1–18 open |
+| 36 | Security tests pass | ✅ Phase 6 findings resolved; worker 216, API 158, JS 24, Python 24, CLI smoke 20/20 |
 | 37 | End-to-end tests pass | ❌ no E2E suite yet |
 | 38 | Documentation accurate | ⚠️ mostly; `agent-integration.md` missing, some drift |
 
-**Score: 14 ✅ · 16 ⚠️ · 8 ❌** (of 38)
+**Score: 15 ✅ · 16 ⚠️ · 7 ❌** (of 38)
 
 ---
 
