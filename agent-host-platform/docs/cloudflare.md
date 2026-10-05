@@ -88,7 +88,7 @@ CLOUDFLARE_ZONE_ID=<zone id>
 TUNNEL_INGRESS_HOSTNAME=<tunnel-id>.cfargotunnel.com   # from step 3
 ```
 
-**Host** (`/etc/uagt/worker.env`, mode `0600`):
+**Host** (`/opt/agent-host/config/worker.env`, mode `0600`):
 
 ```bash
 WORKER_INGRESS_ENABLED=true
