@@ -35,6 +35,9 @@ agent-host status --deployment <id>
 agent-host rollback --deployment <id>
 agent-host tasks [--status running]
 agent-host events [--follow]              # --follow streams live SSE events
+agent-host domains list --deployment <id>
+agent-host domains add --deployment <id> --hostname api.example.com
+agent-host domains rm --deployment <id> --hostname api.example.com
 ```
 
 Append `--json` to any command for machine-readable output; otherwise a
