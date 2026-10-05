@@ -51,7 +51,51 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--config", default=None,
                         help="path to worker.env (default: $WORKER_CONFIG or "
                              "/opt/agent-host/config/worker.env)")
+    parser.add_argument("--self-check", action="store_true",
+                        help="run startup self-checks (config loads, state "
+                             "readable, docker reachable-or-skipped) and exit "
+                             "0/1 without starting the worker loop; used by "
+                             "the post-update health gate")
     return parser.parse_args(argv)
+
+
+def run_self_check(config: WorkerConfig) -> tuple[bool, dict]:
+    """Startup self-checks for --self-check and the update health gate.
+
+    Returns (ok, report). Checks: config validates, the deployment state
+    store is readable, and docker is reachable (a missing docker is a
+    graceful skip, not a failure — the worker runs dockerless).
+    No network calls, no task execution.
+    """
+    report: dict = {"checks": {}}
+    checks = report["checks"]
+    try:
+        config.validate()
+    except ConfigError as exc:
+        checks["config"] = f"FAIL: {exc}"
+        report["ok"] = False
+        return False, report
+    checks["config"] = "ok"
+    try:
+        from deployments.state import DeploymentStore
+        store = DeploymentStore(config.work_dir)
+        n = len(store.list_all())
+        checks["state"] = f"ok ({n} deployments readable)"
+    except Exception as exc:
+        checks["state"] = f"FAIL: {exc}"
+        report["ok"] = False
+        return False, report
+    try:
+        docker = DockerClient()
+        checks["docker"] = f"ok ({docker.version()})"
+    except DockerMissing:
+        checks["docker"] = "skipped (docker not present)"
+    except Exception as exc:
+        checks["docker"] = f"FAIL: {exc}"
+        report["ok"] = False
+        return False, report
+    report["ok"] = True
+    return True, report
 
 
 def detect_capabilities(docker) -> list:
@@ -216,11 +260,25 @@ def main(argv=None) -> int:
         LOG.error("bad configuration: %s", exc)
         return 2
 
+    if args.self_check:
+        import json
+        ok, report = run_self_check(config)
+        print(json.dumps(report))
+        return 0 if ok else 1
+
     LOG.info("starting host worker %s as %s (config: %s)",
              config.worker_version, config.host_name,
              {k: v for k, v in config.redacted().items() if k != "host_token"})
 
     ctx = build_context(config)
+
+    # Boot marker for the self-update post-restart health gate: the updater
+    # polls this file after `systemctl restart` to confirm the NEW version
+    # came up (version + fresh boot timestamp).
+    try:
+        self_update.write_status_file(config.work_dir, config.worker_version)
+    except OSError as exc:
+        LOG.warning("could not write boot status file: %s", exc)
 
     # Post-reboot reconciliation: desired state (local state.json) vs actual
     # Docker state, before any claiming starts. The summary rides along on
