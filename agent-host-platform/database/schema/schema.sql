@@ -51,6 +51,10 @@ create table hosts (
     capabilities   jsonb not null default '[]'::jsonb,        -- e.g. ["docker","docker-compose","gpu"]
     worker_version text,
     token_hash     text not null,                             -- SHA-256 hex of the host bearer token
+    previous_token_hash text,                            -- SHA-256 hex of the pre-rotation host token
+                                                        -- (valid only while previous_token_expires_at
+                                                        -- is in the future — rotation grace window)
+    previous_token_expires_at timestamptz,               -- grace expiry for previous_token_hash
     cpu_pct        double precision,
     ram_pct        double precision,
     disk_pct       double precision,
@@ -163,7 +167,9 @@ create table deployments (
     container_ids  jsonb not null default '[]'::jsonb,
     ports          jsonb not null default '{}'::jsonb,        -- written from the deploy task's
                                                              -- result.ports on completion
-    domains        jsonb not null default '[]'::jsonb,
+    domains        jsonb not null default '[]'::jsonb,        -- DERIVED summary mirror of the
+                                                             -- domains table (migration 007);
+                                                             -- the domains table is authoritative
     health_status  text,                                      -- 'healthy' | 'unhealthy' | 'unknown'
     rollback_of    uuid references deployments(id) on delete set null,
     created_at     timestamptz not null default now(),
@@ -190,6 +196,42 @@ create table port_allocations (
     primary key (host_id, port)
 );
 create index idx_port_allocations_deployment on port_allocations(deployment_id);
+
+-- ----------------------------------------------------------------------------
+-- domains: public hostnames attached to deployments (migration 007).
+-- The SOURCE OF TRUTH for the domain lifecycle; deployments.domains (jsonb)
+-- is a derived summary mirror rebuilt from this table on every transition.
+-- Lifecycle: requested -> configuring -> active -> failed -> removing ->
+-- removed. One live row per hostname (partial unique index) so a hostname
+-- can never be attached to two live deployments at once.
+-- ----------------------------------------------------------------------------
+create table domains (
+    id                uuid primary key default gen_random_uuid(),
+    hostname          text not null,
+    deployment_id     uuid not null references deployments(id) on delete cascade,
+    host_id           uuid not null references hosts(id) on delete cascade,
+    ingress           text not null default 'tunnel'
+                      check (ingress in ('tunnel', 'direct')),
+    status            text not null default 'requested'
+                      check (status in ('requested', 'configuring', 'active',
+                                        'failed', 'removing', 'removed')),
+    cf_record_id      text,                                  -- Cloudflare DNS record id, when DNS is managed
+    dns_configured    boolean not null default false,        -- CNAME hostname -> ingress target exists
+    tunnel_configured boolean not null default false,        -- remote tunnel ingress rule exists (tunnel mode)
+    https_reachable   boolean not null default false,        -- last HTTPS probe result (informational)
+    https_status      integer,                               -- last probe HTTP status (null when no response)
+    https_checked_at  timestamptz,
+    verified_at       timestamptz,                           -- last time route+DNS were confirmed present
+    error             text,                                  -- last failure reason, cleared on success
+    created_at        timestamptz not null default now(),
+    updated_at        timestamptz not null default now()
+);
+create unique index idx_domains_hostname_live
+    on domains (lower(hostname))
+    where status <> 'removed';
+create index idx_domains_deployment on domains (deployment_id);
+create index idx_domains_host on domains (host_id);
+create index idx_domains_status on domains (status);
 
 -- ----------------------------------------------------------------------------
 -- events: APPEND-ONLY journal. This is the system's memory.
