@@ -72,6 +72,31 @@ export function resetRateLimitBucketsForTests(): void {
   buckets.clear();
 }
 
+// Strict bucket for credential rotation endpoints (POST /v1/agents/me/rotate
+// and POST /v1/hosts/:id/rotate-token). Rotation is the most sensitive
+// authenticated operation: a tightened per-credential limit on top of the
+// general API limit (120/min agent, 600/min host), configurable via
+// UAHT_ROTATE_RATE_PER_MIN (default 10/min per credential).
+function rotateLimit(): number {
+  const n = Number(process.env.UAHT_ROTATE_RATE_PER_MIN ?? 10);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 10;
+}
+
+export function rotationRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const auth = req.auth;
+  if (!auth) {
+    sendError(res, 401, 'unauthorized', 'missing or invalid bearer token');
+    return;
+  }
+  const key = `rotate:${auth.kind}:${auth.id}`;
+  const limit = rotateLimit();
+  if (!checkBucket(key, limit)) {
+    sendError(res, 429, 'rate_limited', `rate limit exceeded: ${limit} rotation requests per minute`);
+    return;
+  }
+  next();
+}
+
 // Keep the map from growing unboundedly when many distinct keys appear.
 setInterval(() => {
   const now = Date.now();
