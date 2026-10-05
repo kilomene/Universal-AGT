@@ -274,6 +274,17 @@ def test_add_domain():
     assert out["domain"]["status"] == "dns_pending"
 
 
+def test_add_domain_with_ingress_tunnel():
+    client, fake = client_with(
+        {"/v1/domains": lambda: make_response(201, {"domain": {"hostname": "api.example.com", "status": "active", "ingress": "tunnel"}})}
+    )
+    out = client.add_domain("d-1", "api.example.com", ingress="tunnel")
+    method, url, kwargs = fake.calls[0]
+    assert method == "POST"
+    assert kwargs["json"] == {"deployment_id": "d-1", "hostname": "api.example.com", "ingress": "tunnel"}
+    assert out["domain"]["ingress"] == "tunnel"
+
+
 def test_list_domains():
     client, fake = client_with({"/v1/domains": lambda: make_response(200, {"domains": []})})
     client.list_domains("d-1")
