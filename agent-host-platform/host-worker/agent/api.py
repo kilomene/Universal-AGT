@@ -203,3 +203,20 @@ class ControlPlaneClient:
         if resp.status_code not in (200, 201):
             self._raise(resp, f"artifact {artifact_id} upload")
         return resp.json()
+
+    def get_project_secrets(self, project_id: str) -> dict:
+        """Fetch decrypted project secrets for a project this host is
+        actively deploying (GET /v1/worker/projects/:id/secrets, host
+        token). The server only serves them when this host has a
+        claimed/active task or deployment for the project."""
+        resp = self.session.get(
+            self._url(f"/v1/worker/projects/{project_id}/secrets"),
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 403:
+            return {}  # no active work for this project: no secrets
+        if resp.status_code != 200:
+            self._raise(resp, f"project {project_id} secrets")
+        body = resp.json()
+        secrets = (body or {}).get("secrets")
+        return secrets if isinstance(secrets, dict) else {}
