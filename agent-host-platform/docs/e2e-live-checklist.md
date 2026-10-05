@@ -19,7 +19,7 @@ reboots, real network paths.
   `DATA_ENCRYPTION_KEY` set (64 hex chars), and `UAHT_PROVISIONING_TOKEN`
   set (gates agent registration).
 - One Debian/Ubuntu Linux host with Docker installed.
-- The `agent-host` CLI installed locally, with `UAHT_API_URL` and
+- The `agent-host` CLI installed locally, with `UAHT_BASE_URL` and
   `UAHT_API_KEY` exported.
 - For check 12: a Cloudflare account with a Zone + API token
   (`CF_API_TOKEN`, `CF_ZONE_ID`), and `TUNNEL_INGRESS_HOSTNAME` set on the
@@ -51,12 +51,12 @@ curl -s localhost:3000/v1/health
 **Goal:** criterion 1–3 (agents/hosts authenticate; registration is gated).
 
 ```bash
-export UAHT_API_URL=http://<control-plane>:3000
+export UAHT_BASE_URL=http://<control-plane>:3000
 # without the provisioning token -> 401
-curl -s -X POST "$UAHT_API_URL/v1/agents/register" -H 'Content-Type: application/json' \
+curl -s -X POST "$UAHT_BASE_URL/v1/agents/register" -H 'Content-Type: application/json' \
   -d '{"name":"e2e-agent","permissions":{"deploy":true}}'
 # with the token -> 201, key shown ONCE (save it)
-curl -s -X POST "$UAHT_API_URL/v1/agents/register" -H 'Content-Type: application/json' \
+curl -s -X POST "$UAHT_BASE_URL/v1/agents/register" -H 'Content-Type: application/json' \
   -H "X-Provisioning-Token: $UAHT_PROVISIONING_TOKEN" \
   -d '{"name":"e2e-agent","permissions":{"deploy":true,"approve_deployments":true,"read_status":true}}'
 export UAHT_API_KEY='<the-shown-key>'
@@ -227,7 +227,7 @@ agent-host stop --deployment "$DEP_B"
 docker ps --filter name=uaht-app --format '{{.Names}}'  # app-a, app-c only
 # collision: request app-c's port for a new app-a deployment -> must fail pre-run
 PORT_C=... # app-c's host port from `agent-host deployments list --project app-c`
-curl -s -X POST "$UAHT_API_URL/v1/deployments" -H 'Content-Type: application/json' \
+curl -s -X POST "$UAHT_BASE_URL/v1/deployments" -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $UAHT_API_KEY" \
   -d "{\"project_id\":\"<app-a-uuid>\",\"host_id\":\"<host-uuid>\",\"version\":\"2.0.0\",\"artifact_id\":\"<artifact-uuid>\",\"host_port\":$PORT_C}"
 ```
@@ -253,9 +253,14 @@ agent-host deploy --project demo-app --version 1.4.0 --host e2e-host-01 \
 
 **Pass:** worker `active`; previously-`running` containers are `Up`
 (without manual `docker start`); the host is `online`; a new deploy works.
-**Known gap:** no reconciliation yet — if a container was `docker rm`'d
-while the host was down, the control plane still believes it `running`
-until the next deploy/restart touches it (see implementation-status §6).
+**What this additionally proves locally (worker E2E covers the logic):**
+on every start the worker reconciles its local deployment registry
+(`<work_dir>/deployments/*/state.json`) against actual Docker state —
+stopped containers are started, missing containers are recreated from their
+stored spec, and a corrupt `state.json` is quarantined aside
+(`state.json.corrupt-<timestamp>`) instead of crashing the worker. This
+check proves the real thing: Docker's restart policy plus the worker's
+reconcile on a real reboot.
 
 ## 11. Worker crash recovery (criterion 7)
 
