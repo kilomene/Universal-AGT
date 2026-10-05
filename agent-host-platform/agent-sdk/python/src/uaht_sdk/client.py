@@ -242,17 +242,31 @@ class UahtClient:
             {"name": name, "owner": owner, "repository": repository, "runtime": runtime, "configuration": configuration},
         )
 
-    def list_projects(self, limit=None, cursor=None):
-        return self._get("/projects", {"limit": limit, "cursor": cursor})
+    def list_projects(self):
+        # The server does not paginate this endpoint (no limit/cursor on
+        # GET /v1/projects), so the SDK exposes none — do not re-add params
+        # the wire ignores.
+        return self._get("/projects")
 
     def get_project(self, project_id):
         return self._get(f"/projects/{project_id}")
 
-    def update_project(self, project_id, configuration):
-        return self._put(f"/projects/{project_id}", {"configuration": configuration})
+    def update_project(self, project_id, configuration=None, repository=None, runtime=None):
+        """PUT /v1/projects/:id — the wire accepts {configuration,
+        repository, runtime}; all three are exposed here."""
+        body = {}
+        if configuration is not None:
+            body["configuration"] = configuration
+        if repository is not None:
+            body["repository"] = repository
+        if runtime is not None:
+            body["runtime"] = runtime
+        return self._put(f"/projects/{project_id}", body)
 
-    def list_artifacts(self, project_id=None, limit=None, cursor=None):
-        return self._get("/artifacts", {"project_id": project_id, "limit": limit, "cursor": cursor})
+    def list_artifacts(self, project_id=None):
+        # GET /v1/artifacts supports ?project_id= only (server-side limit is
+        # a fixed 500, no cursor) — the SDK exposes exactly that.
+        return self._get("/artifacts", {"project_id": project_id})
 
     def get_artifact(self, artifact_id):
         return self._get(f"/artifacts/{artifact_id}")
@@ -329,7 +343,8 @@ class UahtClient:
         return file_path
 
     # -- §3.6 Deployments ----------------------------------------------
-    def create_deployment(self, project_id, version, host_id=None, artifact_id=None, mode=None, idempotency_key=None):
+    def create_deployment(self, project_id, version, host_id=None, artifact_id=None, mode=None,
+                          idempotency_key=None, host_port=None):
         return self._post(
             "/deployments",
             {
@@ -339,16 +354,19 @@ class UahtClient:
                 "artifact_id": artifact_id,
                 "mode": mode,
                 "idempotency_key": idempotency_key,
+                "host_port": host_port,
             },
         )
 
     def get_deployment(self, deployment_id):
         return self._get(f"/deployments/{deployment_id}")
 
-    def list_deployments(self, project_id=None, host_id=None, status=None, limit=None, cursor=None):
+    def list_deployments(self, project_id=None, host_id=None, status=None, limit=None):
+        # GET /v1/deployments supports ?project_id=&host_id=&status=&limit=
+        # (no cursor) — the SDK exposes exactly that.
         return self._get(
             "/deployments",
-            {"project_id": project_id, "host_id": host_id, "status": status, "limit": limit, "cursor": cursor},
+            {"project_id": project_id, "host_id": host_id, "status": status, "limit": limit},
         )
 
     def rollback_deployment(self, deployment_id):
@@ -373,8 +391,8 @@ class UahtClient:
         return self._delete("/domains", {"deployment_id": deployment_id, "hostname": hostname})
 
     # -- §3.6 Services -------------------------------------------------
-    def list_services(self, host_id=None):
-        return self._get("/services", {"host_id": host_id})
+    def list_services(self, host_id=None, limit=None):
+        return self._get("/services", {"host_id": host_id, "limit": limit})
 
     def restart_service(self, service_id):
         return self._post(f"/services/{service_id}/restart", {})
@@ -443,6 +461,7 @@ class UahtClient:
         host=None,
         artifact_id=None,
         mode=None,
+        host_port=None,
         wait=False,
         poll_interval=3.0,
         timeout=600.0,
@@ -471,7 +490,8 @@ class UahtClient:
             host_id = hmatch["id"]
 
         created = self.create_deployment(
-            project_id=match["id"], version=version, host_id=host_id, artifact_id=artifact_id, mode=mode
+            project_id=match["id"], version=version, host_id=host_id, artifact_id=artifact_id, mode=mode,
+            host_port=host_port,
         )
         deployment = created.get("deployment", created)
         task = created.get("task")
