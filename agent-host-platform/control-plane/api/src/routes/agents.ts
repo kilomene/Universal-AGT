@@ -3,15 +3,46 @@ import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
-import { generateAgentKey } from '../lib/tokens';
+import { generateAgentKey, sha256Hex, verifyToken } from '../lib/tokens';
 import { requireAgent } from '../middleware/auth';
 import { publicAgent } from './_helpers';
 
 export const agentsRouter = Router();
 
-// POST /v1/agents/register — open bootstrap endpoint (first agent has no key
-// yet). Later registrations are a normal API call; operators should front this
-// with network policy in production (see README).
+// Registration access decision, extracted pure for tests.
+// - UAHT_PROVISIONING_TOKEN set: the X-Provisioning-Token header must match
+//   (constant-time). Missing/wrong -> 401.
+// - Unset (non-production): bootstrap mode — open registration ONLY while no
+//   agents exist yet; afterwards registration is closed until the operator
+//   sets UAHT_PROVISIONING_TOKEN -> 403.
+export function checkRegistrationAccess(
+  presented: string | undefined,
+  agentCount: number,
+): { ok: true } | { ok: false; status: 401 | 403; message: string } {
+  const expected = process.env.UAHT_PROVISIONING_TOKEN;
+  if (expected) {
+    if (presented && verifyToken(presented, sha256Hex(expected))) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      status: 401,
+      message: 'agent registration requires the X-Provisioning-Token header',
+    };
+  }
+  if (agentCount === 0) return { ok: true }; // bootstrap: first agent
+  return {
+    ok: false,
+    status: 403,
+    message:
+      'agent registration is closed: set UAHT_PROVISIONING_TOKEN on the control plane to provision more agents',
+  };
+}
+
+// POST /v1/agents/register — gated (2026-10-05): a provisioning token, or
+// bootstrap mode for the very first agent. The unauthenticated rate-limit
+// bucket (10/min per IP) also applies. Permissions remain caller-chosen:
+// whoever holds the provisioning token is trusted to scope the key.
 agentsRouter.post('/register', async (req, res, next) => {
   try {
     const { name, type, capabilities, permissions } = req.body ?? {};
@@ -28,6 +59,15 @@ agentsRouter.post('/register', async (req, res, next) => {
       return;
     }
     const pool = getPool();
+    const { rows: countRows } = await pool.query('SELECT count(*)::int AS n FROM agents');
+    const access = checkRegistrationAccess(
+      req.header('x-provisioning-token') ?? undefined,
+      Number(countRows[0]?.n ?? 0),
+    );
+    if (!access.ok) {
+      sendError(res, access.status, access.status === 401 ? 'unauthorized' : 'forbidden', access.message);
+      return;
+    }
     const { token, hash } = generateAgentKey();
     try {
       const { rows } = await pool.query(
@@ -77,6 +117,35 @@ agentsRouter.get('/me', requireAgent, async (req, res, next) => {
       return;
     }
     res.json({ agent: publicAgent(rows[0]) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /v1/agents/me/rotate — rotate the caller's own API key. Returns the
+// NEW key (shown once); the old key stops working immediately. Emits
+// agent.key_rotated. Backwards compatible: keys that never rotate keep
+// working exactly as before.
+agentsRouter.post('/me/rotate', requireAgent, async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const { token, hash } = generateAgentKey();
+    const { rowCount } = await pool.query(
+      `UPDATE agents SET api_key_hash = $2, updated_at = now() WHERE id = $1`,
+      [req.auth!.id, hash],
+    );
+    if (!rowCount) {
+      next(new HttpError(404, 'not_found', 'agent not found'));
+      return;
+    }
+    await appendEvent(pool, {
+      type: 'agent.key_rotated',
+      actor_type: 'agent',
+      actor_id: req.auth!.name,
+      payload: { agent_id: req.auth!.id },
+    });
+    logger.info('agent key rotated', { agent: req.auth!.name });
+    res.json({ api_key: token });
   } catch (err) {
     next(err);
   }
