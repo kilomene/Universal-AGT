@@ -41,77 +41,82 @@ What the installer does:
 
 ## Getting a host token (one-time)
 
-From any machine that can reach the control plane (bootstrap credentials
-depend on your control-plane deployment; the token is shown **once**):
+From any machine that can reach the control plane. Host registration needs
+either the provisioning bearer (`PROVISIONING_TOKEN`, hands-off first
+boot) or an agent API key with the `deploy` permission:
 
 ```bash
 curl -s -X POST https://control-plane.example.com/v1/hosts/register \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $UAHT_PROVISIONING_TOKEN" \
   -d '{"name": "persistent-host-01", "host_type": "linux",
        "capabilities": ["docker", "docker-compose"],
        "worker_version": "1.0.0"}'
+# (or: -H "Authorization: Bearer $UAHT_API_KEY" with an agent key that has `deploy`)
 # → 201 {"host": {...}, "host_token": "<show once>"}
 ```
 
 Save the token into the host's environment file, not into chat logs or
-tickets:
+tickets. The worker reads `/opt/agent-host/config/worker.env` by default
+(override with `WORKER_CONFIG`); the installer writes it there (mode
+`0600`, agenthost-owned).
 
 ```bash
-sudo install -m 0600 /dev/null /etc/uagt/worker.env
-sudo tee /etc/uagt/worker.env >/dev/null <<'EOF'
-UAGT_CONTROL_PLANE="https://control-plane.example.com"
-UAGT_HOST_TOKEN="<paste token here>"
+sudo install -m 0600 -o agenthost -g agenthost /dev/null /opt/agent-host/config/worker.env
+# append the WORKER_* keys shown in host-worker/.env.example, e.g.:
+sudo tee -a /opt/agent-host/config/worker.env >/dev/null <<'EOF'
+WORKER_CONTROL_PLANE_URL="https://control-plane.example.com"
+WORKER_HOST_ID="<host uuid from registration>"
+WORKER_HOST_TOKEN="<paste token here>"
+WORKER_HOST_NAME="persistent-host-01"
 EOF
 ```
 
 ## Manual steps (without the installer)
 
+Mirror what the installer does (see `scripts/install-host.sh`): lay out
+`/opt/agent-host` (worker tree) and `/srv/agent-apps`, create the
+`agenthost` system user, then install the shipped unit
+`host-worker/agent/agent-host-worker.service`:
+
 ```bash
-# 1. Copy the worker
-sudo mkdir -p /opt/uagt/worker
-sudo cp -r host-worker/* /opt/uagt/worker/
-sudo chmod +x /opt/uagt/worker/worker.py   # entrypoint
+# 1. Copy the worker (run from the repo root)
+sudo mkdir -p /opt/agent-host/worker /srv/agent-apps
+sudo cp -r agent-host-platform/host-worker/* /opt/agent-host/worker/
+sudo useradd -r -s /usr/sbin/nologin agenthost 2>/dev/null || true
+sudo chown -R agenthost:agenthost /opt/agent-host /srv/agent-apps
 
-# 2. Environment file with secrets (root-only)
-sudo mkdir -p /etc/uagt
-sudo install -m 0600 /dev/null /etc/uagt/worker.env
-# ... write UAGT_CONTROL_PLANE and UAGT_HOST_TOKEN as above ...
+# 2. Environment file with secrets (see the previous section)
+sudo mkdir -p /opt/agent-host/config
+sudo install -m 0600 -o agenthost -g agenthost /dev/null /opt/agent-host/config/worker.env
+# ... append WORKER_CONTROL_PLANE_URL / WORKER_HOST_ID / WORKER_HOST_TOKEN / WORKER_HOST_NAME ...
 
-# 3. systemd unit
-sudo tee /etc/systemd/system/uagt-worker.service >/dev/null <<'EOF'
-[Unit]
-Description=Universal AGT host worker
-After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+# 3. systemd unit (shipped as host-worker/agent/agent-host-worker.service)
+sudo cp agent-host-platform/host-worker/agent/agent-host-worker.service \
+  /etc/systemd/system/
+# Key lines: User=agenthost, WorkingDirectory=/opt/agent-host/worker
+# (so `python3 -m agent.main` resolves), ExecStart=
+# /usr/bin/python3 -m agent.main --config /opt/agent-host/config/worker.env
 
-[Service]
-Type=simple
-User=root
-EnvironmentFile=/etc/uagt/worker.env
-ExecStart=/usr/bin/python3 /opt/uagt/worker/worker.py
-Restart=always
-RestartSec=5
-# Hardening: the worker only needs outbound HTTPS + docker socket
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/opt/uagt /var/lib/uagt
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+# 4. Enable + start
 sudo systemctl daemon-reload
-sudo systemctl enable --now uagt-worker.service
+sudo systemctl enable --now agent-host-worker.service
 ```
+
+The shipped unit runs the worker as the `agenthost` user with
+`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `MemoryMax=1G`,
+and `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` (Docker socket +
+outbound HTTPS only). The worker reaches the Docker socket through
+`ReadWritePaths` — make sure the `agenthost` user can use Docker on your
+host (the installer sets this up).
 
 ## Verification
 
 On the host:
 
 ```bash
-sudo systemctl status uagt-worker.service --no-pager
-sudo journalctl -u uagt-worker.service -n 50 --no-pager   # look for "heartbeat ok"
+sudo systemctl status agent-host-worker.service --no-pager
+sudo journalctl -u agent-host-worker.service -n 50 --no-pager   # look for "heartbeat ok"
 ```
 
 From the control plane side (agent API key):
@@ -161,7 +166,7 @@ inbound ports):
    dashboard-created token tunnels).
 2. On the control plane, set `CLOUDFLARE_API_TOKEN`,
    `CLOUDFLARE_ZONE_ID`, and `TUNNEL_INGRESS_HOSTNAME=<tunnel-id>.cfargotunnel.com`.
-3. On the host, add to `/etc/uagt/worker.env` (mode `0600`):
+3. On the host, add to `/opt/agent-host/config/worker.env` (mode `0600`):
 
 ```bash
 WORKER_INGRESS_ENABLED=true
@@ -187,18 +192,22 @@ change. Full story (including the honest limits): `docs/cloudflare.md`.
 The worker self-updates: the control plane advertises the current worker
 version and the worker pulls and applies updates on its own schedule
 (emits `worker.updated`). To force an update, restart the service —
-`sudo systemctl restart uagt-worker.service`.
+`sudo systemctl restart agent-host-worker.service`. The updater health-gates
+the restart: the new worker must write a boot marker and look healthy
+within `WORKER_UPDATE_HEALTH_TIMEOUT_S` (default 120s), otherwise the
+updater rolls back to the previous release.
 
 ## Uninstall
 
 ```bash
-sudo systemctl disable --now uagt-worker.service
-sudo rm /etc/systemd/system/uagt-worker.service
+sudo systemctl disable --now agent-host-worker.service
+sudo rm /etc/systemd/system/agent-host-worker.service
 sudo systemctl daemon-reload
-sudo rm -rf /opt/uagt /etc/uagt /var/lib/uagt
+sudo rm -rf /opt/agent-host /srv/agent-apps /etc/uagt
 # Optionally deregister the host row via the control plane API.
 ```
 
-The token in `/etc/uagt/worker.env` is deleted with the directory. If the
-token may have leaked, rotate it by re-registering the host (the old token
-stops working).
+The token in `/opt/agent-host/config/worker.env` is deleted with the
+directory. If the token may have leaked, rotate it
+(`POST /v1/hosts/:id/rotate-token` with the host token) or re-register the
+host (the old token stops working).
