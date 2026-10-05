@@ -260,3 +260,33 @@ def test_deploy_helper_missing_project():
     with pytest.raises(UahtError) as exc:
         client.deploy(project="nope", version="1.0.0")
     assert exc.value.code == "not_found"
+
+
+def test_add_domain():
+    client, fake = client_with(
+        {"/v1/domains": lambda: make_response(201, {"domain": {"hostname": "api.example.com", "status": "dns_pending"}})}
+    )
+    out = client.add_domain("d-1", "api.example.com")
+    method, url, kwargs = fake.calls[0]
+    assert method == "POST"
+    assert url == "https://cp.example.com/v1/domains"
+    assert kwargs["json"] == {"deployment_id": "d-1", "hostname": "api.example.com"}
+    assert out["domain"]["status"] == "dns_pending"
+
+
+def test_list_domains():
+    client, fake = client_with({"/v1/domains": lambda: make_response(200, {"domains": []})})
+    client.list_domains("d-1")
+    method, url, kwargs = fake.calls[0]
+    assert method == "GET"
+    assert url == "https://cp.example.com/v1/domains"
+    assert kwargs["params"] == {"deployment_id": "d-1"}
+
+
+def test_remove_domain():
+    client, fake = client_with({"/v1/domains": lambda: make_response(200, {"removed": "api.example.com"})})
+    client.remove_domain("d-1", "api.example.com")
+    method, url, kwargs = fake.calls[0]
+    assert method == "DELETE"
+    assert url == "https://cp.example.com/v1/domains"
+    assert kwargs["json"] == {"deployment_id": "d-1", "hostname": "api.example.com"}
