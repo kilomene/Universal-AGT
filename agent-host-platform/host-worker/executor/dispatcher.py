@@ -99,9 +99,28 @@ class TaskDispatcher:
         scrubber = SecretScrubber(
             [self.ctx.config.host_token, *secrets.values()]
         )
-        # route all ctx.log() output through the scrubber for this task
+        # Task-local scrubber: the claim loop dispatches on a thread pool
+        # against ONE shared ctx, so the scrubber must be installed
+        # thread-locally (WorkerContext.scrub_scope). Swapping the shared
+        # ctx.scrub attribute would let a concurrent task's dispatch
+        # un-scrub this task's secrets in its own log lines. Duck-typed
+        # ctxs in unit tests predate scrub_scope; they keep the historical
+        # swap (those tests are single-threaded by construction).
+        scrub_scope = getattr(self.ctx, "scrub_scope", None)
+        if scrub_scope is not None:
+            with scrub_scope(scrubber.scrub):
+                return self._dispatch_inner(task, task_id, task_type,
+                                            scrubber)
         previous_scrub = self.ctx.scrub
         self.ctx.scrub = scrubber.scrub
+        try:
+            return self._dispatch_inner(task, task_id, task_type,
+                                        scrubber)
+        finally:
+            self.ctx.scrub = previous_scrub
+
+    def _dispatch_inner(self, task: dict, task_id: str, task_type: str,
+                        scrubber: "SecretScrubber") -> dict:
         # NB: the claim endpoint already moved the task queued -> claimed
         # server-side (atomic UPDATE ... WHERE status='queued'), so our
         # client-side tracking starts at "claimed".
@@ -162,15 +181,25 @@ class TaskDispatcher:
             return {"task_id": task_id, "status": "completed", "result": result}
         except Exception:
             tail = traceback.format_exc(limit=8)[-MAX_ERROR_CHARS:]
+            # Failure redaction must use the ACTIVE scrubber, not just the
+            # task scrubber: a handler may have extended it mid-task (the
+            # deploy pipeline chains API-fetched secrets via
+            # ctx.extend_scrub, deliberately un-restored so raise paths stay
+            # redacted). A failing `docker run` embeds `-e KEY=VALUE` argv
+            # in the DockerError message, which lands in this tail — with
+            # only the task scrubber it would leak fetched secret values
+            # into the progress error. On ctxs without effective_scrub
+            # (legacy test doubles) this falls back to ctx.scrub, which the
+            # pipeline extended the historical way.
+            get_effective = getattr(self.ctx, "effective_scrub", None)
+            active_scrub = get_effective() if get_effective else self.ctx.scrub
             try:
                 self.ctx.log(task_id, f"task failed:\n{tail}")
                 final_chunk = read_chunk()
                 self._report(task_id, status, "failed",
-                             log_chunk=scrubber.scrub(final_chunk) or None,
-                             error=scrubber.scrub(tail))
+                             log_chunk=active_scrub(final_chunk) or None,
+                             error=active_scrub(tail))
             except Exception:
                 pass  # never let reporting a failure raise
             return {"task_id": task_id, "status": "failed",
-                    "error": scrubber.scrub(tail)}
-        finally:
-            self.ctx.scrub = previous_scrub
+                    "error": active_scrub(tail)}
