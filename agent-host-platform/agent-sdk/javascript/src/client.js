@@ -112,6 +112,18 @@ export class UahtClient {
     return this._get("/agents/me");
   }
 
+  /**
+   * Rotate this agent's own API key (protocol §3.1). The server invalidates
+   * the old key immediately, so the client adopts the new key on success and
+   * keeps working without a manual re-auth.
+   * @returns {Promise<{api_key: string}>}
+   */
+  async rotateKey() {
+    const res = await this._post("/agents/me/rotate", {});
+    if (res && res.api_key) this.apiKey = res.api_key;
+    return res;
+  }
+
   // ---- §3.2 Tasks ----
   createTask({ type, payload = {}, idempotency_key, priority, host_id, mode }) {
     return this._post("/tasks", { type, payload, idempotency_key, priority, host_id, mode });
@@ -168,6 +180,14 @@ export class UahtClient {
       await sleep(pollIntervalMs);
     }
     return UahtClient._logsText(current);
+  }
+
+  /** Async generator of incremental log chunks until the task terminates.
+   * Named twin of the Python SDK's `tail_logs`; mirrors the CLI
+   * `logs --follow` mode. */
+  async *tailLogs({ deploymentId, taskId, pollIntervalMs = 2000 } = {}) {
+    const task = await this._resolveLogsTask({ deploymentId, taskId });
+    yield* this._tailLogs(task, { pollIntervalMs });
   }
 
   /** Resolve deploymentId -> new logs task, or taskId -> the task itself. */
