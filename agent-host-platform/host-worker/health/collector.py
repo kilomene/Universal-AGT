@@ -77,9 +77,10 @@ def collect_metrics(docker_client=None, deployment_store=None,
     """
     if docker_client is not None:
         try:
-            docker_client.version()
+            # Short timeout: a wedged docker daemon must never stall heartbeats.
+            docker_client.version(timeout=5)
             docker_status = "ok"
-        except Exception as exc:  # DockerMissing, DockerError, OSError
+        except Exception as exc:  # DockerMissing, DockerError, OSError, TimeoutError
             docker_status = f"error: {type(exc).__name__}: {str(exc)[:200]}"
             if type(exc).__name__ == "DockerMissing":
                 docker_status = "missing"
