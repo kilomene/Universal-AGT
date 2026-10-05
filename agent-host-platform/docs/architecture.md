@@ -137,6 +137,35 @@ The **task row is the source of truth**, not the agent's session:
 - Events are append-only and cursor-paginated (`?since=`, `?cursor=`), so a
   consumer that dropped the SSE stream can backfill exactly what it missed.
 
+## Host reliability
+
+The worker and control plane defend the "hosts vanish and come back" reality:
+
+- **Post-reboot reconciliation.** On startup the worker compares its local
+  deployment registry (`<work_dir>/deployments/*/state.json`) against actual
+  Docker state: stopped containers are started, missing containers are
+  recreated from their stored spec (image, port mapping, non-secret env —
+  secrets are never persisted locally and are not restored by a reboot), and
+  a summary rides along on the next heartbeat. A corrupt `state.json` is
+  quarantined aside (`state.json.corrupt-<timestamp>`) instead of crashing
+  the worker.
+- **Reconnect backoff.** Heartbeat and task-claim failures back off
+  exponentially (5s → 300s cap, ±25% jitter), driven by the consecutive
+  failure counter and reset on success. Waits always go through the shutdown
+  event, so SIGTERM stays responsive during backoff.
+- **Crash-loop detection.** Each heartbeat observes every running
+  deployment's Docker `RestartCount`; when restarts rise by
+  `WORKER_CRASH_LOOP_THRESHOLD` (default 5) within
+  `WORKER_CRASH_LOOP_WINDOW_S` (default 300s), the container is explicitly
+  stopped, flagged locally (`crash_loop`), and reported via the heartbeat
+  `issues` array — the control plane emits `service.crash_loop` on first
+  appearance. The worker never restarts a flagged container.
+- **Stale-host sweeper.** The control plane marks hosts `degraded` /
+  `offline` (emitting `host.degraded` / `host.offline`) when heartbeats stop
+  arriving (`HEARTBEAT_DEGRADED_AFTER_S` / `HEARTBEAT_OFFLINE_AFTER_S`,
+  defaults 90s/300s). Heartbeats revive `offline`/`degraded` hosts to
+  `online` but never overwrite an operator-set `draining` state.
+
 ## Idempotency
 
 `POST /v1/tasks` and `POST /v1/deployments` accept an `idempotency_key` in
