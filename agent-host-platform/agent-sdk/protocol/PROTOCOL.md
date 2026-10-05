@@ -12,6 +12,68 @@ Content-Type: `application/json` everywhere unless noted.
 
 ## Changelog
 
+- **2026-10-05 — Phase 7 (public ingress, honest architecture).**
+  - **The honest problem (spec §28):** the persistent host is outbound-only,
+    so DNS CNAME records alone CANNOT make it publicly reachable. Phase 7
+    adds an optional, provider-neutral, disabled-by-default ingress layer
+    instead of pretending DNS is enough. Three modes, documented in
+    `docs/cloudflare.md`: (a) metadata-only (default today — domains
+    recorded, `dns_pending`), (b) direct (operator runs their own ingress;
+    their responsibility), (c) cloudflare-tunnel (worker-managed,
+    outbound-only, recommended for the private-host case). Without (b) or
+    (c), domains resolve but traffic cannot reach the host — stated plainly
+    in the docs and here.
+  - **Additive (backwards compatible):**
+    - New task type `ingress-sync` (now 18 protocol types): `{}` payload;
+      the worker rebuilds its ingress route table from the current
+      deployments' domains (`GET /v1/worker/domains`, host token) joined
+      with local container host ports, rewrites the provider's `config.yml`,
+      and restarts the tunnel process. Idempotent: classified `safe` for
+      retry, and safe to trigger manually. Needs the `deploy` permission.
+      The worker also runs a best-effort in-process sync after successful
+      `deploy`/`remove` tasks when ingress is enabled.
+    - `POST /v1/domains` accepts optional `ingress: 'tunnel' | 'direct'`
+      (default: tunnel when `TUNNEL_INGRESS_HOSTNAME` is set on the control
+      plane, else direct — the previous behavior). Tunnel mode creates the
+      CNAME `hostname → TUNNEL_INGRESS_HOSTNAME`
+      (e.g. `<tunnel-id>.cfargotunnel.com`) instead of
+      `→ PUBLIC_INGRESS_HOSTNAME`, stores `ingress` + `tunnel_host` on the
+      domain entry, and queues an `ingress-sync` task for the host on
+      add/remove. Requesting tunnel mode without `TUNNEL_INGRESS_HOSTNAME`
+      configured is a 422 with a clear message. Garbage `ingress` values
+      are 400. Domain entries recorded before Phase 7 read as
+      `ingress: 'direct'`.
+    - New host-token endpoint `GET /v1/worker/domains` →
+      `{domains: [{deployment_id, hostname, ingress}]}` for the host's
+      non-terminal deployments.
+    - Worker config (all optional, off by default): `WORKER_INGRESS_ENABLED`,
+      `WORKER_INGRESS_PROVIDER` (`cloudflare-tunnel`), and the tunnel token
+      via `UAHT_TUNNEL_TOKEN` env (never in the repo, never logged).
+  - Worker-side (no other REST changes): new `host-worker/ingress/` package
+    with the provider-neutral `IngressProvider` interface (`name`,
+    `setup`, `add_route`, `remove_route`, `sync_routes`, `status`,
+    `shutdown` — loopback-only targets enforced) and a `cloudflare-tunnel`
+    provider that provisions a SHA-256-pinned `cloudflared` release
+    (2026.10.0; official per-asset digests, amd64 re-verified by download —
+    never auto-trusts "latest"), runs
+    `cloudflared tunnel --token <TOKEN> run` as a supervised subprocess
+    (crash restart with backoff; argv-only, `shell=False`), and applies
+    routes as `hostname → http://127.0.0.1:<port>` in `config.yml` with a
+    catch-all 404. A failed download or missing token logs clearly and
+    leaves ingress disabled; the worker keeps running. Honesty note kept in
+    code and docs: for dashboard-created (token) tunnels, Cloudflare reads
+    public-hostname routes from the tunnel's dashboard configuration, not
+    from `config.yml` — the worker-generated file is the canonical route
+    table to mirror there (and is used verbatim by locally-managed
+    tunnels).
+  - SDKs/CLI (additive): `add_domain(..., ingress=)` / `addDomain(...,
+    ingress)` and `agent-host domains add --ingress tunnel|direct`.
+  - What still needs a human: creating the tunnel in the Cloudflare
+    dashboard, copying the tunnel token + `<tunnel-id>.cfargotunnel.com`
+    hostname, and adding each public hostname in the tunnel's dashboard
+    **Public hostnames** tab (required for token tunnels). Nothing in this
+    phase can do those steps.
+
 - **2026-10-05 — Phase 6 (security hardening).**
   - **Intentional tightenings (behavior changes):**
     - `docker-run` payload field `extra_args` **removed** — it allowed
@@ -207,7 +269,8 @@ POST /v1/tasks
     "type": "deploy" | "restart" | "stop" | "start" | "remove" | "rollback" |
             "logs" | "status" | "healthcheck" | "build" | "docker-build" |
             "docker-run" | "docker-compose" | "environment-update" |
-            "artifact-download" | "artifact-upload" | "system-info",
+            "artifact-download" | "artifact-upload" | "system-info" |
+            "ingress-sync",
     "payload": { ... },            # type-specific, see §5
     "idempotency_key": "uuid?",    # optional, strongly recommended
     "priority": 0,                 # higher = sooner
@@ -226,9 +289,9 @@ POST /v1/tasks/:id/reject        # needs approve_deployments; awaiting_approval 
 
 `POST /v1/tasks` enforces a per-type permission map (see Changelog
 2026-10-05): `deploy`/`remove`/`rollback`/`build`/`docker-build`/
-`docker-run`/`docker-compose`/`environment-update`/`artifact-upload` need
-`deploy`; `restart`/`start` need `restart`; `stop` needs `stop`;
-`logs`/`status`/`healthcheck`/`system-info`/`artifact-download` need
+`docker-run`/`docker-compose`/`environment-update`/`artifact-upload`/
+`ingress-sync` need `deploy`; `restart`/`start` need `restart`; `stop` needs
+`stop`; `logs`/`status`/`healthcheck`/`system-info`/`artifact-download` need
 `read_status`.
 
 Task object:
@@ -251,7 +314,9 @@ Changelog 2026-10-05.)
 
 **Retry rule:** a worker-reported `failed` becomes `retrying` (sweeper moves
 it back to `queued`) when `attempts < max_attempts` and the task type is
-safe to re-run: idempotent reads always; `deploy`/`restart`/`start`/`stop`
+safe to re-run: idempotent reads always; `ingress-sync` (reconciles the
+tunnel route table to the desired state — re-running is a no-op when
+nothing changed); `deploy`/`restart`/`start`/`stop`
 and build tasks only when the attempt never reached `running`;
 `remove`/`rollback` never auto-retry.
 
@@ -285,6 +350,12 @@ GET /v1/worker/projects/:project_id/secrets
   → 200 {secrets: {NAME: "value", ...}}   # decrypted; only when this host
                                          # has a claimed/active task or live
                                          # deployment for the project (else 403)
+
+GET /v1/worker/domains
+  → 200 {domains: [{deployment_id, hostname, ingress}]}  # every domain entry
+                                         # on this host's non-terminal
+                                         # deployments; drives the worker's
+                                         # ingress route sync (Phase 7)
 ```
 
 Claim semantics: exactly one host gets a queued task (atomic `UPDATE ...
@@ -408,21 +479,40 @@ GET /v1/health → {ok:true, version, time}
 ### 3.10 Domains — optional Cloudflare DNS (agent API key, manage_domains)
 
 ```
-POST /v1/domains   {deployment_id, hostname}
-                   → 201 {domain:{hostname, cf_record_id?, status, added_at}}
+POST /v1/domains   {deployment_id, hostname, ingress?}
+                   → 201 {domain:{hostname, cf_record_id?, status, added_at,
+                                 ingress, tunnel_host?}}
                    # status: 'active' (DNS created) | 'dns_pending' (Cloudflare
                    # not configured — metadata only) | 'error'
+                   # ingress: 'tunnel' | 'direct' (default: tunnel when
+                   # TUNNEL_INGRESS_HOSTNAME is set on the control plane,
+                   # else direct). Tunnel mode without TUNNEL_INGRESS_HOSTNAME
+                   # is 422. Tunnel-mode changes queue an `ingress-sync` task
+                   # for the host.
 GET  /v1/domains?deployment_id=   → {domains:[...]}
 DELETE /v1/domains {deployment_id, hostname} → removes + deletes the DNS record
 ```
 
 Architectural rule: the system never stores host IPs, so A-records pointing
 at a host are intentionally unsupported. When `CLOUDFLARE_API_TOKEN`,
-`CLOUDFLARE_ZONE_ID`, and `PUBLIC_INGRESS_HOSTNAME` are all set, the control
-plane creates a proxied CNAME `hostname → PUBLIC_INGRESS_HOSTNAME` (the
-ingress is operator-run: a tunnel, reverse proxy, or load balancer in front
-of the host). Otherwise the domain is kept as metadata and DNS is done
-manually. Use a Cloudflare token scoped to "Zone / DNS / Edit" on the zone.
+`CLOUDFLARE_ZONE_ID`, and an ingress hostname are set, the control plane
+creates a proxied CNAME:
+
+- `direct` mode (default unless tunnel is configured):
+  `hostname → PUBLIC_INGRESS_HOSTNAME`. The ingress is operator-run (a
+  reverse proxy, load balancer, or tunnel they manage in front of the
+  host); reaching the host is the operator's responsibility.
+- `tunnel` mode: `hostname → TUNNEL_INGRESS_HOSTNAME`
+  (e.g. `<tunnel-id>.cfargotunnel.com`). The host runs a worker-managed
+  `cloudflared` tunnel (outbound-only); the worker syncs
+  `hostname → http://127.0.0.1:<container-port>` routes via the
+  `ingress-sync` task type.
+
+Otherwise the domain is kept as metadata and DNS is done manually. Honest
+limitation (spec §28): DNS alone never makes an outbound-only host
+reachable — without a working (b) direct or (c) tunnel ingress, domains
+resolve but traffic cannot reach the host. Use a Cloudflare token scoped to
+"Zone / DNS / Edit" on the zone.
 
 ### 3.11 Misc
 
@@ -471,9 +561,15 @@ like `256m|1g`; `resources.cpu` positive number; `restart` in
 - `environment-update`: `{deployment_id, env:{...}}`
 - `artifact-download|artifact-upload`: `{artifact_id, destination?}`
 - `system-info`: `{}`
+- `ingress-sync`: `{}` (empty — the sync pulls current domains from the
+  control plane via `GET /v1/worker/domains` and host ports from the local
+  deployment store, then reconciles the provider's route table)
 
 Task `result` for `deploy`: `{deployment_id, status, health_status, ports}`.
 For `logs`: `{logs: "..."}`. For `system-info`: `{cpu, ram, disk, docker, ...}`.
+For `ingress-sync`:
+`{status: "ok"|"disabled", provider, changed, routes: [{hostname,
+target_host: "127.0.0.1", target_port}], skipped: [{hostname, reason}], route_count}`.
 
 ---
 
