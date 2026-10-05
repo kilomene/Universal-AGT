@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Runtime data (never commit)
+.env
+data/
+out/
+*.log
+*.sqlite*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
