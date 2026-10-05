@@ -235,6 +235,31 @@ Canonical event types: `agent.connected`, `agent.disconnected`,
 GET /v1/health → {ok:true, version, time}
 ```
 
+### 3.10 Domains — optional Cloudflare DNS (agent API key, manage_domains)
+
+```
+POST /v1/domains   {deployment_id, hostname}
+                   → 201 {domain:{hostname, cf_record_id?, status, added_at}}
+                   # status: 'active' (DNS created) | 'dns_pending' (Cloudflare
+                   # not configured — metadata only) | 'error'
+GET  /v1/domains?deployment_id=   → {domains:[...]}
+DELETE /v1/domains {deployment_id, hostname} → removes + deletes the DNS record
+```
+
+Architectural rule: the system never stores host IPs, so A-records pointing
+at a host are intentionally unsupported. When `CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ZONE_ID`, and `PUBLIC_INGRESS_HOSTNAME` are all set, the control
+plane creates a proxied CNAME `hostname → PUBLIC_INGRESS_HOSTNAME` (the
+ingress is operator-run: a tunnel, reverse proxy, or load balancer in front
+of the host). Otherwise the domain is kept as metadata and DNS is done
+manually. Use a Cloudflare token scoped to "Zone / DNS / Edit" on the zone.
+
+### 3.11 Misc
+
+```
+GET /v1/health → {ok:true, version, time}
+```
+
 ---
 
 ## 4. `agent.deploy.json` manifest
