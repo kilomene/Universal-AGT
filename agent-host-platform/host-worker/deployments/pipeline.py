@@ -18,7 +18,15 @@ most defensive:
   * before every `docker run` the host port is verified free both at OS
     level (bind test) and Docker level (`docker ps` published-port scan);
     a collision fails the task with a clear error instead of a cryptic
-    `docker run` failure.
+    `docker run` failure. Compose deployments get the same check: the
+    ports declared in the compose file (via `docker compose config`) are
+    verified free before `compose up`;
+  * a failed healthcheck on a compose deploy tears the new stack down
+    (`compose down`) and restores the previous stack (`compose up` with
+    its stored compose file);
+  * after every successful deploy, garbage collection removes containers
+    and worker-built images of generations older than
+    DEPLOY_KEEP_GENERATIONS (default 2) per project.
 
 Deployment state is recorded under <work_dir>/deployments/<deployment_id>/
 via deployments.state.DeploymentStore. Secret env values are injected into
@@ -39,6 +47,7 @@ from pathlib import Path
 from typing import Optional
 
 from deployments.manifest import parse_memory_mb, validate_manifest
+from deployments import gc
 from health import checker as health_checker
 from health import collector as health_collector
 
@@ -64,11 +73,15 @@ def decide_rollback(healthcheck_passed: bool,
     """Decide the post-healthcheck action.
 
     Returns "keep_new" | "rollback_to_previous" | "fail_clean".
-    Pure function — heavily unit tested.
+    A previous deployment is a rollback target when it has a restorable
+    handle: a container_name (docker/static runtime) or a compose_project
+    (docker-compose runtime, restored via `compose up` with its stored
+    compose file). Pure function — heavily unit tested.
     """
     if healthcheck_passed:
         return "keep_new"
-    if previous and previous.get("container_name"):
+    if previous and (previous.get("container_name")
+                     or previous.get("compose_project")):
         return "rollback_to_previous"
     return "fail_clean"
 
@@ -87,10 +100,14 @@ def verify_checksum(path: str, expected: str) -> bool:
 
 
 def extract_archive(archive_path: str, dest_dir: str) -> str:
-    """Extract .tar.gz/.tgz/.tar/.zip with path-traversal protection."""
+    """Extract .tar.gz/.tgz/.tar/.zip with path-traversal protection.
+
+    The format is detected from the file's magic bytes, not its name —
+    the pipeline stores downloads as <artifact_id>.bin, so an extension
+    check would reject every real artifact.
+    """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    lower = archive_path.lower()
 
     def _safe_join(base: Path, member: str) -> Path:
         target = (base / member).resolve()
@@ -98,12 +115,12 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
             raise DeployError(f"archive member escapes destination: {member!r}")
         return target
 
-    if lower.endswith((".tar.gz", ".tgz")) or lower.endswith(".tar"):
+    if tarfile.is_tarfile(archive_path):
         with tarfile.open(archive_path, "r") as tf:
             for member in tf.getmembers():
                 _safe_join(dest, member.name)
             tf.extractall(dest)
-    elif lower.endswith(".zip"):
+    elif zipfile.is_zipfile(archive_path):
         with zipfile.ZipFile(archive_path, "r") as zf:
             for member in zf.namelist():
                 _safe_join(dest, member)
@@ -111,7 +128,7 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
     else:
         raise DeployError(
             f"unsupported artifact format: {archive_path!r} "
-            "(expected .tar.gz, .tgz, .tar or .zip)"
+            "(expected a tar archive or a zip file)"
         )
     return str(dest)
 
@@ -329,6 +346,9 @@ def deploy(ctx, task: dict) -> dict:
 
     # -- 5. build ------------------------------------------------------------
     effective_health_port = None  # for compose-discovered ports
+    compose_file = None
+    compose_project_name = None
+    image_built = False  # True only when THIS deploy ran docker build
     if runtime == "docker":
         if payload.get("image"):
             log(f"using prebuilt image {built_image}; skipping build")
@@ -343,6 +363,7 @@ def deploy(ctx, task: dict) -> dict:
             log(f"docker build: tag={built_image} dockerfile={dockerfile}")
             docker.build(context_dir, dockerfile, built_image,
                          timeout=int(payload.get("build_timeout", 1200)))
+            image_built = True
             log("docker build OK")
     elif runtime == "docker-compose":
         if not docker.compose_available():
@@ -356,11 +377,27 @@ def deploy(ctx, task: dict) -> dict:
             compose_file = alt if os.path.isfile(alt) else compose_file
         if not os.path.isfile(compose_file):
             raise DeployError(f"compose file not found: {compose_file}")
-        log(f"docker compose up: {compose_file}")
-        docker.compose_up(compose_file, project_name=f"uaht-{safe_project}",
+        compose_project_name = f"uaht-{safe_project}"
+        # Port check for compose too: compose publishes host ports, so the
+        # ports the file declares must be verified free BEFORE `compose up`,
+        # exactly like the pre-`docker run` check. Ports already held by
+        # this project's own stack are skipped (redeploy replaces it).
+        try:
+            compose_model = docker.compose_config_json(compose_file)
+        except Exception as exc:
+            raise DeployError(
+                f"could not read normalized compose model for {compose_file}: "
+                f"{exc}"
+            )
+        wanted_ports = parse_compose_published_ports(compose_model)
+        log(f"compose declares published host ports: {wanted_ports or 'none'}")
+        verify_compose_ports_free(docker, compose_project_name, wanted_ports,
+                                  log=log)
+        log(f"docker compose up: {compose_file} (project {compose_project_name})")
+        docker.compose_up(compose_file, project_name=compose_project_name,
                           build=True)
         effective_health_port = _discover_compose_port(
-            docker, f"uaht-{safe_project}", log)
+            docker, compose_project_name, log)
         if not effective_health_port:
             raise DeployError(
                 "compose started but no published port found on its "
@@ -377,6 +414,7 @@ def deploy(ctx, task: dict) -> dict:
         log(f"static build: tag={built_image} (nginx)")
         docker.build(extract_dir, df_path, built_image,
                      timeout=int(payload.get("build_timeout", 1200)))
+        image_built = True
         log("static build OK")
     else:  # pragma: no cover — validator guarantees this is unreachable
         raise DeployError(f"unsupported runtime: {runtime!r}")
@@ -447,8 +485,10 @@ def deploy(ctx, task: dict) -> dict:
             "project_name": project_name,
             "version": version,
             "container_name": container_name if new_container_started else None,
-            "compose_project": f"uaht-{safe_project}" if runtime == "docker-compose" else None,
+            "compose_project": compose_project_name,
+            "compose_file": compose_file,
             "image": built_image,
+            "image_built": image_built,  # GC may only remove images we built
             "runtime": runtime,
             "host_port": host_port,
             "container_port": container_port,
@@ -461,6 +501,19 @@ def deploy(ctx, task: dict) -> dict:
         }
         store.save(state)
         log(f"deploy OK: {project_name} {version} healthy on :{host_port}")
+        # Garbage-collect superseded generations AFTER the successful
+        # deploy — never during. Keeps DEPLOY_KEEP_GENERATIONS (default 2)
+        # newest generations per project.
+        try:
+            gc_summary = gc.collect_garbage(ctx, log=log)
+            removed = (len(gc_summary["removed_containers"])
+                       + len(gc_summary["removed_images"]))
+            if removed:
+                log(f"gc: removed {len(gc_summary['removed_containers'])} "
+                    f"container(s), {len(gc_summary['removed_images'])} "
+                    f"image(s)")
+        except Exception as exc:  # GC must never fail a good deploy
+            log(f"gc error (non-fatal): {exc}")
         return {
             "deployment_id": deployment_id,
             "status": "running",
@@ -470,6 +523,14 @@ def deploy(ctx, task: dict) -> dict:
 
     # -- 8. failure: remove new, roll back ------------------------------------
     log("healthcheck failed; rolling back")
+    if runtime == "docker-compose" and compose_project_name:
+        # Tear down the NEW unhealthy compose stack first — it must not
+        # keep running (and holding ports) after a failed deploy.
+        log(f"tearing down failed compose stack {compose_project_name}")
+        try:
+            docker.compose_down(compose_file, project_name=compose_project_name)
+        except Exception as exc:
+            log(f"compose down of failed stack failed (continuing): {exc}")
     if new_container_started:
         container_logs = ""
         try:
@@ -482,9 +543,23 @@ def deploy(ctx, task: dict) -> dict:
         docker.rm(container_name, force=True)
     rolled_back_to = None
     if action == "rollback_to_previous" and previous:
-        prev_name = previous["container_name"]
-        log(f"restarting previous container {prev_name}")
-        docker.start(prev_name)
+        prev_name = previous.get("container_name")
+        prev_compose = previous.get("compose_project")
+        if prev_name:
+            log(f"restarting previous container {prev_name}")
+            docker.start(prev_name)
+        elif prev_compose:
+            prev_file = previous.get("compose_file")
+            if not prev_file or not os.path.isfile(prev_file):
+                raise DeployError(
+                    f"healthcheck failed for {project_name} {version} and "
+                    f"the previous compose stack {prev_compose} cannot be "
+                    f"restored: its compose file "
+                    f"{prev_file!r} is missing (redeploy required)"
+                )
+            log(f"restoring previous compose stack {prev_compose} "
+                f"from {prev_file}")
+            docker.compose_up(prev_file, project_name=prev_compose, build=True)
         prev_state = store.load(previous["deployment_id"]) or dict(previous)
         prev_state["status"] = "running"
         prev_state["health_status"] = "healthy"
@@ -497,7 +572,10 @@ def deploy(ctx, task: dict) -> dict:
         "project_name": project_name,
         "version": version,
         "container_name": None,
+        "compose_project": None,
+        "compose_file": compose_file,
         "image": built_image,
+        "image_built": image_built,
         "runtime": runtime,
         "host_port": None,
         "container_port": container_port,
@@ -516,17 +594,119 @@ def deploy(ctx, task: dict) -> dict:
     )
 
 
-def _discover_compose_port(docker, compose_project: str, log) -> Optional[int]:
-    """Find the first published host port among a compose project's containers."""
+def _discover_compose_port(docker, compose_project: str, log=None) -> Optional[int]:
+    """Find the first published host port of a compose project's containers.
+
+    Reads `docker compose -p <name> ps --format json` (the Publishers list)
+    and falls back to `docker inspect` NetworkSettings.Ports per container.
+    No regexing of `docker ps` text. Pure-ish: the parsing helpers are unit
+    tested; docker calls are injected.
+    """
     try:
-        rows = docker.ps(all=False)
-    except Exception:
+        records = docker.compose_ps(compose_project)
+    except Exception as exc:
+        if log:
+            log(f"compose port discovery failed for {compose_project}: {exc}")
         return None
-    for row in rows:
-        names = row.get("Names", "")
-        if compose_project not in names:
+    for rec in records or []:
+        found = _published_ports_from_compose_ps(rec)
+        if found:
+            return found[0]
+    # Fallback: inspect each compose container's published ports.
+    for rec in records or []:
+        name = rec.get("Name") or rec.get("ID")
+        if not name:
             continue
-        found = published_host_ports(row.get("Ports"))
+        try:
+            info = docker.inspect(name)
+        except Exception:
+            continue
+        found = _published_ports_from_inspect(info)
         if found:
             return found[0]
     return None
+
+
+def _published_ports_from_compose_ps(record: dict) -> list:
+    """Host ports from a `docker compose ps --format json` record's
+    Publishers list: [{PublishedPort, TargetPort, Protocol, ...}]."""
+    ports = []
+    for pub in (record or {}).get("Publishers") or []:
+        try:
+            ports.append(int(pub.get("PublishedPort")))
+        except (TypeError, ValueError):
+            continue
+    return ports
+
+
+def _published_ports_from_inspect(info: list) -> list:
+    """Host ports from `docker inspect` NetworkSettings.Ports."""
+    ports = []
+    try:
+        bindings = (info[0].get("NetworkSettings") or {}).get("Ports") or {}
+    except (IndexError, AttributeError):
+        return ports
+    for binds in bindings.values():
+        for bind in binds or []:
+            try:
+                ports.append(int(bind.get("HostPort")))
+            except (TypeError, ValueError):
+                continue
+    return ports
+
+
+def parse_compose_published_ports(config: dict) -> list:
+    """All published host ports declared in a normalized compose model
+    (`docker compose config --format json`). Handles short syntax
+    ("8080:80", "127.0.0.1:8080:80", "80") and long syntax
+    ({published: 8080, target: 80}). Pure function — unit tested."""
+    ports: set = set()
+    services = (config or {}).get("services") or {}
+    for svc in services.values():
+        for entry in (svc or {}).get("ports") or []:
+            if isinstance(entry, dict):
+                pub = entry.get("published")
+                if pub is not None:
+                    try:
+                        ports.add(int(str(pub)))
+                    except (TypeError, ValueError):
+                        pass
+            elif isinstance(entry, str):
+                ports.update(_parse_compose_short_port(entry))
+    return sorted(ports)
+
+
+def _parse_compose_short_port(spec: str) -> list:
+    """Published host port from one short-syntax port spec, or []."""
+    s = str(spec).split("/")[0].strip()  # drop "/tcp" suffix
+    parts = s.split(":")
+    if len(parts) == 2:
+        host = parts[0]
+    elif len(parts) == 3:
+        host = parts[1]  # [ip:]host:container
+    else:
+        return []  # "container" only (ephemeral) or exotic forms: no fixed host port
+    host = host.strip().strip("[]")
+    return [int(host)] if host.isdigit() else []
+
+
+def verify_compose_ports_free(docker, compose_project: str,
+                              wanted_ports: list, log=None) -> None:
+    """Verify every host port a compose file wants to publish is free —
+    the same OS-bind + docker-ps check `docker run` gets.
+
+    Ports already held by THIS compose project's current stack are skipped:
+    a redeploy replaces its own stack in place (`compose up` on the same
+    project name), so its own ports are not a collision.
+    """
+    own: set = set()
+    try:
+        for rec in docker.compose_ps(compose_project) or []:
+            own.update(_published_ports_from_compose_ps(rec))
+    except Exception:
+        own = set()
+    for port in sorted(set(wanted_ports) - own):
+        verify_host_port_free(docker, port, log=log)
+    if log and wanted_ports:
+        log(f"compose ports verified: wanted={sorted(set(wanted_ports))} "
+            f"already-held-by-own-stack={sorted(own)}")
