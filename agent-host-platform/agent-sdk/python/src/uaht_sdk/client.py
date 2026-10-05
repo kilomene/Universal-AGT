@@ -21,6 +21,30 @@ from .sse import iter_sse_events
 TERMINAL_TASK_STATES = frozenset({"completed", "failed", "cancelled"})
 
 
+def _rows(body: Any, key: str) -> list:
+    """Normalize a list endpoint body to a row list.
+
+    The API wraps rows in ``{key: [...]}``, but some deployments return a
+    bare list; handle both shapes (a bare list was previously assumed to be
+    a dict, raising AttributeError).
+    """
+    if isinstance(body, dict):
+        return body.get(key, []) or []
+    if isinstance(body, list):
+        return body
+    return []
+
+
+def _task_logs_text(task: Dict[str, Any]) -> str:
+    """Extract the log text from a logs task row (§5: result = {logs: "..."})."""
+    result = task.get("result")
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict) and isinstance(result.get("logs"), str):
+        return result["logs"]
+    return ""
+
+
 class UahtClient:
     """Agent-facing control-plane client (agent API key, §1)."""
 
@@ -141,6 +165,59 @@ class UahtClient:
 
     def reject_task(self, task_id):
         return self._post(f"/tasks/{task_id}/reject", {})
+
+    def _resolve_logs_task(self, deployment_id=None, task_id=None):
+        """Resolve deployment_id -> a new logs task, or task_id -> the task itself."""
+        if not deployment_id and not task_id:
+            raise TypeError("deployment_id or task_id is required")
+        if task_id:
+            cur = self.get_task(task_id)
+            return cur.get("task", cur)
+        created = self.create_task(type="logs", payload={"deployment_id": deployment_id})
+        return created.get("task", created)
+
+    def tail_logs(self, deployment_id=None, task_id=None, poll_interval=2.0):
+        """Yield incremental log chunks until the logs task terminates.
+
+        Mirrors the CLI ``logs --follow`` mode. The already-fetched task is
+        processed first so its current logs are yielded before the first
+        re-poll.
+        """
+        task = self._resolve_logs_task(deployment_id=deployment_id, task_id=task_id)
+        last_len = 0
+        while True:
+            logs = _task_logs_text(task)
+            chunk = logs[last_len:]
+            if chunk:
+                yield chunk
+                last_len = len(logs)
+            if task.get("status") in TERMINAL_TASK_STATES:
+                break
+            time.sleep(poll_interval)
+            cur = self.get_task(task["id"])
+            task = cur.get("task", cur)
+
+    def get_logs(self, deployment_id=None, task_id=None, follow=False, poll_interval=3.0, timeout=600.0):
+        """Create a ``logs`` task for a deployment (or poll an existing logs
+        task) until it reaches a terminal state, then return the log text.
+
+        Mirrors the CLI ``logs`` command. With ``follow=True``, yields each
+        new log chunk as it arrives (like ``logs --follow``) instead of
+        returning the full text.
+        """
+        if follow:
+            return self.tail_logs(deployment_id=deployment_id, task_id=task_id, poll_interval=poll_interval)
+        task = self._resolve_logs_task(deployment_id=deployment_id, task_id=task_id)
+        started = time.monotonic()
+        while True:
+            cur = self.get_task(task["id"])
+            task = cur.get("task", cur)
+            if task.get("status") in TERMINAL_TASK_STATES:
+                break
+            if time.monotonic() - started > timeout:
+                raise UahtError("timeout", f'logs task {task["id"]} did not finish within {timeout}s')
+            time.sleep(poll_interval)
+        return _task_logs_text(task)
 
     # -- §3.4 Hosts ---------------------------------------------------
     def list_hosts(self):
@@ -363,14 +440,14 @@ class UahtClient:
         if not version:
             raise TypeError("version is required")
 
-        rows = self.list_projects().get("projects", []) or []
+        rows = _rows(self.list_projects(), "projects")
         match = next((p for p in rows if p.get("name") == project or p.get("id") == project), None)
         if not match:
             raise UahtError("not_found", f'project "{project}" not found')
 
         host_id = None
         if host:
-            hrows = self.list_hosts().get("hosts", []) or []
+            hrows = _rows(self.list_hosts(), "hosts")
             hmatch = next((h for h in hrows if h.get("name") == host or h.get("id") == host), None)
             if not hmatch:
                 raise UahtError("not_found", f'host "{host}" not found')
