@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from deployments import pipeline as deploy_pipeline
+from ingress import sync as ingress_sync
 
 
 class HandlerError(Exception):
@@ -111,7 +112,28 @@ def _container_name(ctx, deployment_id: str) -> str:
 # deploy
 # ---------------------------------------------------------------------------
 def handle_deploy(ctx, task: dict) -> dict:
-    return deploy_pipeline.deploy(ctx, task)
+    result = deploy_pipeline.deploy(ctx, task)
+    _ingress_after_change(ctx, _task_id(task), result.get("deployment_id"))
+    return result
+
+
+def _ingress_after_change(ctx, task_id: str, deployment_id) -> None:
+    """Best-effort in-process ingress sync after a successful deploy/remove.
+
+    Runs only when ingress is enabled on this host; never raises, so it
+    cannot fail the task that triggered it.
+    """
+    if not deployment_id:
+        return
+    try:
+        outcome = ingress_sync.maybe_sync_on_change(ctx, deployment_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        ctx.log(task_id, f"ingress sync hook failed: {exc}")
+        return
+    if outcome is not None:
+        ctx.log(task_id,
+                f"ingress sync after change: {outcome.get('status')} "
+                f"({len(outcome.get('routes', []))} routes)")
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +204,7 @@ def handle_remove(ctx, task: dict) -> dict:
     state["status"] = "removed"
     state["container_name"] = None
     ctx.deployment_store.save(state)
+    _ingress_after_change(ctx, _task_id(task), payload["deployment_id"])
     return {"deployment_id": payload["deployment_id"], "status": "removed"}
 
 
@@ -511,6 +534,24 @@ def handle_artifact_upload(ctx, task: dict) -> dict:
     resp = ctx.api.upload_artifact_content(payload["artifact_id"], str(src))
     return {"artifact_id": payload["artifact_id"], "sha256": digest,
             "server": resp}
+
+
+# ---------------------------------------------------------------------------
+# ingress-sync
+# ---------------------------------------------------------------------------
+def handle_ingress_sync(ctx, task: dict) -> dict:
+    """Rebuild the ingress provider's route table from the current
+    deployments' domains (see ingress/sync.py). Payload is empty — the
+    sync pulls current state from the control plane and the local
+    deployment store. Safe to re-run: it reconciles to the desired state.
+    """
+    task_id = _task_id(task)
+    result = ingress_sync.sync_ingress(ctx)
+    ctx.log(task_id,
+            f"ingress sync: {result.get('status')} "
+            f"({len(result.get('routes', []))} routes, "
+            f"{len(result.get('skipped', []))} skipped)")
+    return result
 
 
 def _sha256_file(path: str) -> str:
