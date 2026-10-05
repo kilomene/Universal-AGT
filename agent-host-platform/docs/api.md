@@ -90,12 +90,17 @@ Deployment statuses: `requested`, `approved`, `building`, `starting`,
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/v1/domains` | agent key (`manage_domains`) | Attach a hostname to a deployment; optional `ingress: tunnel\|direct` |
-| GET | `/v1/domains?deployment_id=` | agent key (`manage_domains`) | List attached hostnames |
-| DELETE | `/v1/domains` | agent key (`manage_domains`) | Remove a hostname (`{"deployment_id", "hostname"}`); deletes the DNS record |
+| POST | `/v1/domains` | agent key (`manage_domains`) | Full provision flow: `{"deployment_id","hostname","ingress":"tunnel"\|"direct"}` → validate → DNS → tunnel route → verify → `active` (or `failed`) |
+| GET | `/v1/domains?deployment_id=` | agent key (`manage_domains`) | List domain rows (lifecycle state, per-step flags, error) |
+| GET | `/v1/domains/:hostname` | agent key (`manage_domains`) | One domain's full lifecycle state |
+| DELETE | `/v1/domains` | agent key (`manage_domains`) | Detach: delete tunnel route + DNS record, verify gone (`{"deployment_id","hostname"}`) |
 
-See [`cloudflare.md`](cloudflare.md) for the three ingress modes — DNS
-alone cannot reach an outbound-only host.
+Domain lifecycle: `requested → configuring → active → failed`, and
+`removing → removed` on detach. A domain attached to a deployment that
+reaches a terminal state is marked `failed` (routes dropped, DNS removed,
+event emitted); see [`cloudflare.md`](cloudflare.md) for the two ingress
+modes and the remote-vs-local control authority statement — DNS alone
+cannot reach an outbound-only host.
 
 ## Secrets
 
@@ -120,9 +125,9 @@ Canonical event types: `agent.connected`, `agent.disconnected`,
 `deployment.requested/approved/started/building/healthcheck/completed/failed/rolled_back`,
 `deployment.rollback_requested`, `deployment.rollback_failed`,
 `service.started/stopped/restarted/removed`, `service.crash_loop`,
-`domain.requested/added/removed`,
+`domain.requested/configuring/active/failed/removing/removed`,
 `host.registered/online/offline/degraded`, `host.token_rotated`,
-`healthcheck.passed/failed`, `worker.updated`, `secret.updated`.
+`healthcheck.passed/failed`, `worker.updated`, `secret.changed`, `secret.deleted`.
 Treat unknown types as opaque.
 
 ## Misc
