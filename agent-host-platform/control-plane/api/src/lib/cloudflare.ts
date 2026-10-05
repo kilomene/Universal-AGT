@@ -27,7 +27,22 @@ import { logger } from './log';
 // Credentials are scoped: use a Cloudflare API token limited to
 // "Zone / DNS / Edit" on exactly the zone(s) you serve.
 
-const API_BASE = 'https://api.cloudflare.com/client/v4';
+const DEFAULT_API_BASE = 'https://api.cloudflare.com/client/v4';
+
+/**
+ * Base URL for the Cloudflare API. Overridable via CLOUDFLARE_API_BASE —
+ * this is the TEST hook: the automated suites point it at a local fake
+ * Cloudflare server (see test/fakeCloudflare.ts). In production it is
+ * always the real api.cloudflare.com endpoint; there is no reason to set
+ * it outside tests.
+ */
+export function cloudflareApiBase(): string {
+  const override = process.env.CLOUDFLARE_API_BASE;
+  if (override && override.trim()) return override.replace(/\/+$/, '');
+  return DEFAULT_API_BASE;
+}
+
+const API_BASE = DEFAULT_API_BASE;
 
 /** Which ingress a domain record points at. */
 export type IngressMode = 'tunnel' | 'direct';
@@ -97,10 +112,69 @@ export function cnameTargetFor(cfg: CfConfig, mode: IngressMode): string {
   return cfg.ingressHostname;
 }
 
+/**
+ * Suffixes that must never be served as public hostnames. RFC 6761/6762
+ * special-use names plus the internal-only convention this fleet uses.
+ * A hostname equal to one of these, or nested under it, is rejected.
+ */
+const BLOCKED_SUFFIXES = [
+  'localhost',
+  'local',      // mDNS (RFC 6762)
+  'internal',   // internal-only convention
+  'invalid',    // RFC 2606
+  'example',    // RFC 2606
+  'test',       // RFC 2606
+  'onion',      // RFC 7686
+];
+
+export function isBlockedHostname(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return BLOCKED_SUFFIXES.some(
+    (s) => lower === s || lower.endsWith(`.${s}`),
+  );
+}
+
+/**
+ * Strict public-hostname validation (W10 hardening).
+ *
+ * Rejects, in addition to malformed names:
+ *  - wildcards (`*.example.com` and any label containing `*`) — a wildcard
+ *    DNS record or tunnel route is a standing privilege escalation; every
+ *    hostname here is explicit.
+ *  - localhost / special-use / internal-only names (`localhost`,
+ *    `*.localhost`, `*.local`, `*.internal`, `*.invalid`, `*.example`,
+ *    `*.test`, `*.onion`).
+ *  - IP literals (`127.0.0.1`, `10.0.0.5`, …): the base pattern already
+ *    rejects most of these (TLD must be alpha); the explicit check below
+ *    closes the remainder.
+ */
 export function isValidHostname(hostname: string): boolean {
   if (typeof hostname !== 'string' || hostname.length > 253 || hostname.length < 3) return false;
+  if (hostname.includes('*')) return false;
   // RFC 1035-ish: labels of alphanumerics/hyphens, dots between, TLD alpha.
-  return /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i.test(hostname);
+  if (!/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i.test(hostname)) return false;
+  if (isBlockedHostname(hostname)) return false;
+  // Defensive: a dotted quad that somehow passed the pattern is still an IP.
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return false;
+  return true;
+}
+
+/**
+ * Validate a CNAME *target* (the right-hand side of the record). Targets
+ * come only from operator-controlled environment config, but they are
+ * validated anyway: a target must be a valid public hostname — never an
+ * IP literal (127.x / 10/8 / 172.16/12 / 192.168/16 included), never a
+ * URL, never an internal-only name. Throws HttpError 422 on violation.
+ */
+export function validateCnameTarget(target: string): void {
+  if (typeof target !== 'string' || /[:/?#@]/.test(target) || !isValidHostname(target)) {
+    throw new HttpError(
+      422,
+      'unprocessable',
+      `refusing CNAME target ${JSON.stringify(target)}: must be a valid ` +
+        'public hostname (never an IP address, URL, or internal-only name)',
+    );
+  }
 }
 
 interface CfResult {
@@ -109,11 +183,21 @@ interface CfResult {
   type: string;
 }
 
-async function cfFetch(cfg: CfConfig, method: string, path: string, body?: unknown): Promise<unknown> {
-  const res = await fetch(`${API_BASE}${path}`, {
+/**
+ * Raw Cloudflare API call with the standard success envelope. Shared by
+ * the DNS module and the tunnel module (cloudflare-tunnel.ts). Throws
+ * HttpError 502 on transport or API errors.
+ */
+export async function cfApi(
+  token: string,
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
+  const res = await fetch(`${cloudflareApiBase()}${path}`, {
     method,
     headers: {
-      Authorization: `Bearer ${cfg.token}`,
+      Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -134,6 +218,10 @@ async function cfFetch(cfg: CfConfig, method: string, path: string, body?: unkno
     throw new HttpError(502, 'bad_gateway', `cloudflare API error: ${msg}`);
   }
   return data.result;
+}
+
+async function cfFetch(cfg: CfConfig, method: string, path: string, body?: unknown): Promise<unknown> {
+  return cfApi(cfg.token, method, path, body);
 }
 
 /** Find an existing DNS record by exact name. Returns null when absent. */
@@ -158,6 +246,7 @@ export async function ensureCnameRecord(
   target?: string,
 ): Promise<string> {
   const want = target ?? cfg.ingressHostname;
+  validateCnameTarget(want);
   const existing = await findDnsRecord(cfg, hostname);
   if (existing && existing.type === 'CNAME') {
     return existing.id;
