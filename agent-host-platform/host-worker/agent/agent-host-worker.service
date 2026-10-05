@@ -19,8 +19,16 @@ StartLimitBurst=5
 # Hardening: the worker needs docker + outbound HTTPS only.
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Docker socket is AF_UNIX; control-plane HTTPS is AF_INET/AF_INET6.
+# No other socket families are ever needed.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=1G
 ReadWritePaths=/opt/agent-host /srv/agent-apps /var/run/docker.sock
 # Keep the journal readable for heartbeat verification.
 StandardOutput=journal
