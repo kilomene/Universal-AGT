@@ -11,7 +11,7 @@ The canonical contract is
 [`../agent-sdk/protocol/PROTOCOL.md`](../agent-sdk/protocol/PROTOCOL.md).
 This document explains how the pieces fit together.
 
-## The three layers
+## The four layers
 
 ```
                         ┌───────────────────────────────┐
@@ -33,6 +33,7 @@ This document explains how the pieces fit together.
                         │   • append-only event journal │
                         │   • secrets (encrypted)       │
                         │   • SSE stream /v1/events/stream
+                        │   • serves the dashboard at /
                         └──────────────┬────────────────┘
                                        │  HTTPS + Bearer token
                                        │  (host token; outbound-only)
@@ -46,14 +47,29 @@ This document explains how the pieces fit together.
                         │   • builds / runs containers  │
                         │   • streams progress + logs   │
                         │   • self-updates              │
+                        │   • ingress (optional, Ph. 7)  │
+                        └──────────────┬────────────────┘
+                                       │  public traffic
+                                       │  (only when ingress enabled)
+                                       ▼
+                        ┌───────────────────────────────┐
+                        │    LAYER 4: PUBLIC EDGE       │
+                        │  Cloudflare (optional):       │
+                        │   • proxied CNAMEs (DNS API)  │
+                        │   • edge + outbound tunnel   │
+                        │  (Phase 7: DNS ≠ reachability │
+                        │   is fixed by the worker-     │
+                        │   managed cloudflared tunnel) │
                         └───────────────────────────────┘
 ```
 
-**Layer 1 — Agents.** Any process with an agent API key: an LLM agent, the
-`uagt` CLI, or a human driving the CLI. Agents *declare intent* (create a
-task, register a deployment) and *read results later*. They never SSH into
-the host, never touch Docker directly, and may vanish mid-deploy — the
-system is designed for that.
+**Layer 1 — Agents.** Any process with an agent API key: an LLM agent (Muse,
+Instinct, a CI agent — all just agent rows with scoped permission sets, no
+agent-type special-casing anywhere), the `agent-host` CLI, or a human
+driving the CLI. Agents *declare intent* (create a task, register a
+deployment) and *read results later*. They never SSH into the host, never
+touch Docker directly, and may vanish mid-deploy — the system is designed
+for that.
 
 **Layer 2 — Control plane.** The only durable component. It authenticates
 agents and hosts, stores artifacts with SHA-256 verification, keeps the
@@ -116,8 +132,16 @@ agent                                    control plane                        ho
 
 Deployments are created through `POST /v1/deployments`, which wraps task
 creation: the agent gets a deployment row to watch and a task row that does
-the work. In `mode: "manual"` the task parks in `awaiting_approval` until an
-agent with `approve_deployments` calls `POST /v1/tasks/:id/approve`.
+the work. In `mode: "manual"` the task parks in `awaiting_approval` at creation until
+an agent with `approve_deployments` calls `POST /v1/tasks/:id/approve`.
+
+**Secrets delivery.** Project secrets (`POST /v1/projects/:id/secrets`,
+AES-256-GCM at rest, names-only reads) reach the host only when it needs
+them: inside the deploy task's payload over the worker's authenticated
+channel, or via `GET /v1/worker/projects/:project_id/secrets` (host token;
+the server answers only when the host has a claimed/active task or a live
+deployment for that project). The worker injects them as container env and
+never persists them to `state.json` or its logs.
 
 ## Resumability
 
@@ -259,10 +283,33 @@ IP addresses never appear in requests or responses. This is what makes the
 system work behind NAT, on laptops, and on machines whose network identity
 changes: as long as the worker can reach the control plane, it can do work.
 
+## Public edge (Phase 7) — why layer 4 exists
+
+An outbound-only host cannot receive inbound connections, so **DNS alone
+cannot make it publicly reachable** — a CNAME is just a name pointing at a
+name. The public edge is therefore a real architectural layer with three
+honest modes (full story in [`cloudflare.md`](cloudflare.md)):
+
+- **(a) metadata-only (default).** The hostname is recorded on the
+  deployment (`status: 'dns_pending'`); no DNS is touched. Traffic never
+  reaches the host.
+- **(b) direct.** The control plane creates a proxied CNAME
+  `hostname → PUBLIC_INGRESS_HOSTNAME` — but *you* must run the ingress
+  (reverse proxy, LB, or your own tunnel) that can reach the host's
+  container ports. Your responsibility; the system never sees host IPs.
+- **(c) cloudflare-tunnel (recommended for the private-host case).** The
+  worker supervises an outbound-only `cloudflared tunnel --token <TOKEN>
+  run` (pinned release, SHA-256 verified) and syncs `hostname →
+  http://127.0.0.1:<container-port>` routes from tunnel-mode domains
+  (`POST /v1/domains {"ingress": "tunnel"}` → CNAME `hostname →
+  TUNNEL_INGRESS_HOSTNAME`, plus an `ingress-sync` task for the host).
+  Traffic flows: client → Cloudflare edge → (outbound tunnel) →
+  `cloudflared` → `127.0.0.1:<port>`. The host still listens on nothing.
+
 ## Dashboard
 
-The control plane serves a static, no-build dashboard (`dashboard/`) at any
-base path. It is a monitoring surface with a small set of guarded actions —
+The control plane serves a static, no-build dashboard (`dashboard/`) at the
+API root `/`. It is a monitoring surface with a small set of guarded actions —
 not a second API:
 
 - **Auth.** The agent API key lives in `sessionStorage` only (cleared when
