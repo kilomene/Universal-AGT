@@ -93,7 +93,7 @@ TUNNEL_INGRESS_HOSTNAME=<tunnel-id>.cfargotunnel.com   # from step 3
 ```bash
 WORKER_INGRESS_ENABLED=true
 WORKER_INGRESS_PROVIDER=cloudflare-tunnel
-UAHT_TUNNEL_TOKEN=<tunnel token from step 2>   # never in the repo, never logged
+WORKER_TUNNEL_TOKEN=<redacted>
 ```
 
 On startup the worker downloads `cloudflared` (pinned release, SHA-256
@@ -141,7 +141,7 @@ edge → (outbound tunnel) → `cloudflared` on the host → `127.0.0.1:<port>`.
   process table to local root only, never in logs, events, task results,
   or API responses.
 - To rotate the token: create a new token in the dashboard, update
-  `UAHT_TUNNEL_TOKEN`, and either restart the worker or queue an
+  `WORKER_TUNNEL_TOKEN` (installer input: `UAHT_TUNNEL_TOKEN`), and either restart the worker or queue an
   `ingress-sync` task (the restart picks up the new token).
 
 ## Choosing
