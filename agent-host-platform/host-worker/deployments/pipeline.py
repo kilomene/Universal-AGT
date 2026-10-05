@@ -105,6 +105,12 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
     The format is detected from the file's magic bytes, not its name —
     the pipeline stores downloads as <artifact_id>.bin, so an extension
     check would reject every real artifact.
+
+    Tar extraction uses ``tarfile.data_filter`` (Python 3.12+): it blocks
+    absolute paths, ``..`` escapes, and — critically — symlink/hardlink
+    members that point outside the destination (the pre-extract member
+    loop it replaces could be bypassed by extracting a symlink first and
+    then a file *through* it).
     """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
@@ -117,9 +123,7 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
 
     if tarfile.is_tarfile(archive_path):
         with tarfile.open(archive_path, "r") as tf:
-            for member in tf.getmembers():
-                _safe_join(dest, member.name)
-            tf.extractall(dest)
+            tf.extractall(dest, filter="data")
     elif zipfile.is_zipfile(archive_path):
         with zipfile.ZipFile(archive_path, "r") as zf:
             for member in zf.namelist():
@@ -131,6 +135,20 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
             "(expected a tar archive or a zip file)"
         )
     return str(dest)
+
+
+def confined_under(base: Path, requested: str | None, what: str) -> Path:
+    """Resolve ``requested`` strictly inside ``base``; reject escapes.
+
+    Used for manifest-controlled paths (dockerfile, build context, compose
+    file): an artifact's agent.deploy.json must not smuggle ``..`` or
+    absolute paths out of the extracted artifact tree.
+    """
+    resolved_base = base.resolve()
+    target = (resolved_base / (requested or ".")).resolve()
+    if target != resolved_base and resolved_base not in target.parents:
+        raise DeployError(f"{what} escapes the allowed directory: {requested!r}")
+    return target
 
 
 def pick_free_port(used: set, log=None) -> int:
@@ -311,7 +329,24 @@ def deploy(ctx, task: dict) -> dict:
     resources = manifest_data.get("resources") or {}
     restart_policy = manifest_data.get("restart") or "unless-stopped"
     manifest_env = sanitize_env(manifest_data.get("env"), log=log)
-    secret_env = sanitize_env(secrets, log=log)
+    # Secrets: payload-carried values first (control-plane injected), then
+    # the worker pulls the project's stored secrets over its authenticated
+    # channel (GET /v1/worker/projects/:id/secrets) when the payload carries
+    # none. Payload values win on key collision. Either way they become
+    # container env only — never persisted to state.json (see the save
+    # below) and scrubbed from every log line.
+    payload_secrets = secrets if isinstance(secrets, dict) else {}
+    fetched_secrets: dict = {}
+    if project_id and hasattr(ctx.api, "get_project_secrets"):
+        try:
+            fetched_secrets = ctx.api.get_project_secrets(project_id) or {}
+            if fetched_secrets:
+                log(f"fetched {len(fetched_secrets)} project secret(s) "
+                    f"for container env")
+        except Exception as exc:
+            log(f"project secrets unavailable ({exc}); continuing with "
+                f"payload secrets only")
+    secret_env = sanitize_env({**fetched_secrets, **payload_secrets}, log=log)
     run_env = {**manifest_env, **secret_env}  # secrets override manifest env
 
     # -- 3. host resource check ---------------------------------------------
@@ -356,8 +391,12 @@ def deploy(ctx, task: dict) -> dict:
             if extract_dir is None:
                 raise DeployError("runtime=docker needs artifact_id with a Dockerfile")
             build_cfg = manifest_data.get("build") or {}
-            dockerfile = str(Path(extract_dir) / build_cfg.get("dockerfile", "Dockerfile"))
-            context_dir = str(Path(extract_dir) / build_cfg.get("context", "."))
+            extract_base = Path(extract_dir)
+            dockerfile = str(confined_under(
+                extract_base, build_cfg.get("dockerfile", "Dockerfile"),
+                "build.dockerfile"))
+            context_dir = str(confined_under(
+                extract_base, build_cfg.get("context", "."), "build.context"))
             if not os.path.isfile(dockerfile):
                 raise DeployError(f"Dockerfile not found: {dockerfile}")
             log(f"docker build: tag={built_image} dockerfile={dockerfile}")
@@ -370,8 +409,13 @@ def deploy(ctx, task: dict) -> dict:
             raise DeployError("runtime=docker-compose but 'docker compose' is unavailable")
         if extract_dir is None:
             raise DeployError("runtime=docker-compose needs artifact_id")
-        compose_file = payload.get("compose_file") or str(
-            Path(extract_dir) / "docker-compose.yml")
+        extract_base = Path(extract_dir)
+        compose_file = (
+            str(confined_under(extract_base, payload.get("compose_file"),
+                               "compose_file"))
+            if payload.get("compose_file")
+            else str(extract_base / "docker-compose.yml")
+        )
         if not os.path.isfile(compose_file):
             alt = str(Path(extract_dir) / "compose.yaml")
             compose_file = alt if os.path.isfile(alt) else compose_file
