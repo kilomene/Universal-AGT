@@ -18,12 +18,15 @@ function parseBearer(req) {
             return token;
     }
     // Fallback for browser EventSource (SSE), which cannot set request headers:
-    // the dashboard passes ?api_key=<token> on GET /v1/events/stream only.
-    // Prefer the Authorization header everywhere else — query-string tokens
-    // can end up in access logs.
+    // the dashboard passes ?api_key=<token> on GET /v1/events/stream ONLY.
+    // Honored nowhere else — query-string tokens can end up in access logs
+    // (tightened 2026-10-05; was accepted globally before).
     const q = req.query.api_key;
-    if (typeof q === 'string' && q.length > 0)
-        return q;
+    if (typeof q === 'string' && q.length > 0) {
+        const path = String(req.originalUrl || '').split('?')[0];
+        if (req.method === 'GET' && path === '/v1/events/stream')
+            return q;
+    }
     return null;
 }
 // Attaches req.auth when a valid bearer token is present; never 401s.
