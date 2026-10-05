@@ -28,16 +28,49 @@ sudo UAHT_CONTROL_PLANE_URL="https://control-plane.example.com" \
      bash /tmp/uagt-install.sh
 ```
 
-What the installer does:
+What the installer does, step by step (this is the contract; the script
+fails loudly with a precise error at the first step that cannot be met):
 
-1. Verifies Docker is present (installs `docker.io` via apt if missing).
-2. Creates the `agenthost` system user and lays out `/opt/agent-host`
+1. **Preconditions.** Must run as root. Fails unless the OS is Linux
+   (`uname -s`), `UAHT_CONTROL_PLANE_URL` and `UAHT_HOST_NAME` are set, and
+   `UAHT_HOST_TOKEN`/`UAHT_HOST_ID` are supplied as a pair or not at all.
+2. **Dependencies.** Requires `python3 >= 3.10`. Installs `python3`,
+   `python3-requests` and `docker.io` via apt (skip with
+   `UAHT_SKIP_APT=1`); if the `requests` module is still not importable
+   afterwards, falls back to `pip install -r host-worker/requirements.txt`.
+   Validates the Docker **daemon** with `docker info` — an installed-but-
+   stopped Docker is a hard failure.
+3. **User and directories.** Creates the `agenthost` system user (nologin
+   shell) and adds it to the `docker` group. Creates
+   `/opt/agent-host/{config,worker,logs,deployments,artifacts,builds,updates,releases,quarantine}`
+   and `/srv/agent-apps`, then copies the full worker tree —
+   `agent`, `executor`, `deployments`, `docker`, `health`, `logs`,
+   `updater`, **`ingress`** — to `/opt/agent-host/worker`. Sets
+   `agenthost:agenthost` ownership and mode `0750` on `/opt/agent-host`
    and `/srv/agent-apps`.
-3. Provisions the host at the control plane (`POST /v1/hosts/register`)
-   unless `UAHT_HOST_TOKEN`/`UAHT_HOST_ID` are supplied, and writes
-   `/opt/agent-host/config/worker.env` (mode `0600`, agenthost-owned).
-4. Installs the systemd unit `agent-host-worker.service` and enables it.
-5. Starts the service and waits for the first successful heartbeat.
+4. **Provisioning.** `POST {UAHT_CONTROL_PLANE_URL}/v1/hosts/register` with
+   body `{"name", "host_type": "persistent-linux-host",
+   "capabilities": ["docker", "docker-compose"], "worker_version"}` unless
+   `UAHT_HOST_TOKEN`/`UAHT_HOST_ID` were supplied pre-provisioned.
+5. **Config.** Writes `/opt/agent-host/config/worker.env` (mode `0600`,
+   `agenthost`-owned) with `WORKER_CONTROL_PLANE_URL`,
+   `WORKER_HOST_NAME`, `WORKER_HOST_TOKEN`, `WORKER_HOST_ID`,
+   `WORKER_POLL_WAIT=25`, `WORKER_HEARTBEAT_INTERVAL=30`,
+   `WORKER_WORK_DIR=/opt/agent-host`, `WORKER_APPS_DIR=/srv/agent-apps`,
+   `WORKER_WORKER_VERSION`, plus the optional ingress keys
+   (`WORKER_INGRESS_ENABLED`, `WORKER_INGRESS_PROVIDER`,
+   `UAHT_TUNNEL_TOKEN`).
+6. **systemd.** Installs `agent-host-worker.service` (the unit shipped at
+   `host-worker/agent/agent-host-worker.service`), runs
+   `daemon-reload`, then `systemctl enable --now agent-host-worker`.
+7. **Verification (three gates, all mandatory).** `systemctl is-active`
+   on the unit; the worker's own `--self-check` executed as the
+   `agenthost` user (config loads, deployment state readable, docker
+   reachable-or-skipped — and every worker module imports, so a broken
+   worker-tree copy fails here); then waits up to 120s for the first
+   `heartbeat ok` line in the unit journal, proving the worker can
+   actually reach the control plane. Any gate failure aborts the install
+   — the script never reports success when the worker cannot start.
 
 ## Getting a host token (one-time)
 
