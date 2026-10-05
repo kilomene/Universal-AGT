@@ -100,6 +100,19 @@ export function createApp(): express.Express {
 }
 
 async function main(): Promise<void> {
+  // Security (2026-10-05): agent registration is gated by UAHT_PROVISIONING_TOKEN.
+  // In production the token is required at startup — fail fast rather than
+  // boot with an open bootstrap window. Outside production, an unset token
+  // only permits the very first agent registration (bootstrap mode).
+  if (process.env.NODE_ENV === 'production' && !process.env.UAHT_PROVISIONING_TOKEN) {
+    logger.error('refusing to start: UAHT_PROVISIONING_TOKEN is not set (required in production)');
+    process.exit(1);
+  }
+  if (!process.env.UAHT_PROVISIONING_TOKEN) {
+    logger.warn(
+      'UAHT_PROVISIONING_TOKEN is not set: agent registration is open only until the first agent registers (bootstrap mode)',
+    );
+  }
   const pool = getPool();
   const applied = await runMigrations(pool);
   if (applied.length) logger.info('migrations applied at startup', { applied });
