@@ -11,11 +11,21 @@ last N characters for progress chunks / results.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024   # 10 MiB per log file
 DEFAULT_ROTATIONS = 3
 DEFAULT_TAIL_CHARS = 200_000
+
+# task_id / deployment_id come from the control plane; never let them
+# become path components. Anything outside [a-zA-Z0-9_-] is stripped.
+_SAFE_LOG_ID = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def sanitize_log_id(value: object) -> str:
+    """Make a network-derived id safe for use as a log file name."""
+    return _SAFE_LOG_ID.sub("", str(value)) or "unknown"
 
 
 class LogStore:
@@ -32,10 +42,10 @@ class LogStore:
 
     # -- paths -----------------------------------------------------------
     def task_log_path(self, task_id: str) -> Path:
-        return self.tasks_dir / f"{task_id}.log"
+        return self.tasks_dir / f"{sanitize_log_id(task_id)}.log"
 
     def deployment_log_path(self, deployment_id: str) -> Path:
-        return self.deployments_dir / f"{deployment_id}.log"
+        return self.deployments_dir / f"{sanitize_log_id(deployment_id)}.log"
 
     # -- writing ---------------------------------------------------------
     def _rotate(self, path: Path) -> None:
