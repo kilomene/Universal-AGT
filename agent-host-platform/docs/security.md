@@ -26,6 +26,11 @@ Two bearer-token credential kinds, both sent as
   open (bootstrap mode); afterwards registration returns 403 until the
   operator sets the token. In production (`NODE_ENV=production`) the
   server refuses to start without `UAHT_PROVISIONING_TOKEN`.
+  Two provisioning tokens — don't confuse them: `UAHT_PROVISIONING_TOKEN`
+  gates *agent* registration (`X-Provisioning-Token` header); `PROVISIONING_TOKEN`
+  is the *host* bootstrap bearer for hands-off first-boot
+  `POST /v1/hosts/register` (alternatively, an agent token with the `deploy`
+  permission can register hosts).
 - Credentials rotate without downtime: `POST /v1/agents/me/rotate` and
   `POST /v1/hosts/:id/rotate-token` issue a new credential, invalidate the
   old one immediately, and emit `agent.key_rotated` / `host.token_rotated`.
@@ -232,7 +237,9 @@ install — row-level triggers cannot intercept `TRUNCATE`).
 - [ ] Registration/bootstrap endpoints locked down after initial setup.
 - [ ] Agent keys issued with minimal permissions; `manage_secrets` and
       `approve_deployments` granted sparingly.
-- [ ] Host tokens live only in `/etc/uagt/worker.env` (mode `0600`).
+- [ ] Host tokens live only in the host's own env file —
+      `/opt/agent-host/config/worker.env` (mode `0600`, agenthost-owned) when
+      installed with `scripts/install-host.sh`; never in the repo or logs.
 - [ ] Dashboard users authenticate with agent keys (session-scoped); the
       control plane accepts `?api_key=` **only** on `/v1/events/stream`.
 - [ ] `ARTIFACT_MAX_BYTES` sized for the workload (default 500MB).
