@@ -27,6 +27,9 @@ const SAFE_TYPES: ReadonlySet<string> = new Set([
   'healthcheck',
   'system-info',
   'artifact-download',
+  // Phase 7: reconciles the tunnel route table to the desired state —
+  // re-running it is a no-op when nothing changed.
+  'ingress-sync',
 ]);
 
 // Destructive or operator-gated flows — never auto-retried.
