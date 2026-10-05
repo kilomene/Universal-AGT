@@ -105,6 +105,14 @@ npm run build
 npm start        # serves REST at /v1 and the dashboard at /
 ```
 
+`npm start` runs the compiled output in `dist/`, so it **requires a prior
+`npm run build`** — `dist/` is never committed to the repo. Use
+`npm run prod` (build + start in one step) when you want a single command:
+
+```bash
+npm run prod     # npm run build && npm start
+```
+
 `npm start` runs migrations automatically; `npm run migrate` does it
 explicitly. Health check: `GET /v1/health` → `{ok: true, version, time}`.
 
@@ -121,7 +129,11 @@ Type=simple
 User=uagt
 WorkingDirectory=/opt/universal-agt/agent-host-platform/control-plane/api
 EnvironmentFile=/etc/uagt/control-plane.env
-ExecStart=/usr/bin/node dist/index.js
+# Build from source on every (re)start so stale compiled output can never
+# execute. Deploy step must have run `npm ci` with devDependencies present
+# (tsc lives there); `npm run build` is idempotent.
+ExecStartPre=/usr/bin/npm run build
+ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -136,12 +148,26 @@ WantedBy=multi-user.target
 
 ### Docker example
 
+Built from source in a multi-stage image — the image never copies a
+pre-built `dist/`; it compiles `src/` at build time, so the running code
+always matches the checked-out source:
+
 ```dockerfile
-FROM node:20-slim
+# Stage 1: compile TypeScript from source
+FROM node:20-slim AS build
 WORKDIR /srv/api
 COPY agent-host-platform/control-plane/api/package*.json ./
-RUN npm ci --omit=dev
-COPY agent-host-platform/control-plane/api/dist ./dist
+RUN npm ci
+COPY agent-host-platform/control-plane/api/src ./src
+COPY agent-host-platform/control-plane/api/tsconfig.json ./
+RUN npm run build && npm prune --omit=dev
+
+# Stage 2: minimal runtime (compiled output + prod deps only)
+FROM node:20-slim
+WORKDIR /srv/api
+COPY --from=build /srv/api/package.json ./
+COPY --from=build /srv/api/node_modules ./node_modules
+COPY --from=build /srv/api/dist ./dist
 COPY agent-host-platform/dashboard /srv/dashboard
 ENV DASHBOARD_DIR=/srv/dashboard PORT=3000 NODE_ENV=production
 EXPOSE 3000
