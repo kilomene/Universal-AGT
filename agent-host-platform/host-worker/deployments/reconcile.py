@@ -7,12 +7,13 @@ is the actual state. For every deployment marked ``running`` locally:
   * container present and running        -> nothing to do
   * container present but not running    -> ``docker.start`` (the same call
     the ``start`` task handler uses)
-  * container missing entirely          -> ``docker.run`` with the stored
-    spec — stored image, stored host->container port mapping, stored
-    non-secret env, ``restart=unless-stopped`` (the same call the deploy
-    pipeline uses). Secret env is deliberately NOT restored: a rebooted
-    host does not re-inject secrets on its own; the next redeploy or an
-    ``environment-update`` task does.
+  * container missing entirely          -> ``docker.run`` rebuilt from the
+    stored deployment contract (deployments.pipeline.run_spec_from_state:
+    stored image, stored host->container port mapping, stored non-secret
+    env, stored restart policy, stored cpu/memory limits — the same call
+    the deploy pipeline uses). Secret env is deliberately NOT restored: a
+    rebooted host does not re-inject secrets on its own; the next redeploy
+    or an ``environment-update`` task does.
   * ``docker-compose`` runtime           -> containers are matched by compose
     project name in ``docker ps -a``; stopped ones are started. A project
     with no containers at all cannot be recreated without its compose file,
@@ -26,8 +27,12 @@ from __future__ import annotations
 import logging
 import time
 
+from deployments.pipeline import run_spec_from_state
+
 LOG = logging.getLogger("agent-host-worker.reconcile")
 
+# Fallback for states written before the full deployment contract was
+# persisted (see run_spec_from_state); new states always carry the policy.
 DEFAULT_RESTART_POLICY = "unless-stopped"
 
 
@@ -109,33 +114,34 @@ def _compose_name_matches(compose_project: str, container_name: str) -> bool:
 
 
 def _recreate_container(ctx, state: dict, summary: dict, note) -> None:
-    """Recreate a missing container from its stored spec (pipeline's docker.run)."""
+    """Recreate a missing container from its stored deployment contract.
+
+    The run spec comes from deployments.pipeline.run_spec_from_state —
+    stored image, ports, restart policy and cpu/memory limits — so a
+    rebooted worker restores exactly what was deployed, never a
+    hard-coded default.
+    """
     deployment_id = state.get("deployment_id", "?")
     project = state.get("project_name", "?")
     name = state.get("container_name")
-    image = state.get("image")
     docker = ctx.docker
+    spec = run_spec_from_state(state)
+    image = spec["image"]
     if not image:
         summary["missing"] += 1
         note(f"{project} ({deployment_id}): container {name} missing and no "
              f"image recorded in state; cannot recreate (redeploy required)")
         return
-    ports = {}
-    host_port = state.get("host_port")
-    container_port = state.get("container_port")
-    if host_port and container_port:
-        try:
-            ports[int(host_port)] = int(container_port)
-        except (TypeError, ValueError):
-            pass
     env = dict(state.get("env") or {})  # non-secret env only; secrets are not persisted
     try:
-        docker.run(name, image, ports=ports or None, env=env or None,
-                   restart=DEFAULT_RESTART_POLICY)
+        docker.run(name, image, ports=spec["ports"], env=env or None,
+                   memory=spec["memory"], cpus=spec["cpus"],
+                   restart=spec["restart"])
         summary["reconciled"] += 1
         note(f"{project} ({deployment_id}): container {name} was missing; "
              f"recreated from image {image}"
-             + (f" on :{host_port}->{container_port}" if ports else ""))
+             + (f" on {spec['ports']}" if spec["ports"] else "")
+             + f" (restart={spec['restart']})")
     except Exception as exc:
         summary["missing"] += 1
         note(f"{project} ({deployment_id}): failed to recreate container "
