@@ -9,7 +9,7 @@ and invokes subprocess with shell=False (in practice: shell=True never
 appears anywhere in this codebase).
 
 Rules enforced here:
-  1. Only the 17 protocol task types (§3.2 / §5) are executable. Any other
+  1. Only the 18 protocol task types (§3.2 / §5) are executable. Any other
      ``type`` value — including a missing one — raises TaskRejected and the
      task is reported ``failed`` WITHOUT any execution.
   2. Handlers receive the task dict and a WorkerContext; they may only call
@@ -59,6 +59,8 @@ TASK_HANDLERS: dict[str, callable] = {
     # artifacts
     "artifact-download": handlers.handle_artifact_download,
     "artifact-upload": handlers.handle_artifact_upload,
+    # ingress
+    "ingress-sync": handlers.handle_ingress_sync,
 }
 
 # The canonical set of executable types, derived from the allowlist itself.
