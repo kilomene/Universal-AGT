@@ -3,15 +3,15 @@ import { describe, expect, it } from 'vitest';
 import { classifyTaskType, decideRetryOutcome } from '../src/lib/retryPolicy';
 import { TASK_TYPES } from '../src/routes/tasks';
 
-// The 17 PROTOCOL §3.2 task types must ALL be classified (no silent gaps).
-describe('classifyTaskType — full 17-type matrix', () => {
+// The 18 PROTOCOL §3.2 task types must ALL be classified (no silent gaps).
+describe('classifyTaskType — full 18-type matrix', () => {
   it('covers every protocol task type', () => {
     for (const t of TASK_TYPES) {
       expect(['safe', 'conditional', 'never']).toContain(classifyTaskType(t));
     }
   });
-  it('safe: idempotent reads/status', () => {
-    for (const t of ['logs', 'status', 'healthcheck', 'system-info', 'artifact-download']) {
+  it('safe: idempotent reads/status + ingress-sync (reconciles to desired state)', () => {
+    for (const t of ['logs', 'status', 'healthcheck', 'system-info', 'artifact-download', 'ingress-sync']) {
       expect(classifyTaskType(t)).toBe('safe');
     }
   });
