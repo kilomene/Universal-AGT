@@ -121,18 +121,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Fail on committed secrets or env files
-        run: |
-          set -euo pipefail
-          # No real .env files may ever be committed (.env.example templates are fine)
-          if git ls-files | grep -E '(^|/)\.env($|\.)' | grep -vE '\.env\.(example|sample|template|dist)$' ; then
-            echo "ERROR: real .env file committed"; exit 1
-          fi
-          # No private keys, tokens, or passwords in tracked files
-          # (the workflow's own pattern text is excluded — it self-matches otherwise)
-          if git grep -nEi 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[bap]-|sk-live-|aws_secret_access_key|password\s*=\s*["'"'"'][^"'"'"']+["'"'"']' -- ':!*.md' ':!docs/**' ':!.github/workflows/**' ; then
-            echo "ERROR: possible secret found in tracked files"; exit 1
-          fi
-          echo "secrets sweep clean"
+        # Scan logic lives in scripts/secrets-sweep.sh — the single source of
+        # truth shared with the local vitest suite
+        # (control-plane/api/test/secretsSweep.test.ts), so the sweep is
+        # exercised even when hosted runners are unavailable.
+        run: bash scripts/secrets-sweep.sh
 
   dist-drift-guard:
     name: No committed build output + clean source build
