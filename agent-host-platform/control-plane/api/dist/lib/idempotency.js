@@ -19,6 +19,8 @@ function taskIdempotencyBody(input) {
 }
 // The "body" compared for deployment idempotency: the requested deployment
 // parameters (dedupes across BOTH the deployment row and its deploy task).
+// host_port lives in the port registry, not on the deployment row — callers
+// pass it explicitly (null when no fixed port was requested).
 function deploymentIdempotencyBody(input) {
     return {
         project_id: input.project_id,
@@ -26,6 +28,7 @@ function deploymentIdempotencyBody(input) {
         version: input.version,
         artifact_id: input.artifact_id ?? null,
         mode: input.mode ?? 'automatic',
+        host_port: input.host_port ?? null,
     };
 }
 async function findTaskByIdempotencyKey(pool, key) {
