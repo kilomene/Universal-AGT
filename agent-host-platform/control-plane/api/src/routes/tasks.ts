@@ -32,9 +32,34 @@ export const TASK_TYPES = [
 ] as const;
 
 function permissionForTaskType(type: string): string {
-  // Deploying new code is the privileged action; everything else is at
-  // minimum a status read. (restart/stop/remove gates live on services.)
-  return type === 'deploy' ? 'deploy' : 'read_status';
+  // Per-type permission map (PROTOCOL §3.2, tightened 2026-10-05 — see the
+  // PROTOCOL changelog). Mutating a deployment needs the matching service
+  // permission; creating build/run work needs deploy; reads need read_status.
+  switch (type) {
+    case 'deploy':
+    case 'remove':
+    case 'rollback':
+    case 'build':
+    case 'docker-build':
+    case 'docker-run':
+    case 'docker-compose':
+    case 'environment-update':
+    case 'artifact-upload':
+      return 'deploy';
+    case 'restart':
+    case 'start':
+      return 'restart';
+    case 'stop':
+      return 'stop';
+    case 'logs':
+    case 'status':
+    case 'healthcheck':
+    case 'system-info':
+    case 'artifact-download':
+      return 'read_status';
+    default:
+      return 'deploy'; // defensive: unknown types are never open
+  }
 }
 
 async function getTask(pool: ReturnType<typeof getPool>, id: string) {
@@ -108,20 +133,44 @@ tasksRouter.post('/', requireAgent, async (req, res, next) => {
     }
 
     const status = taskMode === 'manual' ? 'awaiting_approval' : 'queued';
-    const { rows } = await pool.query(
-      `INSERT INTO tasks (idempotency_key, created_by, assigned_to, type, status, priority, payload)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [
-        typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null,
-        auth.id,
-        host_id ?? null,
-        type,
-        status,
-        prio,
-        JSON.stringify(payload ?? {}),
-      ],
-    );
-    const task = rows[0];
+    let task: Record<string, any>;
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO tasks (idempotency_key, created_by, assigned_to, type, status, priority, payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [
+          typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null,
+          auth.id,
+          host_id ?? null,
+          type,
+          status,
+          prio,
+          JSON.stringify(payload ?? {}),
+        ],
+      );
+      task = rows[0];
+    } catch (err) {
+      // Idempotency race: two requests with the same key passed the
+      // pre-check concurrently. Re-read and replay/409 instead of 500 —
+      // the same behavior POST /v1/deployments already has.
+      if ((err as { code?: string }).code === '23505' && typeof idempotency_key === 'string' && idempotency_key) {
+        const existing = await findTaskByIdempotencyKey(pool, idempotency_key);
+        if (existing) {
+          const decision = decideIdempotency(
+            { body: taskIdempotencyBody(existing) },
+            taskIdempotencyBody({ type, payload }),
+          );
+          if (decision === 'replay') {
+            const raced = await getTask(pool, existing.id);
+            res.status(200).json({ task: raced, idempotent_replay: true });
+            return;
+          }
+          sendError(res, 409, 'conflict', 'idempotency key already used with a different payload');
+          return;
+        }
+      }
+      throw err;
+    }
     await appendEvent(pool, {
       type: 'task.created',
       actor_type: 'agent',
@@ -208,7 +257,10 @@ tasksRouter.get('/:id', requireAgent, requirePermission('read_status'), async (r
 });
 
 // POST /v1/tasks/:id/cancel — uses the state machine; terminal states -> 409.
-tasksRouter.post('/:id/cancel', requireAgent, requirePermission('read_status'), async (req, res, next) => {
+// Permission (tightened 2026-10-05, see PROTOCOL changelog): the `deploy`
+// permission, or the agent that created the task. Cancelling someone else's
+// deployment task is a mutating action, not a status read.
+tasksRouter.post('/:id/cancel', requireAgent, async (req, res, next) => {
   try {
     if (!isUuid(req.params.id)) {
       sendError(res, 400, 'bad_request', 'id must be a UUID');
@@ -218,6 +270,12 @@ tasksRouter.post('/:id/cancel', requireAgent, requirePermission('read_status'), 
     const task = await getTask(pool, req.params.id);
     if (!task) {
       next(new HttpError(404, 'not_found', 'task not found'));
+      return;
+    }
+    const auth = req.auth!;
+    const isCreator = task.created_by !== null && task.created_by === auth.id;
+    if (auth.permissions?.['deploy'] !== true && !isCreator) {
+      sendError(res, 403, 'forbidden', 'missing permission: deploy (or be the task creator)');
       return;
     }
     if (!canTransitionTask(task.status, 'cancelled')) {
