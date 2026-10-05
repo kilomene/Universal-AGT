@@ -184,6 +184,19 @@ def cmd_rollback(args):
     _emit(args, c.rollback_deployment(args.deployment))
 
 
+def cmd_domains(args):
+    c = _client(args)
+    if args.action == "add":
+        _emit(args, c.add_domain(args.deployment, args.hostname))
+    elif args.action == "rm":
+        _emit(args, c.remove_domain(args.deployment, args.hostname))
+    else:
+        domains = c.list_domains(args.deployment)
+        rows = domains.get("domains", []) if isinstance(domains, dict) else domains
+        _emit(args, [{"hostname": d.get("hostname"), "status": d.get("status"),
+                      "added": d.get("added_at")} for d in rows])
+
+
 def cmd_tasks(args):
     c = _client(args)
     tasks = c.list_tasks(status=args.status)
@@ -253,6 +266,12 @@ def build_parser():
     r = sub.add_parser("rollback", help="roll a deployment back to the previous healthy version")
     r.add_argument("--deployment", required=True, help="deployment id")
 
+    d = sub.add_parser("domains", help="manage public hostnames for a deployment (optional Cloudflare DNS)")
+    d.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm"],
+                   help="list domains (default), add one, or remove one")
+    d.add_argument("--deployment", required=True, help="deployment id")
+    d.add_argument("--hostname", default=None, help="hostname for add/rm")
+
     t = sub.add_parser("tasks", help="list tasks in the durable queue")
     t.add_argument("--status", default=None, help="filter by task status")
 
@@ -275,6 +294,7 @@ def main(argv=None):
             "start": cmd_start,
             "status": cmd_status,
             "rollback": cmd_rollback,
+            "domains": cmd_domains,
             "tasks": cmd_tasks,
             "events": cmd_events,
         }[args.command](args)
