@@ -131,20 +131,44 @@ the worker sets those limits on every `docker run` it issues.
 
 ## Secret handling
 
-- Secrets are stored **encrypted at rest** via `POST /v1/projects/:id/secrets`.
-- They are **never returned** by any read endpoint: `GET .../secrets`
-  lists names only.
-- The worker receives decrypted values **only inside the task payload of a
-  deployment it is actively executing**, over its authenticated channel —
-  or by pulling `GET /v1/worker/projects/:project_id/secrets` (host token;
-  the server only answers when the host has a claimed/active task or a live
-  deployment for that project, else 403). At deploy time the worker injects
-  them as container env (payload-carried values win on collision).
-- Secrets never appear in logs, events, or task results. The worker's log
-  redaction strips known secret values from `log_chunk`s before upload, and
-  secret env is never persisted to the worker's `state.json`.
+- Project secrets are stored **encrypted at rest** via
+  `POST /v1/projects/:id/secrets` (upsert): AES-256-GCM with the
+  `DATA_ENCRYPTION_KEY` (64 hex chars = 32 bytes); the stored blob is
+  `nonce(12) || ciphertext || authTag(16)`. Plaintext never hits the
+  `secrets` table.
+- Secret **values are never returned** by any agent-facing endpoint:
+  `GET /v1/projects/:id/secrets` lists names + `created_at`/`updated_at`
+  only, the POST response returns metadata only, and DELETE returns 204.
+- Rotation/change emits **`secret.changed`**, deletion emits
+  **`secret.deleted`** — payloads carry `project_id` + `name` only, never
+  values.
+- The worker pulls decrypted values over its authenticated channel via
+  `GET /v1/worker/projects/:project_id/secrets` (**host token only**; agent
+  tokens get 403). The server answers only when that host has a
+  claimed/running/awaiting_approval task or a live
+  (requested/approved/building/starting/healthcheck/running) deployment for
+  the project — otherwise 403. At deploy time the worker injects them as
+  container env (payload-carried `secrets` win on key collision);
+  `environment-update` merges payload secrets the same way.
+- Secrets never appear in logs, events, or task results. The dispatcher's
+  per-task scrubber redacts payload-carried secret values and the host
+  token from log lines, `log_chunk`s and progress errors; `deploy()` chains
+  the API-fetched values into the active scrubber as well (a failing
+  `docker run` embeds the full `-e KEY=value` argv in its error), and secret
+  env is never persisted to the worker's `state.json`.
 - Managing secrets requires the `manage_secrets` permission — keep it off
   every key that doesn't strictly need it.
+
+Accepted limitations (secrets):
+
+- Payload-carried secrets (`payload.secrets` on docker-run /
+  environment-update tasks) are agent-supplied and live in **plaintext in
+  the task row** — the encrypted store + worker pull is the preferred path
+  for real credentials.
+- `docker run -e KEY=value` passes values as process argv, briefly visible
+  in the host's process list while docker starts the container.
+- Scrubbers skip values shorter than 4 characters (redacting 1–3 char
+  strings would mangle ordinary log text with false positives).
 
 ## Rate limits
 
@@ -220,7 +244,7 @@ a compromised control plane means compromised workers, full stop.
 Every security-relevant action emits an event:
 `agent.connected/disconnected`, `task.*`, `artifact.*`,
 `deployment.*`, `service.*`, `host.registered/online/offline`,
-`secret.updated`, `worker.updated`, `agent.key_rotated`,
+`secret.changed`, `secret.deleted`, `worker.updated`, `agent.key_rotated`,
 `host.token_rotated`. Events are **append-only** — there is no delete or
 update endpoint — and are cursor-paginated, so an auditor can replay the
 full history of who did what, when, from which actor.
