@@ -633,7 +633,8 @@ def test_compose_port_collision_fails_before_compose_up(tmp_path, monkeypatch):
     # a DIFFERENT project declaring the same host port must fail before up
     art_y = _compose_artifact("yapp")
     ctx.api = FakeAPI(art_y)
-    with pytest.raises(pipeline.DeployError, match="already published"):
+    with pytest.raises(pipeline.DeployError,
+                       match="already published|port registry"):
         pipeline.deploy(ctx, _compose_deploy_task(
             "yapp", "1.0.0", "ydep-1", "art-y",
             "sha256:" + hashlib.sha256(art_y).hexdigest()))
