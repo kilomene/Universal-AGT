@@ -2,9 +2,11 @@
 
 Lifecycle per task:
   1. policy.get_handler(task["type"]) — TaskRejected => report failed, no execution
-  2. progress "claimed"
-  3. progress "running" + start log-chunk streamer thread
-  4. handler(ctx, task)
+  2. progress "running" + start log-chunk streamer thread
+     (the claim endpoint already moved the task queued -> claimed
+     server-side; re-reporting "claimed" would be a claimed -> claimed
+     self-transition, which the control-plane state machine rejects)
+  3. handler(ctx, task)
      - success => progress "completed" with result
      - exception => progress "failed" with scrubbed traceback tail
 
@@ -53,10 +55,14 @@ class _ProgressStreamer(threading.Thread):
         self._read_chunk = read_chunk
         self._scrub = scrub
         self._interval = interval
-        self._stop = threading.Event()
+        # Named _stop_event (not _stop): threading.Thread._stop() is internal
+        # cleanup invoked from _wait_for_tstate_lock during join(); an Event
+        # attribute named _stop would shadow it and make join() raise
+        # TypeError: 'Event' object is not callable.
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
-        while not self._stop.wait(self._interval):
+        while not self._stop_event.wait(self._interval):
             chunk = self._read_chunk()
             if not chunk:
                 continue
@@ -70,7 +76,7 @@ class _ProgressStreamer(threading.Thread):
                 pass  # streaming is best-effort; final report carries the tail
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
 
 class TaskDispatcher:
@@ -130,7 +136,11 @@ class TaskDispatcher:
                         "rejected": True}
 
             self.ctx.log(task_id, f"task claimed: type={task_type}")
-            status = self._report(task_id, status, "claimed")
+            # NB: the claim endpoint already moved the task queued -> claimed
+            # server-side (atomic UPDATE ... WHERE status='queued'), so the
+            # first progress report goes straight to "running". Re-reporting
+            # "claimed" would be a claimed -> claimed self-transition, which
+            # the control-plane state machine rejects with 409.
             status = self._report(task_id, status, "running")
 
             streamer = _ProgressStreamer(self.api, task_id, status,
