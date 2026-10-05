@@ -265,8 +265,55 @@ def handle_rollback(ctx, task: dict) -> dict:
     ctx.deployment_store.save(current)
     target["status"] = "running"
     ctx.deployment_store.save(target)
+    ports_settled = _settle_rollback_ports(
+        ctx, _task_id(task), current["deployment_id"], target["deployment_id"])
     return {"deployment_id": current["deployment_id"], "status": "rolled_back",
-            "rolled_back_to": target["deployment_id"]}
+            "rolled_back_to": target["deployment_id"],
+            "ports_settled": ports_settled}
+
+
+def _settle_rollback_ports(ctx, task_id: str, deployment_id: str,
+                           target_deployment_id: str) -> bool:
+    """Best-effort port-registry settle after a completed rollback.
+
+    Tells the control plane to release the rolled-back deployment's port
+    reservations and re-reserve the rollback target's host ports for the
+    target deployment (its reservation was dropped when the newer
+    deployment superseded it). Uses the API client's public session and
+    base_url attributes — no new client method (agent.api is owned
+    elsewhere). Never raises: the registry is advisory and the worker's
+    physical port checks are the backstop, so a settle failure must not
+    fail an already-completed rollback.
+    """
+    api = getattr(ctx, "api", None)
+    session = getattr(api, "session", None) if api is not None else None
+    base_url = getattr(api, "base_url", None) if api is not None else None
+    if session is None or not base_url:
+        ctx.log(task_id,
+                "rollback port settle skipped: no control-plane session")
+        return False
+    url = (f"{base_url}/v1/deployments/{deployment_id}/"
+           f"settle-rollback-ports")
+    try:
+        resp = session.post(
+            url, json={"target_deployment_id": target_deployment_id},
+            timeout=30)
+    except Exception as exc:
+        ctx.log(task_id, f"rollback port settle failed (non-fatal): {exc}")
+        return False
+    if resp.status_code != 200:
+        ctx.log(task_id,
+                f"rollback port settle returned HTTP {resp.status_code} "
+                f"(non-fatal)")
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    ctx.log(task_id,
+            f"rollback ports settled: released={body.get('released')} "
+            f"restored={body.get('restored')} skipped={body.get('skipped')}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +477,32 @@ def handle_docker_compose(ctx, task: dict) -> dict:
     if not compose_file.is_file():
         raise HandlerError(f"compose file not found: {payload.get('compose_file')!r}")
     project_name = payload.get("project_name") or f"uaht-task-{_task_id(task)[:8]}"
-    ctx.log(_task_id(task), f"docker compose up {compose_file}")
+    # W5/W7: validate the normalized compose model against the explicit
+    # DENY list BEFORE `compose up`. A task-controlled compose file must
+    # not smuggle privileged mode, host namespaces, host devices, added
+    # capabilities, custom security options, or bind mounts escaping the
+    # compose file's directory. Refusing here means zero docker side
+    # effects for a malicious file.
+    try:
+        model = docker.compose_config_json(str(compose_file))
+    except Exception as exc:
+        raise HandlerError(
+            f"cannot validate compose file: 'compose config' failed: {exc}")
+    from deployments import compose_validate
+    errors = compose_validate.validate_compose_model(
+        model, workspace=compose_file.parent, compose_file=compose_file)
+    if errors:
+        raise HandlerError(
+            "compose file rejected by security policy: " + "; ".join(errors))
+    # Ports through the same registry-aware free-port verification the
+    # deploy pipeline uses — no silent squatting on another deployment's
+    # reserved port.
+    wanted_ports = deploy_pipeline.parse_compose_published_ports(model)
+    deploy_pipeline.verify_compose_ports_free(
+        docker, project_name, wanted_ports,
+        registry_used=ctx.deployment_store.used_host_ports())
+    ctx.log(_task_id(task),
+            f"docker compose up {compose_file} (security validation passed)")
     docker.compose_up(str(compose_file), project_name=project_name,
                       build=bool(payload.get("build")))
     return {"project_name": project_name, "compose_file": str(compose_file),
@@ -441,7 +513,14 @@ def handle_docker_compose(ctx, task: dict) -> dict:
 # environment-update
 # ---------------------------------------------------------------------------
 def handle_environment_update(ctx, task: dict) -> dict:
-    """Recreate a deployment's container with merged env (stop -> rm -> run)."""
+    """Recreate a deployment's container with merged env (stop -> rm -> run).
+
+    The replacement container is rebuilt from the deployment's persisted
+    contract (deployments.pipeline.run_spec_from_state): restart policy,
+    cpu/memory limits, image and port mapping are deployment-time facts
+    and must survive an env update unchanged. They are NEVER re-derived
+    from `docker inspect` or hard-coded defaults here.
+    """
     payload = _payload(task)
     _require(payload, "deployment_id")
     docker = ctx.require_docker()
@@ -454,21 +533,27 @@ def handle_environment_update(ctx, task: dict) -> dict:
         raise HandlerError("payload env must be a non-empty object")
     secret_env = deploy_pipeline.sanitize_env(payload.get("secrets"))
     merged = {**state.get("env", {}), **new_env, **secret_env}
-    ctx.log(_task_id(task), f"recreating {name} with {len(merged)} env vars")
-    info = docker.inspect(name)[0]
-    image = info.get("Config", {}).get("Image")
-    port_bindings = {}
-    try:
-        bindings = (info.get("NetworkSettings") or {}).get("Ports") or {}
-        for cport, binds in bindings.items():
-            if binds:
-                port_bindings[int(binds[0]["HostPort"])] = int(cport.split("/")[0])
-    except (ValueError, KeyError, IndexError):
-        pass
+    spec = deploy_pipeline.run_spec_from_state(state)
+    image = spec["image"]
+    if not image:
+        # Pre-contract state with no image recorded: fall back to the
+        # running container's image rather than failing the update.
+        info = docker.inspect(name)[0]
+        image = (info.get("Config") or {}).get("Image")
+    if not image:
+        raise HandlerError(
+            f"deployment {payload['deployment_id']} has no image recorded "
+            f"and none could be read from its container"
+        )
+    ctx.log(_task_id(task),
+            f"recreating {name} with {len(merged)} env vars "
+            f"(restart={spec['restart']}, memory={spec['memory']}, "
+            f"cpus={spec['cpus']}, ports={spec['ports']})")
     docker.stop(name)
     docker.rm(name, force=True)
-    docker.run(name, image, ports=port_bindings, env=merged,
-               restart=state.get("restart", "unless-stopped"))
+    docker.run(name, image, ports=spec["ports"], env=merged,
+               memory=spec["memory"], cpus=spec["cpus"],
+               restart=spec["restart"])
     state["env"] = {k: v for k, v in merged.items() if k not in secret_env}
     ctx.deployment_store.save(state)
     return {"deployment_id": payload["deployment_id"], "container": name,
