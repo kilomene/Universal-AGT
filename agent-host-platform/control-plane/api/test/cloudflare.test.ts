@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HttpError } from '../src/lib/errors';
 import {
+  cnameTargetFor,
   deleteDnsRecord,
   ensureCnameRecord,
   findDnsRecord,
   getCloudflareConfig,
   isValidHostname,
+  requireTunnelHostname,
+  resolveIngressMode,
   type CfConfig,
 } from '../src/lib/cloudflare';
 
@@ -13,6 +16,14 @@ const CFG: CfConfig = {
   token: 'test-token',
   zoneId: 'zone123',
   ingressHostname: 'ingress.example.net',
+  tunnelHostname: null,
+};
+
+const TUNNEL_CFG: CfConfig = {
+  token: 'test-token',
+  zoneId: 'zone123',
+  ingressHostname: '',
+  tunnelHostname: 'abc123.cfargotunnel.com',
 };
 
 function mockFetchOnce(json: unknown, ok = true, status = 200) {
@@ -31,6 +42,7 @@ afterEach(() => {
   delete process.env.CLOUDFLARE_API_TOKEN;
   delete process.env.CLOUDFLARE_ZONE_ID;
   delete process.env.PUBLIC_INGRESS_HOSTNAME;
+  delete process.env.TUNNEL_INGRESS_HOSTNAME;
 });
 
 describe('isValidHostname', () => {
@@ -47,14 +59,75 @@ describe('isValidHostname', () => {
 });
 
 describe('getCloudflareConfig', () => {
-  it('returns null unless all three vars are set', () => {
+  it('returns null unless token + zone + at least one ingress hostname are set', () => {
     expect(getCloudflareConfig()).toBeNull();
     process.env.CLOUDFLARE_API_TOKEN = 't';
     expect(getCloudflareConfig()).toBeNull();
     process.env.CLOUDFLARE_ZONE_ID = 'z';
-    expect(getCloudflareConfig()).toBeNull();
+    expect(getCloudflareConfig()).toBeNull(); // no ingress hostname yet
     process.env.PUBLIC_INGRESS_HOSTNAME = 'i.example.net';
-    expect(getCloudflareConfig()).toEqual({ token: 't', zoneId: 'z', ingressHostname: 'i.example.net' });
+    expect(getCloudflareConfig()).toEqual({
+      token: 't', zoneId: 'z', ingressHostname: 'i.example.net', tunnelHostname: null,
+    });
+  });
+  it('works with only the tunnel hostname configured (no direct ingress)', () => {
+    process.env.CLOUDFLARE_API_TOKEN = 't';
+    process.env.CLOUDFLARE_ZONE_ID = 'z';
+    process.env.TUNNEL_INGRESS_HOSTNAME = 'abc123.cfargotunnel.com';
+    expect(getCloudflareConfig()).toEqual({
+      token: 't', zoneId: 'z', ingressHostname: '', tunnelHostname: 'abc123.cfargotunnel.com',
+    });
+  });
+});
+
+describe('resolveIngressMode (Phase 7)', () => {
+  it('defaults to tunnel when TUNNEL_INGRESS_HOSTNAME is set, else direct', () => {
+    expect(resolveIngressMode()).toBe('direct');
+    expect(resolveIngressMode(undefined)).toBe('direct');
+    expect(resolveIngressMode('')).toBe('direct');
+    process.env.TUNNEL_INGRESS_HOSTNAME = 'abc123.cfargotunnel.com';
+    expect(resolveIngressMode()).toBe('tunnel');
+  });
+  it('honors an explicit mode', () => {
+    expect(resolveIngressMode('tunnel')).toBe('tunnel');
+    expect(resolveIngressMode('direct')).toBe('direct');
+    // explicit direct wins even when tunnel is configured
+    process.env.TUNNEL_INGRESS_HOSTNAME = 'abc123.cfargotunnel.com';
+    expect(resolveIngressMode('direct')).toBe('direct');
+  });
+  it('rejects garbage with 400', () => {
+    try {
+      resolveIngressMode('cname-bomb');
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(HttpError);
+      expect(err).toMatchObject({ status: 400, code: 'bad_request' });
+    }
+  });
+});
+
+describe('requireTunnelHostname / cnameTargetFor (Phase 7)', () => {
+  it('tunnel mode resolves to the tunnel hostname', () => {
+    process.env.TUNNEL_INGRESS_HOSTNAME = 'abc123.cfargotunnel.com';
+    expect(cnameTargetFor(TUNNEL_CFG, 'tunnel')).toBe('abc123.cfargotunnel.com');
+    expect(requireTunnelHostname()).toBe('abc123.cfargotunnel.com');
+    expect(cnameTargetFor(CFG, 'direct')).toBe('ingress.example.net');
+  });
+  it('tunnel mode without TUNNEL_INGRESS_HOSTNAME is a 422 with a clear message', () => {
+    // env is unset here (afterEach clears it)
+    try {
+      requireTunnelHostname();
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(HttpError);
+      expect(err).toMatchObject({ status: 422 });
+      expect((err as Error).message).toContain('TUNNEL_INGRESS_HOSTNAME');
+    }
+  });
+  it('direct mode without PUBLIC_INGRESS_HOSTNAME is a 422', () => {
+    expect(() => cnameTargetFor(TUNNEL_CFG, 'direct')).toThrowError(
+      expect.objectContaining({ status: 422 }),
+    );
   });
 });
 
@@ -96,6 +169,35 @@ describe('ensureCnameRecord', () => {
       type: 'CNAME',
       name: 'api.example.com',
       content: 'ingress.example.net',
+      proxied: true,
+    });
+  });
+
+  it('creates the CNAME at the tunnel hostname in tunnel mode', async () => {
+    process.env.TUNNEL_INGRESS_HOSTNAME = 'abc123.cfargotunnel.com';
+    const getFn = vi.fn().mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({ success: true, result: [] }),
+    });
+    const postFn = vi.fn().mockResolvedValue({
+      ok: true, status: 200,
+      json: () => Promise.resolve({
+        success: true,
+        result: { id: 'recT', name: 'api.example.com', type: 'CNAME' },
+      }),
+    });
+    const fetchMock = vi.fn().mockImplementationOnce(getFn).mockImplementationOnce(postFn);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const id = await ensureCnameRecord(
+      TUNNEL_CFG, 'api.example.com', cnameTargetFor(TUNNEL_CFG, 'tunnel'));
+    expect(id).toBe('recT');
+    const [, postInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(postInit.body);
+    expect(body).toMatchObject({
+      type: 'CNAME',
+      name: 'api.example.com',
+      content: 'abc123.cfargotunnel.com',
       proxied: true,
     });
   });
