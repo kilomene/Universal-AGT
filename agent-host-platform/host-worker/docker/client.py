@@ -103,9 +103,14 @@ class DockerClient:
             memory: Optional[str] = None,
             cpus: Optional[str] = None,
             restart: str = "unless-stopped",
-            extra_args: Optional[list] = None,
             timeout: int = 120) -> str:
-        """docker run -d; returns the container id."""
+        """docker run -d; returns the container id.
+
+        NOTE (security, 2026-10-05): there is deliberately NO ``extra_args``
+        parameter. Caller-supplied docker flags were an argv-injection path
+        to host root (``--privileged``, ``-v /:/host``); they were removed
+        from the protocol and are rejected by policy before execution.
+        """
         name = sanitize_ident(name)
         argv = ["run", "-d", "--name", name]
         for host_port, container_port in (ports or {}).items():
@@ -118,7 +123,6 @@ class DockerClient:
             argv += ["--cpus", str(cpus)]
         if restart:
             argv += ["--restart", str(restart)]
-        argv += list(extra_args or [])
         argv += [image]
         return self._run(*argv, timeout=timeout).stdout.strip()
 
