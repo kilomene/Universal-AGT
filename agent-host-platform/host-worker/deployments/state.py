@@ -78,6 +78,14 @@ class DeploymentStore:
         states.sort(key=lambda s: s.get("created_at", ""), reverse=True)
         return states
 
+    def for_project(self, project_id: str) -> list:
+        """All deployments of a project, newest first."""
+        states = [
+            s for s in self.list_all()
+            if s.get("project_id") == project_id
+        ]
+        return states  # list_all is already newest-first
+
     def latest_for_project(self, project_id: str,
                            statuses: tuple = ("running",)) -> Optional[dict]:
         """Newest deployment of a project in one of the given statuses."""
