@@ -6,7 +6,14 @@ import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
+import {
+  TERMINAL_PORT_RELEASE_STATUSES,
+  releasePortAllocations,
+  releaseSupersededPortAllocations,
+} from '../lib/ports';
+import { decideRetryOutcome } from '../lib/retryPolicy';
 import { canTransitionTask, isTaskStatus, isTerminalTaskStatus } from '../lib/stateMachine';
+import { readTaskSweeperConfig } from '../lib/taskSweeper';
 import { requireHost } from '../middleware/auth';
 import { isUuid, publicHost } from './_helpers';
 
@@ -165,14 +172,21 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
 // Atomic claim: exactly one host gets a queued task (FOR UPDATE SKIP LOCKED).
 // ?wait=N (max 30): hold the request, polling every 1s, until work appears.
 // 204 when nothing is claimable within the window.
+//
+// The claim records a lease (claimed_at + TASK_CLAIM_LEASE_S, default 600s):
+// a task that stays in claimed/running past its lease with no progress
+// report is requeued by the stuck-task sweeper. Every progress report
+// refreshes the lease, so an actively-reporting worker is never swept.
 // ---------------------------------------------------------------------------
-async function tryClaim(pool: Pool, hostId: string) {
+async function tryClaim(pool: Pool, hostId: string, leaseS: number) {
   const { rows } = await pool.query(
     `UPDATE tasks SET
        status = 'claimed',
        claimed_by = $1,
        assigned_to = $1,
        attempts = attempts + 1,
+       lease_expires_at = now() + make_interval(secs => $2),
+       last_progress_at = now(),
        started_at = COALESCE(started_at, now())
      WHERE id = (
        SELECT id FROM tasks
@@ -182,7 +196,7 @@ async function tryClaim(pool: Pool, hostId: string) {
        FOR UPDATE SKIP LOCKED
      )
      RETURNING *`,
-    [hostId],
+    [hostId, leaseS],
   );
   return rows[0] ?? null;
 }
@@ -203,6 +217,7 @@ workerRouter.post('/tasks/claim', requireHost, async (req, res, next) => {
     wait = Math.min(Math.floor(wait), 30);
 
     const pool = getPool();
+    const leaseS = readTaskSweeperConfig().leaseS;
     const deadline = Date.now() + wait * 1000;
     let claimed: Record<string, unknown> | null = null;
     let clientGone = false;
@@ -210,7 +225,7 @@ workerRouter.post('/tasks/claim', requireHost, async (req, res, next) => {
       clientGone = true;
     });
     for (;;) {
-      claimed = await tryClaim(pool, hostId);
+      claimed = await tryClaim(pool, hostId, leaseS);
       if (claimed || clientGone) break;
       if (Date.now() >= deadline) break;
       await sleep(1000);
@@ -247,6 +262,7 @@ async function mirrorDeploymentState(
   task: Record<string, any>,
   nextStatus: string,
   actorName: string,
+  reportedResult?: Record<string, any> | null,
 ): Promise<void> {
   const payload = (task.payload ?? {}) as Record<string, any>;
   const deploymentId = payload.deployment_id;
@@ -256,7 +272,7 @@ async function mirrorDeploymentState(
   const deployment = rows[0];
   if (!deployment) return;
 
-  const isRollbackTask = task.type === 'deploy' && payload.rollback === true;
+  const isRollbackTask = task.type === 'rollback' || (task.type === 'deploy' && payload.rollback === true);
   const serviceEvent =
     task.type === 'restart' ? 'service.restarted' : task.type === 'stop' ? 'service.stopped' : task.type === 'start' ? 'service.started' : null;
 
@@ -264,8 +280,8 @@ async function mirrorDeploymentState(
   let depEvent: string | null = null;
   if (nextStatus === 'running') {
     if (['requested', 'approved'].includes(deployment.status)) {
-      depStatus = task.type === 'deploy' ? 'building' : deployment.status;
-      depEvent = task.type === 'deploy' ? (isRollbackTask ? null : 'deployment.started') : null;
+      depStatus = task.type === 'deploy' && !isRollbackTask ? 'building' : deployment.status;
+      depEvent = task.type === 'deploy' && !isRollbackTask ? 'deployment.started' : null;
     }
   } else if (nextStatus === 'completed') {
     if (isRollbackTask) {
@@ -274,13 +290,22 @@ async function mirrorDeploymentState(
     } else if (task.type === 'deploy') {
       depStatus = 'running';
       depEvent = 'deployment.completed';
+    } else if (task.type === 'remove') {
+      depStatus = 'stopped';
+      depEvent = 'service.removed';
     } else if (serviceEvent) {
       depStatus = task.type === 'stop' ? 'stopped' : 'running';
       depEvent = serviceEvent;
     }
   } else if (nextStatus === 'failed') {
-    depStatus = 'failed';
-    depEvent = task.type === 'deploy' && !isRollbackTask ? 'deployment.failed' : serviceEvent ? null : 'deployment.failed';
+    if (task.type === 'rollback') {
+      // A failed rollback leaves the deployment where it was; the failure
+      // is recorded as an event, not a deployment status.
+      depEvent = 'deployment.rollback_failed';
+    } else {
+      depStatus = 'failed';
+      depEvent = task.type === 'deploy' && !isRollbackTask ? 'deployment.failed' : serviceEvent ? null : 'deployment.failed';
+    }
   }
 
   if (depStatus) {
@@ -297,8 +322,39 @@ async function mirrorDeploymentState(
       task_id: task.id,
       deployment_id: deploymentId,
       host_id: task.claimed_by,
-      payload: { version: deployment.version },
+      payload:
+        depEvent === 'deployment.rolled_back'
+          ? { version: deployment.version, rolled_back_to: payload.target_deployment_id ?? null }
+          : { version: deployment.version },
     });
+  }
+
+  // The worker reports the real host->container port mapping in
+  // task.result.ports on a completed deploy — persist it on the deployment
+  // row (this is what the deployments.ports JSONB column is for).
+  if (
+    task.type === 'deploy' &&
+    !isRollbackTask &&
+    nextStatus === 'completed' &&
+    reportedResult &&
+    typeof reportedResult === 'object' &&
+    reportedResult.ports &&
+    typeof reportedResult.ports === 'object'
+  ) {
+    await pool.query('UPDATE deployments SET ports = $2 WHERE id = $1', [
+      deploymentId,
+      JSON.stringify(reportedResult.ports),
+    ]);
+  }
+
+  // Port registry lifecycle: release this deployment's reservations when it
+  // reaches a terminal state; when a deploy reaches `running`, older
+  // deployments of the same project+host are superseded — free their ports.
+  if (depStatus && TERMINAL_PORT_RELEASE_STATUSES.has(depStatus)) {
+    await releasePortAllocations(pool, deploymentId);
+  }
+  if (task.type === 'deploy' && !isRollbackTask && nextStatus === 'completed') {
+    await releaseSupersededPortAllocations(pool, deployment.project_id, deployment.host_id, deploymentId);
   }
 }
 
@@ -338,8 +394,24 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
       sendError(res, 403, 'forbidden', 'only the claiming host may report progress on this task');
       return;
     }
-    if (!canTransitionTask(task.status, status)) {
-      sendError(res, 409, 'conflict', `cannot transition task from ${task.status} to ${status}`);
+
+    // A worker-reported `failed` is not necessarily terminal: the retry
+    // policy may park the task in `retrying` (the stuck-task sweeper later
+    // returns it to `queued`) when the budget allows and the task type is
+    // safe to re-run from where it failed.
+    let finalStatus = status;
+    if (status === 'failed') {
+      const outcome = decideRetryOutcome({
+        type: task.type,
+        failedFrom: task.status,
+        attempts: task.attempts,
+        maxAttempts: task.max_attempts,
+      });
+      if (outcome === 'retry') finalStatus = 'retrying';
+    }
+
+    if (!canTransitionTask(task.status, finalStatus)) {
+      sendError(res, 409, 'conflict', `cannot transition task from ${task.status} to ${finalStatus}`);
       return;
     }
 
@@ -349,7 +421,8 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
       await appendFile(join(dir, `${taskId}.log`), log_chunk, 'utf8');
     }
 
-    const terminal = isTerminalTaskStatus(status);
+    const terminal = isTerminalTaskStatus(finalStatus);
+    const leaseS = readTaskSweeperConfig().leaseS;
     const updated = (
       await pool.query(
         `UPDATE tasks SET
@@ -357,14 +430,17 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
            result = COALESCE($3, result),
            error = COALESCE($4, error),
            started_at = CASE WHEN $2 = 'running' AND started_at IS NULL THEN now() ELSE started_at END,
-           completed_at = CASE WHEN $5 THEN now() ELSE completed_at END
+           completed_at = CASE WHEN $5 THEN now() ELSE completed_at END,
+           last_progress_at = now(),
+           lease_expires_at = CASE WHEN $5 THEN NULL ELSE now() + make_interval(secs => $6) END
          WHERE id = $1 RETURNING *`,
         [
           taskId,
-          status,
+          finalStatus,
           result !== undefined ? JSON.stringify(result) : null,
           error !== undefined ? error : null,
           terminal,
+          leaseS,
         ],
       )
     ).rows[0];
@@ -374,19 +450,31 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
       awaiting_approval: 'task.awaiting_approval',
       completed: 'task.completed',
       failed: 'task.failed',
+      retrying: 'task.retrying',
     };
-    if (eventFor[status]) {
+    if (eventFor[finalStatus]) {
       await appendEvent(pool, {
-        type: eventFor[status],
+        type: eventFor[finalStatus],
         actor_type: 'host',
         actor_id: req.auth!.name,
         task_id: taskId,
         host_id: task.claimed_by,
-        payload: status === 'failed' ? { error: error ?? null } : {},
+        payload:
+          finalStatus === 'failed'
+            ? { error: error ?? null }
+            : finalStatus === 'retrying'
+              ? { error: error ?? null, attempts: updated.attempts, max_attempts: updated.max_attempts }
+              : {},
       });
     }
 
-    await mirrorDeploymentState(pool, task, status, req.auth!.name);
+    await mirrorDeploymentState(
+      pool,
+      task,
+      finalStatus,
+      req.auth!.name,
+      typeof result === 'object' && result !== null && !Array.isArray(result) ? result : null,
+    );
 
     res.json({ task: updated });
   } catch (err) {
