@@ -132,6 +132,77 @@ export class UahtClient {
     return this._post(`/tasks/${id}/reject`, {});
   }
 
+  /** Extract the log text from a logs task row (§5: result = {logs: "..."}). */
+  static _logsText(task) {
+    const result = task && task.result;
+    if (typeof result === "string") return result;
+    if (result && typeof result.logs === "string") return result.logs;
+    return "";
+  }
+
+  /**
+   * Create a `logs` task for a deployment (or poll an existing logs task)
+   * until it reaches a terminal state, then return the log text.
+   * Mirrors the CLI `logs` command.
+   *
+   * With `follow: true` returns an async generator that yields each new log
+   * chunk as it arrives (like `logs --follow`) until the task terminates.
+   *
+   * @param {{deploymentId?: string, taskId?: string, follow?: boolean,
+   *          pollIntervalMs?: number, timeoutMs?: number}} opts
+   * @returns {Promise<string> | AsyncGenerator<string>}
+   */
+  async getLogs({ deploymentId, taskId, follow = false, pollIntervalMs = 3000, timeoutMs = 600000 } = {}) {
+    const task = await this._resolveLogsTask({ deploymentId, taskId });
+    if (follow) return this._tailLogs(task, { pollIntervalMs });
+    const terminal = new Set(["completed", "failed", "cancelled"]);
+    const started = Date.now();
+    let current = task;
+    for (;;) {
+      const cur = await this.getTask(current.id);
+      current = cur.task || cur;
+      if (terminal.has(current.status)) break;
+      if (Date.now() - started > timeoutMs) {
+        throw new UahtError("timeout", `logs task ${current.id} did not finish within ${timeoutMs}ms`);
+      }
+      await sleep(pollIntervalMs);
+    }
+    return UahtClient._logsText(current);
+  }
+
+  /** Resolve deploymentId -> new logs task, or taskId -> the task itself. */
+  async _resolveLogsTask({ deploymentId, taskId }) {
+    if (!deploymentId && !taskId) {
+      throw new TypeError("deploymentId or taskId is required");
+    }
+    if (taskId) {
+      const cur = await this.getTask(taskId);
+      return cur.task || cur;
+    }
+    const created = await this.createTask({ type: "logs", payload: { deployment_id: deploymentId } });
+    return created.task || created;
+  }
+
+  /** Async generator of incremental log chunks until the task terminates.
+   * The already-fetched task is processed first so its current logs are
+   * yielded before the first re-poll. */
+  async *_tailLogs(task, { pollIntervalMs = 2000 } = {}) {
+    const terminal = new Set(["completed", "failed", "cancelled"]);
+    let lastLen = 0;
+    for (;;) {
+      const logs = UahtClient._logsText(task);
+      const chunk = logs.slice(lastLen);
+      if (chunk) {
+        yield chunk;
+        lastLen = logs.length;
+      }
+      if (terminal.has(task.status)) break;
+      await sleep(pollIntervalMs);
+      const cur = await this.getTask(task.id);
+      task = cur.task || cur;
+    }
+  }
+
   // ---- §3.4 Hosts ----
   listHosts() {
     return this._get("/hosts");
@@ -167,7 +238,8 @@ export class UahtClient {
    */
   async initArtifact({ project_id, filePath, version, filename }) {
     const st = await stat(filePath);
-    const name = filename || filePath.split("/").pop();
+    // Split on both separators so Windows-style paths resolve correctly.
+    const name = filename || filePath.split(/[\\/]/).pop();
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(filePath)) hash.update(chunk);
     const checksum = `sha256:${hash.digest("hex")}`;
@@ -303,9 +375,16 @@ export class UahtClient {
    * Implements SSE parsing on the fetch reader — no extra dependency.
    * Yields parsed event objects; stops when the consumer breaks or the
    * optional `signal` aborts.
+   *
+   * `since` (ISO-8601) and `limit` are appended as query parameters;
+   * the server replays the last `limit` events before live-pushing.
    */
-  async *streamEvents({ since, signal } = {}) {
-    const res = await this.fetch(`${this.baseUrl}/v1/events/stream`, {
+  async *streamEvents({ since, limit, signal } = {}) {
+    const qs = new URLSearchParams();
+    if (since) qs.set("since", String(since));
+    if (limit !== undefined && limit !== null) qs.set("limit", String(limit));
+    const s = qs.toString();
+    const res = await this.fetch(`${this.baseUrl}/v1/events/stream${s ? `?${s}` : ""}`, {
       method: "GET",
       headers: this._headers({ Accept: "text/event-stream" }),
       signal,
