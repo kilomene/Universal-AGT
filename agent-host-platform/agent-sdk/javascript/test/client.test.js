@@ -341,3 +341,141 @@ describe("domains (§3.10)", () => {
     assert.deepEqual(JSON.parse(opts.body), { deployment_id: "d-1", hostname: "api.example.com" });
   });
 });
+
+describe("getLogs", () => {
+  it("creates a logs task and polls it to terminal, returning the log text", async () => {
+    const states = [
+      { task: { id: "t-9", status: "running", result: { logs: "line1\n" } } },
+      { task: { id: "t-9", status: "completed", result: { logs: "line1\nline2\n" } } },
+    ];
+    let polls = 0;
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: async (url, opts) => {
+        calls.push({ url, opts });
+        if (url === "https://cp.example.com/v1/tasks" && opts.method === "POST") {
+          assert.deepEqual(JSON.parse(opts.body).payload, { deployment_id: "d-1" });
+          assert.equal(JSON.parse(opts.body).type, "logs");
+          return jsonResponse(201, { task: { id: "t-9", status: "queued" } });
+        }
+        if (url === "https://cp.example.com/v1/tasks/t-9")
+          return jsonResponse(200, states[Math.min(polls++, states.length - 1)]);
+        throw new Error(`unexpected ${url}`);
+      },
+    });
+    const logs = await client.getLogs({ deploymentId: "d-1", pollIntervalMs: 1 });
+    assert.equal(logs, "line1\nline2\n");
+    assert.ok(polls >= 2);
+  });
+
+  it("polls an existing task id directly", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, {
+        task: { id: "t-7", status: "completed", result: { logs: "boot ok" } },
+      })),
+    });
+    const logs = await client.getLogs({ taskId: "t-7", pollIntervalMs: 1 });
+    assert.equal(logs, "boot ok");
+    assert.equal(calls[0].url, "https://cp.example.com/v1/tasks/t-7");
+  });
+
+  it("requires deploymentId or taskId", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, {})),
+    });
+    await assert.rejects(() => client.getLogs(), TypeError);
+  });
+
+  it("follow mode yields incremental chunks until the task terminates", async () => {
+    const states = [
+      { task: { id: "t-8", status: "running", result: { logs: "a" } } },
+      { task: { id: "t-8", status: "running", result: { logs: "ab" } } },
+      { task: { id: "t-8", status: "completed", result: { logs: "abc" } } },
+    ];
+    let polls = 0;
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: async (url) => {
+        if (url === "https://cp.example.com/v1/tasks/t-8")
+          return jsonResponse(200, states[Math.min(polls++, states.length - 1)]);
+        throw new Error(`unexpected ${url}`);
+      },
+    });
+    const chunks = [];
+    for await (const chunk of await client.getLogs({ taskId: "t-8", follow: true, pollIntervalMs: 1 }))
+      chunks.push(chunk);
+    assert.deepEqual(chunks, ["a", "b", "c"]);
+  });
+
+  it("times out when the task never reaches a terminal state", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { task: { id: "t-6", status: "running", result: {} } })),
+    });
+    await assert.rejects(
+      () => client.getLogs({ taskId: "t-6", pollIntervalMs: 1, timeoutMs: 10 }),
+      (err) => err instanceof UahtError && err.code === "timeout"
+    );
+  });
+});
+
+describe("initArtifact basename", () => {
+  it("resolves Windows-style paths (backslashes) to a bare filename", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    // On POSIX a backslash is a legal filename char, so this exercises the
+    // split-on-both-separators logic with a real stat-able file.
+    const dir = mkdtempSync(join(tmpdir(), "uaht-"));
+    const weird = join(dir, "some\\dir\\app.tar.gz");
+    writeFileSync(weird, "bytes");
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(201, { artifact: { id: "a1" }, upload_url: "/v1/artifacts/a1/content" })),
+    });
+    await client.initArtifact({ project_id: "p1", filePath: weird, version: "1.0.0" });
+    const body = JSON.parse(calls[0].opts.body);
+    assert.equal(body.filename, "app.tar.gz");
+  });
+});
+
+describe("streamEvents query params", () => {
+  it("appends since and limit to the stream URL", async () => {
+    const stream = new ReadableStream({ start(c) { c.close(); } });
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: async (url, opts) => {
+        calls.push({ url, opts });
+        return { ok: true, status: 200, body: stream };
+      },
+    });
+    for await (const _ of client.streamEvents({ since: "2026-10-05T00:00:00Z", limit: 25 })) { /* drain */ }
+    const { url, opts } = calls[0];
+    assert.ok(url.startsWith("https://cp.example.com/v1/events/stream?"));
+    assert.ok(url.includes("since=2026-10-05T00%3A00%3A00Z"));
+    assert.ok(url.includes("limit=25"));
+    assert.equal(opts.headers.Accept, "text/event-stream");
+  });
+
+  it("omits the query string when since/limit are not given", async () => {
+    const stream = new ReadableStream({ start(c) { c.close(); } });
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: async (url) => {
+        assert.equal(url, "https://cp.example.com/v1/events/stream");
+        return { ok: true, status: 200, body: stream };
+      },
+    });
+    for await (const _ of client.streamEvents()) { /* drain */ }
+  });
+});
