@@ -625,10 +625,12 @@ def handle_artifact_upload(ctx, task: dict) -> dict:
 # ingress-sync
 # ---------------------------------------------------------------------------
 def handle_ingress_sync(ctx, task: dict) -> dict:
-    """Rebuild the ingress provider's route table from the current
+    """Refresh the ingress provider's local route mirror from the current
     deployments' domains (see ingress/sync.py). Payload is empty — the
     sync pulls current state from the control plane and the local
     deployment store. Safe to re-run: it reconciles to the desired state.
+    Note: this updates the non-authoritative local mirror only — routing
+    for token-based tunnels is controlled remotely by the control plane.
     """
     task_id = _task_id(task)
     result = ingress_sync.sync_ingress(ctx)
