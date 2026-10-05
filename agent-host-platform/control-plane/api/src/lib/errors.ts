@@ -9,6 +9,7 @@ export type ErrorCode =
   | 'conflict'
   | 'unprocessable'
   | 'rate_limited'
+  | 'bad_gateway'
   | 'internal';
 
 export function sendError(res: Response, status: number, code: ErrorCode, message: string): void {
