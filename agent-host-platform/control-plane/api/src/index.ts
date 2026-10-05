@@ -10,6 +10,7 @@ import { logger } from './lib/log';
 import { agentsRouter } from './routes/agents';
 import { artifactsRouter, uploadArtifactContent } from './routes/artifacts';
 import { deploymentsRouter } from './routes/deployments';
+import { domainsRouter } from './routes/domains';
 import { eventsRouter } from './routes/events';
 import { healthRouter } from './routes/health';
 import { hostsRouter } from './routes/hosts';
@@ -72,6 +73,7 @@ export function createApp(): express.Express {
   v1.use('/projects', projectsRouter);
   v1.use('/artifacts', artifactsRouter);
   v1.use('/deployments', deploymentsRouter);
+  v1.use('/domains', domainsRouter);
   v1.use('/services', servicesRouter);
   v1.use('/events', eventsRouter);
   app.use('/v1', v1);
