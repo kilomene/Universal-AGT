@@ -315,6 +315,19 @@ describe("domains (§3.10)", () => {
     assert.equal(out.domain.status, "dns_pending");
   });
 
+  it("addDomain passes the optional ingress mode (Phase 7)", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(201, { domain: { hostname: "api.example.com", status: "active", ingress: "tunnel" } })),
+    });
+    const out = await client.addDomain("d-1", "api.example.com", "tunnel");
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/domains");
+    assert.deepEqual(JSON.parse(opts.body), { deployment_id: "d-1", hostname: "api.example.com", ingress: "tunnel" });
+    assert.equal(out.domain.ingress, "tunnel");
+  });
+
   it("listDomains GETs /v1/domains?deployment_id=", async () => {
     const client = new UahtClient({
       baseUrl: "https://cp.example.com",
