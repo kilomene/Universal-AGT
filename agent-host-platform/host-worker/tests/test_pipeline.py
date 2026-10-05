@@ -33,6 +33,7 @@ class FakeDockerClient:
         self.start_calls = []
         self.stop_calls = []
         self.rm_calls = []
+        self.ps_rows = []        # injected `docker ps` rows for port checks
 
     def _record(self, name, *args):
         self.calls.append((name, args))
@@ -83,6 +84,10 @@ class FakeDockerClient:
     def logs(self, name, tail=500):
         self._record("logs", name)
         return "fake logs\n"
+
+    def ps(self, all=False):
+        self._record("ps", all)
+        return list(self.ps_rows)
 
     def inspect(self, name):
         self._record("inspect", name)
@@ -189,10 +194,12 @@ def test_healthcheck_failure_restores_previous_version(tmp_path, monkeypatch):
     with pytest.raises(pipeline.DeployError, match="healthcheck failed"):
         pipeline.deploy(ctx, _deploy_task())
 
-    # new container was started, then stopped + removed
+    # new container was started, then stopped + removed. Its name is unique
+    # per deployment attempt (deployment_id suffix), so it never collides
+    # with the live container of the same version.
     assert len(docker.run_calls) == 1
     new_name = docker.run_calls[0]["name"]
-    assert new_name == "uaht-my-api-2.0.0"
+    assert new_name == "uaht-my-api-2.0.0-depv2"
     assert new_name in docker.stop_calls
     assert new_name in docker.rm_calls
     assert new_name not in docker.containers
@@ -312,3 +319,150 @@ def test_successful_deploy_marks_running(tmp_path, monkeypatch):
     # secrets never persisted to the state file
     new_state = ctx.deployment_store.load("dep-v2")
     assert "API_KEY" not in str(new_state.get("env"))
+
+
+# ---------------------------------------------------------------------------
+# Same-version redeploy: the new container gets a unique name per attempt,
+# so the live container of the same version survives until health passes.
+# ---------------------------------------------------------------------------
+def _seed_same_version_previous(ctx):
+    old_name = "uaht-my-api-2.0.0-depv2a"  # an earlier attempt's container
+    ctx.deployment_store.save({
+        "deployment_id": "dep-v2a",
+        "task_id": "task-0",
+        "project_id": "proj-1",
+        "project_name": "my-api",
+        "version": "2.0.0",
+        "container_name": old_name,
+        "image": "img:2.0.0",
+        "runtime": "docker",
+        "host_port": 18001,
+        "container_port": 3000,
+        "healthcheck_path": "/health",
+        "env": {"NODE_ENV": "production"},
+        "status": "running",
+        "health_status": "healthy",
+        "created_at": "2026-10-01T00:00:00Z",
+    })
+    return old_name
+
+
+def test_same_version_redeploy_keeps_old_container_until_health_passes(tmp_path, monkeypatch):
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(b""))
+    old_name = _seed_same_version_previous(ctx)
+    docker.containers[old_name] = {"image": "img:2.0.0", "running": True}
+
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+
+    result = pipeline.deploy(ctx, _deploy_task())  # same version 2.0.0, new attempt dep-v2
+
+    new_name = docker.run_calls[0]["name"]
+    assert new_name == "uaht-my-api-2.0.0-depv2"
+    assert new_name != old_name
+    # the live container was never removed (no downtime before health passed)
+    assert old_name not in docker.rm_calls
+    assert old_name in docker.containers
+    # ...then stopped (kept, not removed) once the new one passed health
+    assert old_name in docker.stop_calls
+    # state.json records the ACTUAL container name (reconcile reads this)
+    new_state = ctx.deployment_store.load("dep-v2")
+    assert new_state["container_name"] == new_name
+    assert result["status"] == "running"
+
+
+def test_same_version_redeploy_failed_health_keeps_old_running(tmp_path, monkeypatch):
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(b""))
+    old_name = _seed_same_version_previous(ctx)
+    docker.containers[old_name] = {"image": "img:2.0.0", "running": True}
+
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: False)
+
+    with pytest.raises(pipeline.DeployError, match="healthcheck failed"):
+        pipeline.deploy(ctx, _deploy_task())
+
+    # the old container of the same version was never touched by the failed attempt
+    assert old_name not in docker.stop_calls
+    assert old_name not in docker.rm_calls
+    assert docker.containers[old_name]["running"] is True
+
+
+# ---------------------------------------------------------------------------
+# Port verification: OS-level bind test + docker ps published-port scan,
+# run before every `docker run`. Collisions fail the task with a clear error.
+# ---------------------------------------------------------------------------
+def test_published_host_ports_parses_ps_cells():
+    assert pipeline.published_host_ports("0.0.0.0:8080->3000/tcp") == [8080]
+    assert pipeline.published_host_ports("0.0.0.0:8080->3000/tcp, :::8080->3000/tcp") == [8080, 8080]
+    assert pipeline.published_host_ports(":::9090->90/tcp") == [9090]
+    assert pipeline.published_host_ports("") == []
+    assert pipeline.published_host_ports(None) == []
+
+
+def test_verify_host_port_free_passes_on_free_port(tmp_path):
+    import socket as _socket
+    docker = FakeDockerClient()
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        free = s.getsockname()[1]
+    # socket closed again -> port free
+    pipeline.verify_host_port_free(docker, free)  # must not raise
+
+
+def test_verify_host_port_free_fails_on_os_bind_collision():
+    import socket as _socket
+    docker = FakeDockerClient()
+    holder = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    taken = holder.getsockname()[1]
+    try:
+        with pytest.raises(pipeline.DeployError, match="already in use"):
+            pipeline.verify_host_port_free(docker, taken)
+    finally:
+        holder.close()
+
+
+def test_verify_host_port_free_fails_on_docker_published_port(tmp_path):
+    import socket as _socket
+    docker = FakeDockerClient()
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        free = s.getsockname()[1]
+    docker.ps_rows = [{"Names": "/some-other-app", "Ports": f"0.0.0.0:{free}->3000/tcp"}]
+    with pytest.raises(pipeline.DeployError, match="already published"):
+        pipeline.verify_host_port_free(docker, free)
+
+
+def _grab_free_port():
+    import socket as _socket
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_requested_host_port_used_after_verification(tmp_path, monkeypatch):
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(b""))
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    wanted = _grab_free_port()
+    result = pipeline.deploy(ctx, _deploy_task(requested_host_port=wanted))
+    assert docker.run_calls[0]["ports"] == {wanted: 3000}
+    assert result["ports"] == {str(wanted): 3000}
+
+
+def test_requested_host_port_collision_fails_before_docker_run(tmp_path, monkeypatch):
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(b""))
+    wanted = _grab_free_port()
+    docker.ps_rows = [{"Names": "/some-other-app",
+                       "Ports": f"0.0.0.0:{wanted}->3000/tcp"}]
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    with pytest.raises(pipeline.DeployError, match="already published"):
+        pipeline.deploy(ctx, _deploy_task(requested_host_port=wanted))
+    # no container was ever started for the colliding port
+    assert docker.run_calls == []
