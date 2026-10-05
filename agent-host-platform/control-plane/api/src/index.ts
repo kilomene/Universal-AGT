@@ -22,6 +22,7 @@ import { tasksRouter } from './routes/tasks';
 import { workerRouter } from './routes/worker';
 import { apiErrorHandler, attachAuth, requireAgent, requirePermission } from './middleware/auth';
 import { rateLimit } from './middleware/rateLimit';
+import { validateStartupConfig } from './lib/config';
 
 function repoRoot(): string {
   // dist layout: <repo>/agent-host-platform/control-plane/api/dist
@@ -100,18 +101,19 @@ export function createApp(): express.Express {
 }
 
 async function main(): Promise<void> {
-  // Security (2026-10-05): agent registration is gated by UAHT_PROVISIONING_TOKEN.
-  // In production the token is required at startup — fail fast rather than
-  // boot with an open bootstrap window. Outside production, an unset token
-  // only permits the very first agent registration (bootstrap mode).
-  if (process.env.NODE_ENV === 'production' && !process.env.UAHT_PROVISIONING_TOKEN) {
-    logger.error('refusing to start: UAHT_PROVISIONING_TOKEN is not set (required in production)');
+  // Startup configuration (2026-10-05, W3): fail fast on missing production
+  // secrets/config. Development (NODE_ENV=development) relaxes
+  // UAHT_PROVISIONING_TOKEN only (bootstrap mode); production — the default
+  // when NODE_ENV is unset — is strict. No insecure fallbacks in any mode.
+  try {
+    const { relaxed } = validateStartupConfig();
+    for (const note of relaxed) {
+      logger.warn(`startup check relaxed (development mode): ${note}`);
+    }
+    logger.info('startup configuration validated');
+  } catch (err) {
+    logger.error('startup configuration invalid', { err: String(err) });
     process.exit(1);
-  }
-  if (!process.env.UAHT_PROVISIONING_TOKEN) {
-    logger.warn(
-      'UAHT_PROVISIONING_TOKEN is not set: agent registration is open only until the first agent registers (bootstrap mode)',
-    );
   }
   const pool = getPool();
   const applied = await runMigrations(pool);
