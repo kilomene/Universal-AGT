@@ -299,3 +299,45 @@ describe("artifact upload headers", () => {
     assert.equal(opts.headers.Authorization, "Bearer k");
   });
 });
+
+describe("domains (§3.10)", () => {
+  it("addDomain POSTs deployment_id + hostname to /v1/domains", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(201, { domain: { hostname: "api.example.com", status: "dns_pending" } })),
+    });
+    const out = await client.addDomain("d-1", "api.example.com");
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/domains");
+    assert.equal(opts.method, "POST");
+    assert.deepEqual(JSON.parse(opts.body), { deployment_id: "d-1", hostname: "api.example.com" });
+    assert.equal(out.domain.status, "dns_pending");
+  });
+
+  it("listDomains GETs /v1/domains?deployment_id=", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { domains: [] })),
+    });
+    await client.listDomains("d-1");
+    const { url, opts } = calls[0];
+    assert.ok(url.includes("/v1/domains?"));
+    assert.ok(url.includes("deployment_id=d-1"));
+    assert.equal(opts.method, "GET");
+  });
+
+  it("removeDomain DELETEs /v1/domains with a JSON body", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(200, { removed: "api.example.com" })),
+    });
+    await client.removeDomain("d-1", "api.example.com");
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/domains");
+    assert.equal(opts.method, "DELETE");
+    assert.deepEqual(JSON.parse(opts.body), { deployment_id: "d-1", hostname: "api.example.com" });
+  });
+});
