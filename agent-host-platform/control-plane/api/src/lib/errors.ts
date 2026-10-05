@@ -8,6 +8,7 @@ export type ErrorCode =
   | 'not_found'
   | 'conflict'
   | 'unprocessable'
+  | 'payload_too_large'
   | 'rate_limited'
   | 'bad_gateway'
   | 'internal';
