@@ -31,7 +31,9 @@ export const TASK_TYPES = [
   'system-info',
 ] as const;
 
-function permissionForTaskType(type: string): string {
+// Exported for the security test-suite: every type in TASK_TYPES must map
+// to an explicit permission here, and unknown types must stay closed.
+export function permissionForTaskType(type: string): string {
   // Per-type permission map (PROTOCOL §3.2, tightened 2026-10-05 — see the
   // PROTOCOL changelog). Mutating a deployment needs the matching service
   // permission; creating build/run work needs deploy; reads need read_status.
