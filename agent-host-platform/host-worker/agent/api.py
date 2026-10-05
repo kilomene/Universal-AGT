@@ -220,3 +220,16 @@ class ControlPlaneClient:
         body = resp.json()
         secrets = (body or {}).get("secrets")
         return secrets if isinstance(secrets, dict) else {}
+
+    # -- §3.10 ingress ----------------------------------------------------
+    def list_host_domains(self) -> dict:
+        """List domain entries on this host's live deployments
+        (GET /v1/worker/domains, host token). Used by the ingress route
+        sync to map hostnames -> local container ports."""
+        resp = self.session.get(
+            self._url("/v1/worker/domains"),
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            self._raise(resp, "host domains")
+        return resp.json()
