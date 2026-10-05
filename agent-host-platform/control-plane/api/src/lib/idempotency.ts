@@ -28,12 +28,15 @@ export function taskIdempotencyBody(input: { type: string; payload: unknown }): 
 
 // The "body" compared for deployment idempotency: the requested deployment
 // parameters (dedupes across BOTH the deployment row and its deploy task).
+// host_port lives in the port registry, not on the deployment row — callers
+// pass it explicitly (null when no fixed port was requested).
 export function deploymentIdempotencyBody(input: {
   project_id: string;
   host_id?: string | null;
   version: string;
   artifact_id?: string | null;
   mode?: string;
+  host_port?: number | null;
 }): unknown {
   return {
     project_id: input.project_id,
@@ -41,6 +44,7 @@ export function deploymentIdempotencyBody(input: {
     version: input.version,
     artifact_id: input.artifact_id ?? null,
     mode: input.mode ?? 'automatic',
+    host_port: input.host_port ?? null,
   };
 }
 
