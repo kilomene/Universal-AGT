@@ -2,7 +2,7 @@
 
 Covers:
   * IngressConfig validation (disabled by default; bad provider rejected;
-    cloudflare-tunnel without a token -> clear error naming UAHT_TUNNEL_TOKEN)
+    cloudflare-tunnel without a token -> clear error naming WORKER_TUNNEL_TOKEN)
   * build_routes(): hostname -> 127.0.0.1:port mapping from fake deployment
     states + domain entries, with skip reasons
   * render_cloudflared_config(): exact config.yml rendering
@@ -71,7 +71,7 @@ def test_missing_token_clear_error():
     with pytest.raises(ConfigError) as excinfo:
         cfg.validate()
     msg = str(excinfo.value)
-    assert "UAHT_TUNNEL_TOKEN" in msg
+    assert "WORKER_TUNNEL_TOKEN" in msg
     assert "tunnel token" in msg.lower()
 
 
@@ -444,7 +444,7 @@ def test_cloudflared_setup_requires_token(tmp_path):
                         tunnel_token="", work_dir=str(tmp_path))
     with pytest.raises(ConfigError) as excinfo:
         p.setup(cfg)
-    assert "UAHT_TUNNEL_TOKEN" in str(excinfo.value)
+    assert "WORKER_TUNNEL_TOKEN" in str(excinfo.value)
 
 
 def test_build_ingress_config_from_worker_config():
