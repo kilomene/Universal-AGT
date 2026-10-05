@@ -13,6 +13,10 @@ Startup:
   5. claim loop: POST /v1/worker/tasks/claim?wait=POLL_WAIT, dispatch each
      claimed task in a small thread pool, repeat forever (claim failures
      back off exponentially with jitter)
+  6. (optional) public ingress: when WORKER_INGRESS_ENABLED=true, start the
+     configured ingress provider (e.g. a supervised cloudflared tunnel —
+     outbound-only) and sync tunnel routes after deploys/removes that
+     carry domains
 
 The worker is OUTBOUND ONLY: it opens HTTPS connections to the control
 plane and never listens on any port. SIGTERM/SIGINT shut it down cleanly.
@@ -39,6 +43,7 @@ from deployments.state import DeploymentStore
 from docker.client import DockerClient, DockerMissing
 from executor.dispatcher import TaskDispatcher
 from health import collector as health_collector
+from ingress import IngressError, build_ingress_config, get_provider
 from logs.store import LogStore
 from updater import self_update
 
@@ -272,6 +277,27 @@ def main(argv=None) -> int:
 
     ctx = build_context(config)
 
+    # Public ingress (Phase 7): optional, disabled by default. When enabled,
+    # start the configured provider (e.g. a supervised cloudflared tunnel —
+    # outbound-only: the host dials out, nothing listens inbound). A setup
+    # failure logs clearly and leaves ingress disabled; the worker keeps
+    # running its deployment duties.
+    ingress_cfg = build_ingress_config(config)
+    provider = None
+    if ingress_cfg.enabled:
+        try:
+            ingress_cfg.validate()
+            provider = get_provider(ingress_cfg.provider)
+            provider.setup(ingress_cfg)
+            provider.start()
+            LOG.info("ingress provider %s started", provider.name)
+        except (ConfigError, IngressError) as exc:
+            LOG.error("ingress disabled: %s", exc)
+            provider = None
+    else:
+        LOG.info("ingress disabled (set WORKER_INGRESS_ENABLED=true to enable)")
+    ctx.ingress = provider
+
     # Boot marker for the self-update post-restart health gate: the updater
     # polls this file after `systemctl restart` to confirm the NEW version
     # came up (version + fresh boot timestamp).
@@ -302,6 +328,11 @@ def main(argv=None) -> int:
         claim_loop(ctx, stop_event)
     finally:
         stop_event.set()
+        if provider is not None:
+            try:
+                provider.shutdown()
+            except Exception:
+                LOG.exception("error shutting down ingress provider")
     LOG.info("host worker stopped")
     return 0
 
