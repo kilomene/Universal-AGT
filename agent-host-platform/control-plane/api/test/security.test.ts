@@ -22,8 +22,9 @@ import { createApp } from '../src/index';
 import { checkRegistrationAccess } from '../src/routes/agents';
 import { artifactMaxBytes } from '../src/routes/artifacts';
 import { permissionForTaskType, TASK_TYPES } from '../src/routes/tasks';
+import { PERMISSIONS } from '../src/middleware/auth';
 import { rateLimit, resetRateLimitBucketsForTests } from '../src/middleware/rateLimit';
-import { generateAgentKey, generateHostToken } from '../src/lib/tokens';
+import { generateAgentKey, generateHostToken, sha256Hex } from '../src/lib/tokens';
 import { encryptSecret } from '../src/lib/secrets';
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,10 @@ function setupDb() {
     name: 'test_gen_id',
     args: [],
     returns: 'text',
+    // impure: a fresh id on every call, like gen_random_uuid() in production
+    // (pg-mem memoizes pure function results, which would hand every
+    // default-id insert the same 'row-1').
+    impure: true,
     implementation: () => `row-${++n}`,
   });
   // pg-mem mangles Buffer query PARAMETERS on the bytea path (bytes do not
@@ -64,6 +69,7 @@ function setupDb() {
       status TEXT NOT NULL DEFAULT 'online',
       capabilities JSONB, worker_version TEXT,
       token_hash TEXT NOT NULL,
+      previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
       cpu_pct DOUBLE PRECISION, ram_pct DOUBLE PRECISION,
       disk_pct DOUBLE PRECISION, docker_status TEXT,
       running_apps JSONB, total_cpu DOUBLE PRECISION,
@@ -79,7 +85,7 @@ function setupDb() {
       version TEXT, status TEXT NOT NULL DEFAULT 'pending'
     );
     CREATE TABLE tasks (
-      id TEXT PRIMARY KEY, type TEXT NOT NULL,
+      id TEXT PRIMARY KEY DEFAULT test_gen_id(), type TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'queued',
       idempotency_key TEXT,
       created_by TEXT, assigned_to TEXT, claimed_by TEXT,
@@ -107,7 +113,8 @@ function setupDb() {
       project_id TEXT NOT NULL, name TEXT NOT NULL,
       encrypted_value BYTEA NOT NULL,
       created_at TIMESTAMPTZ DEFAULT now(),
-      updated_at TIMESTAMPTZ DEFAULT now()
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (project_id, name)
     );
   `);
   const pg = db.adapters.createPg();
@@ -122,6 +129,7 @@ const H2 = '44444444-4444-4444-4444-444444444444';
 const P1 = '55555555-5555-5555-5555-555555555555';
 const ART1 = '66666666-6666-6666-6666-666666666666';
 const T1 = '77777777-7777-7777-7777-777777777777';
+const D1 = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 
 let base = '';
 
@@ -150,7 +158,7 @@ let artifactDir = '';
 // Env keys individual tests may mutate; saved/restored around each test so
 // one test's tuning never leaks into another. ARTIFACT_DIR and
 // DATA_ENCRYPTION_KEY are set once in beforeAll and left alone.
-const TEST_ENV_KEYS = ['UAHT_PROVISIONING_TOKEN', 'ARTIFACT_MAX_BYTES', 'RATE_LIMIT_UNAUTH_PER_MIN'] as const;
+const TEST_ENV_KEYS = ['UAHT_PROVISIONING_TOKEN', 'ARTIFACT_MAX_BYTES', 'RATE_LIMIT_UNAUTH_PER_MIN', 'UAHT_ROTATE_RATE_PER_MIN'] as const;
 let savedTestEnv: Record<string, string | undefined> = {};
 
 beforeAll(async () => {
@@ -691,5 +699,318 @@ describe('token rotation', () => {
   it('401s rotation with no token', async () => {
     const res = await fetch(`${base}/v1/agents/me/rotate`, { method: 'POST' });
     expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W12 auth hardening: credential separation (agent vs host tokens)
+// ---------------------------------------------------------------------------
+describe('credential separation', () => {
+  beforeEach(wipe);
+  it('agent and host credentials use distinct issuance, storage, and hashing', async () => {
+    const agentToken = await seedAgent(A1, 'agent-a', { read_status: true });
+    const hostToken = await seedHost(H1, 'host-a');
+    // distinct issuance: different prefixes, different generators
+    expect(agentToken.startsWith('uag_')).toBe(true);
+    expect(agentToken.startsWith('uagh_')).toBe(false);
+    expect(hostToken.startsWith('uagh_')).toBe(true);
+    // distinct storage: each hash lives only in its own table
+    const a = await state.pool.query(`SELECT api_key_hash FROM agents WHERE id = $1`, [A1]);
+    const h = await state.pool.query(`SELECT token_hash FROM hosts WHERE id = $1`, [H1]);
+    expect(a.rows[0].api_key_hash).toBe(sha256Hex(agentToken));
+    expect(h.rows[0].token_hash).toBe(sha256Hex(hostToken));
+    expect(a.rows[0].api_key_hash).not.toBe(h.rows[0].token_hash);
+  });
+  it('a host token is 403 on every agent-only endpoint (never authenticates as an agent)', async () => {
+    const hostToken = await seedHost(H1, 'host-a');
+    const auth = { Authorization: `Bearer ${hostToken}` };
+    const calls: Array<[string, string, unknown?]> = [
+      ['GET', '/v1/tasks'],
+      ['POST', '/v1/tasks', { type: 'status', payload: {} }],
+      ['GET', '/v1/agents/me'],
+      ['GET', '/v1/hosts'],
+      ['POST', '/v1/deployments', {}],
+      ['POST', '/v1/agents/me/rotate'],
+    ];
+    for (const [method, path, body] of calls) {
+      const res = await fetch(`${base}${path}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...auth },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      expect(res.status, `${method} ${path}`).toBe(403);
+      const payload = await res.json();
+      expect(payload.error.code).toBe('forbidden');
+      expect(payload.error.message).toContain('agent token required');
+    }
+  });
+  it('an agent token is 403 on every host-only endpoint (never authenticates as a host)', async () => {
+    const agentToken = await seedAgent(A1, 'agent-a', { read_status: true });
+    const auth = { Authorization: `Bearer ${agentToken}` };
+    const calls: Array<[string, string, unknown?]> = [
+      ['POST', `/v1/hosts/${H1}/heartbeat`, {}],
+      ['POST', '/v1/worker/tasks/claim', { host_id: H1, capabilities: [] }],
+      ['GET', '/v1/worker/domains'],
+      ['GET', `/v1/worker/projects/${P1}/secrets`],
+      ['POST', `/v1/hosts/${H1}/rotate-token`, {}],
+    ];
+    for (const [method, path, body] of calls) {
+      const res = await fetch(`${base}${path}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...auth },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      expect(res.status, `${method} ${path}`).toBe(403);
+      const payload = await res.json();
+      expect(payload.error.code).toBe('forbidden');
+      expect(payload.error.message).toContain('host token required');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W12 auth hardening: permission model enumeration + least-privilege matrix
+// ---------------------------------------------------------------------------
+describe('permission model', () => {
+  it('enumerates the canonical permission set', () => {
+    expect([...PERMISSIONS].sort()).toEqual(
+      ['approve_deployments', 'deploy', 'manage_domains', 'manage_secrets', 'read_status', 'restart', 'stop'].sort(),
+    );
+  });
+  it('permissionForTaskType only yields known permissions', () => {
+    for (const t of TASK_TYPES) {
+      expect(PERMISSIONS as readonly string[]).toContain(permissionForTaskType(t));
+    }
+    expect(PERMISSIONS as readonly string[]).toContain(permissionForTaskType('unknown-type'));
+  });
+});
+
+describe('permission matrix', () => {
+  beforeEach(wipe);
+  async function fixture() {
+    await state.pool.query(`INSERT INTO projects (id, name) VALUES ($1, 'p')`, [P1]);
+    await state.pool.query(
+      `INSERT INTO deployments (id, project_id, host_id, version, status) VALUES ($1, $2, $3, 'v1', 'running')`,
+      [D1, P1, H1],
+    );
+    await state.pool.query(
+      `INSERT INTO tasks (id, type, status, created_by, payload) VALUES ($1, 'deploy', 'awaiting_approval', $2, '{}')`,
+      [T1, A1],
+    );
+  }
+  function call(token: string, method: string, path: string, body?: unknown) {
+    return fetch(`${base}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  }
+  it('403s an agent with no permissions on every guarded endpoint', async () => {
+    await fixture();
+    const token = await seedAgent(A2, 'noperms', {});
+    const cases: Array<[string, string, string, unknown?]> = [
+      ['POST', '/v1/tasks', 'remove (task type -> deploy)', { type: 'remove', payload: {} }],
+      ['POST', `/v1/tasks/${T1}/cancel`, 'cancel (not creator, no deploy)', undefined],
+      ['POST', `/v1/tasks/${T1}/approve`, 'approve (approve_deployments)', undefined],
+      ['POST', '/v1/deployments', 'deploy', {}],
+      ['POST', `/v1/deployments/${D1}/rollback`, 'rollback (deploy)', undefined],
+      ['POST', `/v1/services/${D1}/restart`, 'restart', undefined],
+      ['POST', `/v1/services/${D1}/stop`, 'stop', undefined],
+      ['POST', `/v1/services/${D1}/start`, 'start (restart)', undefined],
+      ['POST', `/v1/projects/${P1}/secrets`, 'secrets (manage_secrets)', { name: 'K', value: 'v' }],
+      ['POST', '/v1/domains', 'domains (manage_domains)', {}],
+      ['POST', '/v1/projects', 'create project (deploy)', {}],
+      ['PUT', `/v1/projects/${P1}`, 'update project (deploy)', {}],
+      ['POST', '/v1/artifacts/init', 'artifact init (deploy)', {}],
+    ];
+    for (const [method, path, label, body] of cases) {
+      const res = await call(token, method, path, body);
+      expect(res.status, `${label}: ${method} ${path}`).toBe(403);
+      expect((await res.json()).error.code).toBe('forbidden');
+    }
+  });
+  it('lets correctly-permissioned agents through the same guards', async () => {
+    await fixture();
+    const token = await seedAgent(A1, 'privileged', {
+      deploy: true, restart: true, manage_secrets: true, approve_deployments: true, read_status: true,
+    });
+    let res = await call(token, 'POST', '/v1/tasks', { type: 'remove', payload: {} });
+    expect(res.status).toBe(201);
+    res = await call(token, 'POST', `/v1/services/${D1}/restart`);
+    expect(res.status).toBe(201);
+    res = await call(token, 'POST', `/v1/projects/${P1}/secrets`, { name: 'K', value: 'v' });
+    expect(res.status).toBe(201);
+    res = await call(token, 'POST', `/v1/tasks/${T1}/approve`);
+    expect(res.status).toBe(200);
+  });
+  it('host-admin surface: register needs provisioning token or deploy; rotate-token is host self-only', async () => {
+    const noPermToken = await seedAgent(A1, 'noperms', {});
+    const agentToken = await seedAgent(A2, 'deployer', { deploy: true });
+    const hostToken = await seedHost(H1, 'host-a');
+    await seedHost(H2, 'host-b');
+    // no provisioning token set (beforeEach) -> agent without deploy is 403
+    let res = await call(noPermToken, 'POST', '/v1/hosts/register', { name: 'h-x' });
+    expect(res.status).toBe(403);
+    // agent WITH deploy may register hosts (alternative to the provisioning token)
+    res = await call(agentToken, 'POST', '/v1/hosts/register', { name: 'h-ok' });
+    expect(res.status).toBe(201);
+    expect((await res.json()).host_token).toMatch(/^uagh_/);
+    // host token cannot rotate another host's token
+    res = await fetch(`${base}/v1/hosts/${H2}/rotate-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${hostToken}` },
+      body: '{}',
+    });
+    expect(res.status).toBe(403);
+    // agent token cannot rotate any host token
+    res = await fetch(`${base}/v1/hosts/${H1}/rotate-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${agentToken}` },
+      body: '{}',
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W12 auth hardening: host rotation grace window (safe sequence for workers)
+// ---------------------------------------------------------------------------
+describe('host rotation grace', () => {
+  beforeEach(wipe);
+  function heartbeat(token: string) {
+    return fetch(`${base}/v1/hosts/${H1}/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: '{}',
+    });
+  }
+  function rotate(token: string, body: unknown) {
+    return fetch(`${base}/v1/hosts/${H1}/rotate-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+  }
+  it('grace_seconds keeps the old token valid until expiry, then it dies', async () => {
+    const oldToken = await seedHost(H1, 'host-a');
+    const res = await rotate(oldToken, { grace_seconds: 300 });
+    expect(res.status).toBe(200);
+    const { host_token: newToken } = await res.json();
+    expect(newToken).toMatch(/^uagh_/);
+    // during grace both authenticate
+    expect((await heartbeat(oldToken)).status).toBe(200);
+    expect((await heartbeat(newToken)).status).toBe(200);
+    // force the grace window to expire
+    await state.pool.query(
+      `UPDATE hosts SET previous_token_expires_at = now() - interval '1 second' WHERE id = $1`,
+      [H1],
+    );
+    expect((await heartbeat(oldToken)).status).toBe(401);
+    expect((await heartbeat(newToken)).status).toBe(200);
+  });
+  it('rejects out-of-range grace_seconds', async () => {
+    const token = await seedHost(H1, 'host-a');
+    for (const g of [-1, 3601, 1.5, 'soon']) {
+      const res = await rotate(token, { grace_seconds: g });
+      expect(res.status, `grace_seconds=${g}`).toBe(400);
+    }
+  });
+  it('a non-grace rotation clears any lingering grace state', async () => {
+    const oldToken = await seedHost(H1, 'host-a');
+    const r1 = await rotate(oldToken, { grace_seconds: 300 });
+    expect(r1.status).toBe(200);
+    const { host_token: midToken } = await r1.json();
+    const r2 = await rotate(midToken, {});
+    expect(r2.status).toBe(200);
+    expect((await heartbeat(oldToken)).status).toBe(401); // grace cleared
+    expect((await heartbeat(midToken)).status).toBe(401); // replaced
+  });
+  it('rotation events and the DB never carry plaintext tokens', async () => {
+    const oldAgentKey = await seedAgent(A1, 'rotator', { read_status: true });
+    const r1 = await fetch(`${base}/v1/agents/me/rotate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${oldAgentKey}` },
+    });
+    const { api_key: newAgentKey } = await r1.json();
+    const oldHostToken = await seedHost(H1, 'host-a');
+    const r2 = await rotate(oldHostToken, { grace_seconds: 60 });
+    const { host_token: newHostToken } = await r2.json();
+    const { rows } = await state.pool.query(
+      `SELECT type, payload FROM events WHERE type IN ('agent.key_rotated', 'host.token_rotated')`,
+    );
+    expect(rows.length).toBe(2);
+    for (const row of rows) {
+      const blob = JSON.stringify(row.payload);
+      for (const secret of [newAgentKey, newHostToken, oldAgentKey, oldHostToken]) {
+        expect(blob).not.toContain(secret);
+      }
+    }
+    const a = await state.pool.query(`SELECT api_key_hash FROM agents WHERE id = $1`, [A1]);
+    expect(a.rows[0].api_key_hash).not.toContain(newAgentKey);
+    const h = await state.pool.query(
+      `SELECT token_hash, previous_token_hash FROM hosts WHERE id = $1`, [H1]);
+    expect(h.rows[0].token_hash).not.toContain(newHostToken);
+    expect(String(h.rows[0].previous_token_hash)).not.toContain(oldHostToken);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// W12 auth hardening: strict rate limits on auth endpoints
+// ---------------------------------------------------------------------------
+describe('auth endpoint rate limits', () => {
+  beforeEach(wipe);
+  it('throttles agent registration harder than the general API limit', async () => {
+    process.env.UAHT_PROVISIONING_TOKEN = 'prov-token';
+    process.env.RATE_LIMIT_UNAUTH_PER_MIN = '3';
+    resetRateLimitBucketsForTests();
+    const mk = (n: number) =>
+      fetch(`${base}/v1/agents/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Provisioning-Token': 'prov-token' },
+        body: JSON.stringify({ name: `rl-agent-${n}` }),
+      });
+    expect((await mk(1)).status).toBe(201);
+    expect((await mk(2)).status).toBe(201);
+    expect((await mk(3)).status).toBe(201);
+    const fourth = await mk(4);
+    expect(fourth.status).toBe(429);
+    expect((await fourth.json()).error.code).toBe('rate_limited');
+  });
+  it('throttles agent key rotation per credential (tighter than the general 120/min)', async () => {
+    process.env.UAHT_ROTATE_RATE_PER_MIN = '2';
+    resetRateLimitBucketsForTests();
+    let cur = await seedAgent(A1, 'rotator', { read_status: true });
+    for (let i = 0; i < 2; i++) {
+      const res = await fetch(`${base}/v1/agents/me/rotate`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cur}` },
+      });
+      expect(res.status).toBe(200);
+      cur = (await res.json()).api_key;
+    }
+    const denied = await fetch(`${base}/v1/agents/me/rotate`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cur}` },
+    });
+    expect(denied.status).toBe(429);
+    expect((await denied.json()).error.code).toBe('rate_limited');
+  });
+  it('throttles host token rotation per host', async () => {
+    process.env.UAHT_ROTATE_RATE_PER_MIN = '1';
+    resetRateLimitBucketsForTests();
+    const token = await seedHost(H1, 'host-a');
+    const ok = await fetch(`${base}/v1/hosts/${H1}/rotate-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: '{}',
+    });
+    expect(ok.status).toBe(200);
+    const { host_token: fresh } = await ok.json();
+    const denied = await fetch(`${base}/v1/hosts/${H1}/rotate-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fresh}` },
+      body: '{}',
+    });
+    expect(denied.status).toBe(429);
   });
 });
