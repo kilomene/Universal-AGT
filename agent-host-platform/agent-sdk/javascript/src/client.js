@@ -235,17 +235,31 @@ export class UahtClient {
   createProject({ name, owner, repository, runtime, configuration }) {
     return this._post("/projects", { name, owner, repository, runtime, configuration });
   }
-  listProjects({ limit, cursor } = {}) {
-    return this._get("/projects", { limit, cursor });
+  // The server does not paginate this endpoint (no limit/cursor support on
+  // GET /v1/projects), so the SDK exposes none — do not re-add params the
+  // wire ignores.
+  listProjects() {
+    return this._get("/projects");
   }
   getProject(id) {
     return this._get(`/projects/${id}`);
   }
-  updateProject(id, configuration) {
-    return this._put(`/projects/${id}`, { configuration });
+  /**
+   * PUT /v1/projects/:id — the wire accepts {configuration, repository,
+   * runtime}; all three are exposed here (configuration stays positional
+   * for backwards compatibility).
+   */
+  updateProject(id, configuration, { repository, runtime } = {}) {
+    const body = {};
+    if (configuration !== undefined) body.configuration = configuration;
+    if (repository !== undefined) body.repository = repository;
+    if (runtime !== undefined) body.runtime = runtime;
+    return this._put(`/projects/${id}`, body);
   }
-  listArtifacts({ project_id, limit, cursor } = {}) {
-    return this._get("/artifacts", { project_id, limit, cursor });
+  // GET /v1/artifacts supports ?project_id= only (server-side limit is a
+  // fixed 500, no cursor) — the SDK exposes exactly that.
+  listArtifacts({ project_id } = {}) {
+    return this._get("/artifacts", { project_id });
   }
   getArtifact(id) {
     return this._get(`/artifacts/${id}`);
@@ -329,7 +343,7 @@ export class UahtClient {
   }
 
   // ---- §3.6 Deployments ----
-  createDeployment({ project_id, host_id, version, artifact_id, mode, idempotency_key }) {
+  createDeployment({ project_id, host_id, version, artifact_id, mode, idempotency_key, host_port }) {
     return this._post("/deployments", {
       project_id,
       host_id,
@@ -337,13 +351,16 @@ export class UahtClient {
       artifact_id,
       mode,
       idempotency_key,
+      host_port,
     });
   }
   getDeployment(id) {
     return this._get(`/deployments/${id}`);
   }
-  listDeployments({ project_id, host_id, status, limit, cursor } = {}) {
-    return this._get("/deployments", { project_id, host_id, status, limit, cursor });
+  // GET /v1/deployments supports ?project_id=&host_id=&status=&limit=
+  // (no cursor) — the SDK exposes exactly that.
+  listDeployments({ project_id, host_id, status, limit } = {}) {
+    return this._get("/deployments", { project_id, host_id, status, limit });
   }
   rollbackDeployment(id) {
     return this._post(`/deployments/${id}/rollback`, {});
@@ -368,8 +385,8 @@ export class UahtClient {
   }
 
   // ---- §3.6 Services ----
-  listServices({ host_id } = {}) {
-    return this._get("/services", { host_id });
+  listServices({ host_id, limit } = {}) {
+    return this._get("/services", { host_id, limit });
   }
   restartService(id) {
     return this._post(`/services/${id}/restart`, {});
@@ -470,11 +487,11 @@ export class UahtClient {
    * reaches a terminal state.
    *
    * @param {{project: string, host?: string, version: string, artifactId?: string,
-   *          mode?: "automatic"|"manual", wait?: boolean, pollIntervalMs?: number,
+   *          mode?: "automatic"|"manual", hostPort?: number, wait?: boolean, pollIntervalMs?: number,
    *          timeoutMs?: number}} opts
    * @returns {{deployment: object, task: object}}
    */
-  async deploy({ project, host, version, artifactId, mode, wait = false,
+  async deploy({ project, host, version, artifactId, mode, hostPort, wait = false,
                  pollIntervalMs = 3000, timeoutMs = 600000 } = {}) {
     if (!project) throw new TypeError("project (name) is required");
     if (!version) throw new TypeError("version is required");
@@ -499,6 +516,7 @@ export class UahtClient {
       version,
       artifact_id: artifactId,
       mode,
+      host_port: hostPort,
     });
     let deployment = created.deployment || created;
     let task = created.task || null;
