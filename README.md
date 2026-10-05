@@ -9,13 +9,33 @@ An agent registers, uploads an artifact, and creates a deployment. The
 **control plane** (the source of truth) queues the work; the **host worker**
 (an outbound-only daemon on the persistent host) claims it, builds and runs
 the container, and reports back. The agent reads the result whenever it
-comes back — minutes or days later.
+comes back — minutes or days later. An optional **public edge** (Cloudflare
+DNS + a worker-managed outbound tunnel) serves the deployed apps to the
+public internet without ever opening an inbound port on the host.
 
-Three layers, one wire protocol:
+Four layers, one wire protocol:
 
 ```
-agents / SDKs / CLI ──HTTPS──▶ control plane ──HTTPS──▶ host worker
- (may disappear)        (durable state)          (outbound-only daemon)
+LAYER 1: AGENTS            agents / SDKs (Python, JS) / `agent-host` CLI / humans
+  (may disappear)                 │  HTTPS + Bearer agent API key
+                                  ▼
+LAYER 2: CONTROL PLANE     REST API + durable Postgres state: agents, hosts,
+  (durable state)                  projects, artifact store (sha256), deployments,
+                                   task queue (atomic claims), encrypted secrets,
+                                   append-only event journal, SSE stream.
+                                   Serves the ops dashboard at `/`.
+                                  │  HTTPS + Bearer host token (worker dials out)
+                                  ▼
+LAYER 3: HOST WORKER        systemd daemon on the persistent host: heartbeats,
+  (outbound-only daemon)           claims tasks, builds/runs containers (Docker),
+                                   health checks, crash-loop detection,
+                                   post-reboot reconciliation, self-updates.
+                                   Optionally supervises `cloudflared` (Phase 7).
+                                  │  public traffic (only if ingress enabled)
+                                  ▼
+LAYER 4: PUBLIC EDGE       Cloudflare: proxied CNAMEs (DNS API) + edge/tunnel.
+  (optional, Phase 7)              The tunnel dials OUT to Cloudflare's edge —
+                                   the host still listens on nothing.
 ```
 
 ## Repository layout
@@ -23,32 +43,30 @@ agents / SDKs / CLI ──HTTPS──▶ control plane ──HTTPS──▶ host
 ```
 Universal-AGT/
 ├── README.md                        ← this file
+├── .github/workflows/ci.yml         ← 6 jobs: API, JS SDK, worker, Python SDK, CLI smoke, secrets sweep
 └── agent-host-platform/
     ├── agent-sdk/
-    │   ├── protocol/PROTOCOL.md     ← canonical wire contract (REST + SSE)
-    │   ├── python/                  ← Python SDK (client, errors, SSE)
-    │   └── javascript/              ← JavaScript SDK
-    ├── cli/                         ← `agent-host` CLI (deploy, status, logs, rollback, …)
-    ├── control-plane/               ← REST API, task queue, artifacts,
-    │                                  deployments, events, auth (Node/TS)
-    ├── database/                    ← schema + migrations (Postgres)
-    ├── host-worker/                 ← outbound-only daemon: claim tasks,
-    │                                  docker builds, health checks, updater
-    ├── dashboard/                   ← static ops dashboard (this build)
-    │   ├── index.html
-    │   ├── css/style.css
-    │   └── js/app.js
-    ├── docs/                        ← guides (this build)
-    │   ├── architecture.md          ← three layers, deploy data-flow, resumability
-    │   ├── api.md                   ← endpoint reference summary
-    │   ├── host-install.md          ← installing the worker on a host
-    │   ├── agent-guide.md           ← register → upload → deploy → operate
-    │   └── security.md              ← auth, allowlist, secrets, rate limits
-    ├── examples/                    ← tiny real deployable apps (this build)
+    │   ├── protocol/PROTOCOL.md     ← canonical wire contract (REST + SSE) — authoritative
+    │   ├── python/                  ← Python SDK (client, SSE, deploy helper)
+    │   └── javascript/              ← JavaScript SDK (client, SSE async generator)
+    ├── cli/                         ← `agent-host` CLI (deploy, status, logs, rollback, approve, …)
+    ├── control-plane/
+    │   ├── api/                     ← Express REST API (Node/TS): routes, sweepers, retry policy
+    │   ├── agents/ hosts/ task-queue/ deployments/ artifacts/ events/ authentication/
+    │   └── (modules live under api/src; the top-level dirs mirror the design areas)
+    ├── database/migrations/         ← 001_initial … 005_events_truncate_block (apply in order)
+    ├── host-worker/                 ← outbound-only daemon: claim tasks, docker builds,
+    │                                  health checks, reconcile, updater, ingress/
+    ├── dashboard/                   ← static ops dashboard served by the API at `/`
+    │                                  (approvals panel, actions, SSE live view)
+    ├── docs/                        ← guides (see table below)
+    ├── examples/                    ← tiny real deployable apps
+    │   ├── demo-app/                ← zero-dep Python app (used by the E2E suite)
     │   ├── url-shortener/           ← Node http, zero deps
     │   ├── static-site/             ← nginx static page
     │   └── validate.py              ← manifest validator (PROTOCOL §4)
     └── scripts/
+        └── install-host.sh          ← host installer (see docs/host-install.md)
 ```
 
 ## Quickstart
@@ -57,36 +75,46 @@ Universal-AGT/
 
 ```bash
 cd agent-host-platform/control-plane/api
-npm install
-npm run migrate        # apply database/migrations against Postgres
-npm start              # serves the REST API at /v1 and the dashboard at /
+npm ci
+npm run build
+# apply migrations 001…005 against Postgres first, then:
+DATABASE_URL="postgresql://user:pass@localhost:5432/uagt" \
+DATA_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
+UAHT_PROVISIONING_TOKEN="<pick-a-strong-value>" \
+npm start                       # REST API at /v1, dashboard at /
 ```
 
-`GET /v1/health` should return `{ok: true, version, time}`.
+`GET /v1/health` should return `{ok: true, version, time}`. Full production
+guide: [`docs/deployment.md`](agent-host-platform/docs/deployment.md).
 
 ### 2. Install the worker on your persistent host
 
-On the host (needs Docker + outbound HTTPS to the control plane):
+On the host (needs Docker + outbound HTTPS to the control plane), as root:
 
 ```bash
-sudo UAGT_CONTROL_PLANE="https://control-plane.example.com" \
-     UAGT_HOST_TOKEN="<token from POST /v1/hosts/register>" \
-     bash agent-host-platform/host-worker/install.sh
+curl -fsSL https://<your-mirror>/Universal-AGT/scripts/install-host.sh -o /tmp/uagt-install.sh
+sudo UAHT_CONTROL_PLANE_URL="https://control-plane.example.com" \
+     UAHT_HOST_NAME="persistent-host-01" \
+     bash /tmp/uagt-install.sh
 ```
 
-Full steps, verification, and uninstall: [`docs/host-install.md`](agent-host-platform/docs/host-install.md).
+The installer provisions the host at the control plane, writes
+`/opt/agent-host/config/worker.env` (mode `0600`), installs the
+`agent-host-worker` systemd unit, starts it, and verifies the first
+heartbeat. Full steps, verification, ingress, and uninstall:
+[`docs/host-install.md`](agent-host-platform/docs/host-install.md).
 
 ### 3. Deploy an example
 
 ```bash
-# one step: upload the artifact and deploy (see docs/agent-guide.md §7)
+# one step: upload the artifact and deploy (see docs/agent-guide.md)
 export UAHT_BASE_URL="https://control-plane.example.com"
-export UAHT_API_KEY="<your agent api key>"
-tar -czf /tmp/url-shortener.tar.gz -C agent-host-platform/examples/url-shortener .
-agent-host deploy --project url-shortener --version 1.0.0 \
-  --artifact /tmp/url-shortener.tar.gz --mode automatic
+export UAHT_API_KEY="<your agent api key>"     # from POST /v1/agents/register (shown once)
+tar -czf /tmp/demo-app.tar.gz -C agent-host-platform/examples/demo-app .
+agent-host deploy --project demo-app --version 1.0.0 \
+  --artifact /tmp/demo-app.tar.gz --mode automatic
 
-# or watch it happen live in the dashboard served at /
+# watch it happen live in the dashboard served at /
 ```
 
 The walkthrough with raw `curl` (register → artifact upload → deploy →
@@ -107,33 +135,60 @@ python3 agent-host-platform/examples/validate.py
   row plus a `deploy` task; statuses flow
   `requested → building → starting → healthcheck → running`.
 - **Atomic claims.** Exactly one host gets a queued task — multi-host safe
-  with no lock service.
-- **Manual approval mode.** Tasks can park in `awaiting_approval` until a
-  holder of `approve_deployments` approves or rejects them.
+  with no lock service (`FOR UPDATE SKIP LOCKED`).
+- **Claim leases + sweepers.** Every claim records a lease
+  (`TASK_CLAIM_LEASE_S`, default 600s), refreshed on each progress report.
+  The stuck-task sweeper requeues lease-expired work or fails it when the
+  retry budget is exhausted; the stale-host sweeper marks silent hosts
+  `degraded`/`offline` (`HEARTBEAT_*_S` thresholds).
+- **Retry policy.** Failed tasks become `retrying` only when the type is
+  safe to re-run and `attempts < max_attempts`; `remove`/`rollback` never
+  auto-retry.
+- **Port registry.** Fixed `host_port` reservations are unique per
+  host+port (409 on collision); the worker also bind-tests every port at
+  OS and Docker level before `docker run`.
+- **Manual approval mode.** Tasks park in `awaiting_approval` at creation
+  until a holder of `approve_deployments` approves or rejects them — in the
+  API, the CLI, and the dashboard's Approvals panel.
 - **Append-only events.** Everything security-relevant is journaled and
   streamed live over SSE at `/v1/events/stream`.
+- **Secrets that stay secret.** AES-256-GCM at rest, never returned by
+  reads, decrypted only for the host executing the deploy, injected as
+  container env, never written to worker disk.
+- **Public ingress without inbound ports (Phase 7).** DNS alone cannot
+  reach an outbound-only host — so the worker can supervise an outbound
+  `cloudflared` tunnel and sync `hostname → 127.0.0.1:port` routes for
+  tunnel-mode domains. See [`docs/cloudflare.md`](agent-host-platform/docs/cloudflare.md).
 - **Defense in depth.** SHA-256-hashed bearer tokens, scoped permissions,
   worker command allowlist (never a raw shell string from the network),
-  double-verified artifact checksums, encrypted secrets that are never
-  returned by reads, and per-key rate limits. See
-  [`docs/security.md`](agent-host-platform/docs/security.md).
+  double-verified artifact checksums, wire-capped uploads, per-key rate
+  limits. See [`docs/security.md`](agent-host-platform/docs/security.md).
 
 ## Docs
 
 | Doc | What it covers |
 |---|---|
-| [`agent-sdk/protocol/PROTOCOL.md`](agent-host-platform/agent-sdk/protocol/PROTOCOL.md) | **Canonical** wire protocol — REST + JSON + SSE, auth, manifest rules |
-| [`docs/architecture.md`](agent-host-platform/docs/architecture.md) | Three layers, ASCII diagram, deploy data-flow, resumability/idempotency |
+| [`agent-sdk/protocol/PROTOCOL.md`](agent-host-platform/agent-sdk/protocol/PROTOCOL.md) | **Canonical** wire protocol — REST + JSON + SSE, auth, manifest rules, changelog |
+| [`docs/architecture.md`](agent-host-platform/docs/architecture.md) | Four layers, deploy data-flow, sweepers, retry policy, port registry, ingress |
 | [`docs/api.md`](agent-host-platform/docs/api.md) | Endpoint reference summary |
-| [`docs/host-install.md`](agent-host-platform/docs/host-install.md) | Worker install, systemd, verification, uninstall |
-| [`docs/agent-guide.md`](agent-host-platform/docs/agent-guide.md) | Agent/CLI deploy walkthrough, approval modes |
-| [`docs/security.md`](agent-host-platform/docs/security.md) | Auth model, permissions, allowlist, secrets, rate limits |
+| [`docs/deployment.md`](agent-host-platform/docs/deployment.md) | **Production deployment guide**: Supabase/migrations, env vars, domain + HTTPS, first deploy |
+| [`docs/host-install.md`](agent-host-platform/docs/host-install.md) | Worker install, systemd, verification, ingress, uninstall |
+| [`docs/cloudflare.md`](agent-host-platform/docs/cloudflare.md) | The three ingress modes: metadata-only, direct, cloudflare-tunnel |
+| [`docs/agent-guide.md`](agent-host-platform/docs/agent-guide.md) | Agent deploy walkthrough (register → deploy → operate) |
+| [`docs/agent-integration.md`](agent-host-platform/docs/agent-integration.md) | Machine-readable integration card: every endpoint, task types, error codes |
+| [`docs/security.md`](agent-host-platform/docs/security.md) | Auth model, permissions, worker containment, artifact integrity, rate limits |
+| [`docs/troubleshooting.md`](agent-host-platform/docs/troubleshooting.md) | Symptom → cause → fix for the real failure modes |
+| [`docs/e2e-live-checklist.md`](agent-host-platform/docs/e2e-live-checklist.md) | 14 live-infrastructure checks (Supabase + real host + real Docker) |
+| [`docs/implementation-status.md`](agent-host-platform/docs/implementation-status.md) | Acceptance scorecard + per-phase resolution log |
 
 ## Conventions
 
 - No IP addresses anywhere in requests, responses, or docs — hosts are
   referenced by `host_id` / `host_name` only.
 - No secrets in the repo. Tokens are shown once at registration and live in
-  secret storage / root-only files.
+  secret storage / root-only files. Examples use `<placeholder>` values.
 - Every mutating call should carry an `idempotency_key` — retries are safe
   by construction.
+- Agent-neutral by design: Muse, Instinct, CI agents, and humans are all
+  just agent rows with scoped permission sets — no agent-type special-casing
+  anywhere in the control plane, SDKs, CLI, or worker.
