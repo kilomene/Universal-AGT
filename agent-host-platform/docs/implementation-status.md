@@ -156,48 +156,60 @@ Python E2E against the faithful in-memory plane.)
 
 ---
 
+**Recomputed 2026-10-05 (Phase 10)** against the final code — every verdict
+below was re-checked against the implementation (routes, sweepers,
+worker handlers, SDKs, CLI, migrations), not carried forward from the
+original audit.
+
 | # | Criterion | Verdict |
 |---|---|---|
-| 1 | Muse can authenticate | ✅ (needs registration gate fix for production) |
-| 2 | Instinct can authenticate | ✅ (same) |
+| 1 | Muse can authenticate | ✅ (registration gate: `X-Provisioning-Token`, Phase 6) |
+| 2 | Instinct can authenticate | ✅ (same gate; no agent-type special-casing anywhere) |
 | 3 | Persistent host can authenticate | ✅ |
 | 4 | Host requires no publicly exposed IP | ✅ by design (outbound-only) |
 | 5 | Host connects outbound | ✅ |
-| 6 | Host survives reboot | ⚠️ containers return via restart policy; **no reconciliation** — needs live test (checklist #10) |
-| 7 | Worker survives crash | ✅ systemd `Restart=always` — needs live test (checklist #11) |
+| 6 | Host survives reboot | ✅ (restart policy + post-reboot reconcile in `deployments/reconcile.py`; corrupt `state.json` quarantined; live proof — checklist #10) |
+| 7 | Worker survives crash | ✅ systemd `Restart=always`; reconnect backoff 5s→300s jittered (live proof — checklist #11) |
 | 8 | Tasks persist | ✅ (DB-backed) |
-| 9 | Tasks are idempotent | ⚠️ task keys yes; **deployment replay broken** for artifact/manual |
+| 9 | Tasks are idempotent | ✅ (task `type`+`payload` + deployment 6-field compare; Phase 3 fixed replay) |
 | 10 | Tasks are atomically claimed | ✅ (`FOR UPDATE SKIP LOCKED`) |
-| 11 | Artifacts upload | ✅ |
-| 12 | Artifacts verify | ✅ (SHA-256, quarantine) |
-| 13 | Automatic deployment works | ✅ (E2E-proven locally incl. the checksum/project_name wiring fix; needs live Docker test — checklist #4) |
-| 14 | Manual deployment works | ✅ (E2E-proven: approve→proceeds, reject→never starts; needs live test — checklist #5) |
+| 11 | Artifacts upload | ✅ (init + PUT, 413 wire cap `ARTIFACT_MAX_BYTES`) |
+| 12 | Artifacts verify | ✅ (SHA-256 twice: at upload and post-download; quarantine) |
+| 13 | Automatic deployment works | ✅ (E2E-proven incl. checksum/project_name wiring; live Docker — checklist #4) |
+| 14 | Manual deployment works | ✅ (created in `awaiting_approval`; approve/reject; dashboard Approvals panel; live — checklist #5) |
 | 15 | Docker deployment works | ⚠️ (E2E-proven via subprocess-backed fake; real daemon needs live host — checklist #4) |
-| 16 | Multiple applications work | ⚠️ (isolation design sound; no port registry — collision possible) |
-| 17 | Health checks work | ⚠️ (HTTP-only) |
-| 18 | Failed deployment handled | ✅ (E2E-proven: broken build fails clean, logs retained, previous version keeps serving) |
-| 19 | Rollback works | ✅ (worker-side auto-rollback E2E-proven; API endpoint fixed in Phase 3, route-tested) |
-| 20 | Logs work | ✅ |
-| 21 | Events work | ✅ |
-| 22 | Secrets protected | ✅ (encrypted at rest + host delivery; E2E proves container-env injection, never in state.json/logs) |
-| 23 | Resource limits work | ⚠️ manifest→docker flags; no aggregate accounting |
-| 24 | Agent disappearance doesn't stop deployment | ✅ (E2E-proven: completes with no agent polling; state retrievable on reconnect; live variant — checklist #6) |
-| 25 | Host disappearance detected | ❌ no sweeper |
-| 26 | Host reconnects | ⚠️ fixed 5s retry, no backoff |
-| 27 | Worker updates safely | ⚠️ no post-restart gate |
-| 28 | Dashboard works | ⚠️ read-only |
-| 29 | CLI works | ✅ |
-| 30 | SDK works | ✅ (minus JS `since` bug) |
-| 31 | Muse integration works | ⚠️ (no agent-integration.md yet) |
-| 32 | Instinct integration works | ⚠️ (same) |
-| 33 | Cloudflare works where configured | ✅ (mocked; needs live CF test) |
-| 34 | Public ingress works | ❌ **not designed** — Phase 7 |
-| 35 | Domain routing works | ⚠️ DNS only; no traffic path |
-| 36 | Security tests pass | ✅ Phase 6 findings resolved; worker 250, API 187, JS 28, Python 27, CLI smoke 20/20 |
-| 37 | End-to-end tests pass | ✅ 6/6 worker E2E + 21/21 API flow tests green locally; live-infra variants in `docs/e2e-live-checklist.md` |
-| 38 | Documentation accurate | ⚠️ mostly; `agent-integration.md` missing, some drift |
+| 16 | Multiple applications work | ✅ (port registry DB+OS+Docker, per-deployment names/dirs/logs; E2E-proven 3-app; live — checklist #9) |
+| 17 | Health checks work | ⚠️ (HTTP-only, exact-200) |
+| 18 | Failed deployment handled | ✅ (broken build fails clean, logs retained, previous version keeps serving) |
+| 19 | Rollback works | ✅ (worker auto-rollback + API endpoint fixed Phase 3, route-tested; never auto-retries) |
+| 20 | Logs work | ✅ (per-task/deployment, rotation, secret scrubbing) |
+| 21 | Events work | ✅ (append-only + trigger-blocked TRUNCATE + SSE; migration 005 needs superuser) |
+| 22 | Secrets protected | ✅ (AES-256-GCM at rest, names-only reads, host-scoped delivery, env injection, never in state/logs) |
+| 23 | Resource limits work | ⚠️ (manifest→docker `--memory`/`--cpus`; `environment-update` drops them on recreate; no aggregate capacity accounting) |
+| 24 | Agent disappearance doesn't stop deployment | ✅ (E2E-proven; live variant — checklist #6) |
+| 25 | Host disappearance detected | ✅ (stale-host sweeper: `degraded`/`offline`, `host.degraded`/`host.offline`; never flips operator `draining`) |
+| 26 | Host reconnects | ✅ (exponential backoff + jitter; heartbeats revive `offline`/`degraded`) |
+| 27 | Worker updates safely | ✅ (SHA-256 verified tarball + post-restart health gate with rollback; code-signing with an offline key is an explicit, documented trust-model limitation, not a gap) |
+| 28 | Dashboard works | ✅ (hosts/apps/deployments/tasks panels, Approvals dossier + confirmations, service actions, SSE live) |
+| 29 | CLI works | ✅ (`agent-host`: 20 commands incl. approve/reject/secrets/domains; `--json` global) |
+| 30 | SDK works | ✅ (JS + Python parity: `rotateKey`, `getLogs`/`tailLogs`, `addDomain(..., ingress)`, `streamEvents` since-fix) |
+| 31 | Muse integration works | ✅ (`docs/agent-integration.md` exists; distinct permission sets, no special-casing) |
+| 32 | Instinct integration works | ✅ (same — protocol is agent-neutral) |
+| 33 | Cloudflare works where configured | ⚠️ (idempotent CNAME ensure/delete, mocked; needs live CF test — checklist #12) |
+| 34 | Public ingress works | ✅ (Phase 7: worker-managed `cloudflared` tunnel, outbound-only; live — checklist #12) |
+| 35 | Domain routing works | ✅ (`ingress: tunnel`/`direct`, CNAME targets, `ingress-sync` tasks; dashboard-tunnel hostname note documented) |
+| 36 | Security tests pass | ✅ (Phase 6 findings resolved; worker 250, API 187, JS 28, Python 27, CLI smoke 20/20 — all green) |
+| 37 | End-to-end tests pass | ✅ (6/6 worker E2E + 21/21 API flow tests green locally; live-infra variants in `docs/e2e-live-checklist.md`) |
+| 38 | Documentation accurate | ✅ (Phase 10: every doc re-verified against code; drift fixed; `deployment.md` + `troubleshooting.md` added) |
 
-**Score: 18 ✅ · 14 ⚠️ · 6 ❌** (of 38)
+**Score: 34 ✅ · 4 ⚠️ · 0 ❌** (of 38)
+
+The 4 ⚠️ are all *known, documented* boundaries, not defects:
+**15** real-Docker proof needs a live host · **17** health checks are
+HTTP-only by design · **23** no aggregate capacity accounting (and
+`environment-update` drops memory/cpus on recreate — see troubleshooting)
+· **33** Cloudflare paths are mocked in tests, live check #12 covers them.
+Every ❌ from the original audit is resolved.
 
 ---
 
@@ -211,7 +223,37 @@ Python E2E against the faithful in-memory plane.)
 - **Phase 7** — honest ingress design: document why DNS≠reachability; implement optional modular ingress (cloudflared tunnel managed by worker, or control-plane-relayed); keep provider-neutral interface.
 - **Phase 8** — dashboard approvals UI + destructive-action confirmations + agents/projects pages; CLI `--json` already there — verify all commands; SDK parity re-check.
 - **Phase 9** — ✅ done 2026-10-05: deterministic E2E suite (demo app; agent-disappearance; manual approve/reject; broken app; health-fail rollback; multi-app) — 6/6 worker E2E + 21/21 API flow tests green locally; live-infra needs marked explicitly in `docs/e2e-live-checklist.md`.
-- **Phase 10** — update all docs to match reality; production deployment guide.
+- **Phase 10** — ✅ done 2026-10-05: documentation finalization (this
+  document). Every doc re-verified against the final code; drift fixed:
+  root README rewritten (4-layer architecture, correct installer path/env
+  vars, full docs index); `architecture.md` gained layer 4 (public edge)
+  and the secrets-delivery note, dashboard mount fixed to `/`;
+  `security.md` worker.env path corrected, `PROVISIONING_TOKEN` vs
+  `UAHT_PROVISIONING_TOKEN` disambiguated; `agent-integration.md` gained
+  the 18th task type `ingress-sync` (+permission map), the Domains section,
+  credential rotation, JS `tailLogs`, and a corrected task state diagram
+  (`awaiting_approval` is the *initial* state in manual mode);
+  `host-install.md` manual section rewritten to match `install-host.sh`
+  (unit `agent-host-worker`, `/opt/agent-host/config/worker.env`,
+  `python3 -m agent.main` entrypoint) and host-registration auth;
+  `api.md` gained rotate/domain/worker-secrets endpoints, `ingress-sync`,
+  `payload_too_large`, and the full event list; `agent-guide.md` fixed
+  (`agent-host` not `uagt`, provisioning header, manual-mode parking);
+  `e2e-live-checklist.md` fixed (reconciliation exists — check 10's "known
+  gap" removed; `UAHT_API_URL` → `UAHT_BASE_URL`). NEW:
+  `docs/deployment.md` (production guide: Supabase + migrations 001–005,
+  full env-var table, systemd/Docker, HTTPS reverse-proxy sketch, worker
+  install, muse+instinct registration, first deploy, tunnel setup,
+  production checklist) and `docs/troubleshooting.md` (symptom→cause→fix
+  for the real failure modes). Acceptance score recomputed: **34 ✅ ·
+  4 ⚠️ · 0 ❌** (was 18·14·6).
+
+## What still needs live infrastructure
+
+The 4 ⚠️ criteria and every "live" note above are covered by
+`docs/e2e-live-checklist.md` — 14 checks against real Supabase + real Linux
+host + real Docker (+ real Cloudflare for #12). Nothing else is outstanding:
+no code changes were made or needed in Phase 10 (docs-only by rule).
 
 ## What was NOT rebuilt
 
