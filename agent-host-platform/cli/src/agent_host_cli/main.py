@@ -187,7 +187,8 @@ def cmd_rollback(args):
 def cmd_domains(args):
     c = _client(args)
     if args.action == "add":
-        _emit(args, c.add_domain(args.deployment, args.hostname))
+        _emit(args, c.add_domain(args.deployment, args.hostname,
+                                 ingress=args.ingress))
     elif args.action == "rm":
         _emit(args, c.remove_domain(args.deployment, args.hostname))
     else:
@@ -392,6 +393,10 @@ def build_parser():
                    help="list domains (default), add one, or remove one")
     d.add_argument("--deployment", required=True, help="deployment id")
     d.add_argument("--hostname", default=None, help="hostname for add/rm")
+    d.add_argument("--ingress", default=None, choices=["tunnel", "direct"],
+                   help="ingress mode for add (default: tunnel when "
+                        "TUNNEL_INGRESS_HOSTNAME is set on the control plane, "
+                        "else direct)")
 
     t = sub.add_parser("tasks", help="list tasks in the durable queue")
     t.add_argument("--status", default=None, help="filter by task status")
