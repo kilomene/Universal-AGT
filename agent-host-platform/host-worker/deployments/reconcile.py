@@ -97,6 +97,17 @@ def _desired_running(store) -> list:
         return []
 
 
+def _compose_name_matches(compose_project: str, container_name: str) -> bool:
+    """True when a container belongs to the compose project.
+
+    Compose names containers <project>-<service>-<seq>; a bare substring
+    check would wrongly match a project that is a prefix of another
+    (uaht-proj vs uaht-proj2). Pure function — unit tested.
+    """
+    return (container_name == compose_project
+            or container_name.startswith(compose_project + "-"))
+
+
 def _recreate_container(ctx, state: dict, summary: dict, note) -> None:
     """Recreate a missing container from its stored spec (pipeline's docker.run)."""
     deployment_id = state.get("deployment_id", "?")
@@ -142,7 +153,7 @@ def _reconcile_compose(ctx, state: dict, ps_all: dict, summary: dict, note) -> N
              f"compose_project recorded; skipping")
         return
     docker = ctx.docker
-    matched = [n for n in ps_all if compose_project in n]
+    matched = [n for n in ps_all if _compose_name_matches(compose_project, n)]
     if not matched:
         summary["missing"] += 1
         note(f"{project} ({deployment_id}): compose project {compose_project} "
