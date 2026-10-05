@@ -1,0 +1,169 @@
+"""Post-reboot reconciliation: desired state vs actual Docker state.
+
+Runs once at worker startup, before the claim loop starts. The local
+<work_dir>/deployments/*/state.json registry is the desired state; `docker`
+is the actual state. For every deployment marked ``running`` locally:
+
+  * container present and running        -> nothing to do
+  * container present but not running    -> ``docker.start`` (the same call
+    the ``start`` task handler uses)
+  * container missing entirely          -> ``docker.run`` with the stored
+    spec — stored image, stored host->container port mapping, stored
+    non-secret env, ``restart=unless-stopped`` (the same call the deploy
+    pipeline uses). Secret env is deliberately NOT restored: a rebooted
+    host does not re-inject secrets on its own; the next redeploy or an
+    ``environment-update`` task does.
+  * ``docker-compose`` runtime           -> containers are matched by compose
+    project name in ``docker ps -a``; stopped ones are started. A project
+    with no containers at all cannot be recreated without its compose file,
+    so it is reported as missing and left for the operator.
+
+Every action is logged. The returned summary dict is attached to the next
+heartbeat payload so the control plane sees what the reboot recovered.
+"""
+from __future__ import annotations
+
+import logging
+import time
+
+LOG = logging.getLogger("agent-host-worker.reconcile")
+
+DEFAULT_RESTART_POLICY = "unless-stopped"
+
+
+def reconcile(ctx, log=None) -> dict:
+    """Reconcile desired-running deployments with Docker. Returns a summary."""
+    log = log or LOG.info
+    summary = {
+        "reconciled": 0,   # containers started or recreated
+        "already_running": 0,
+        "missing": 0,      # desired-running but could not be restored
+        "skipped": 0,      # not in a reconcilable state
+        "actions": [],     # human-readable log of what happened
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    def note(msg: str) -> None:
+        summary["actions"].append(msg)
+        log("reconcile: %s", msg)
+
+    store = ctx.deployment_store
+    docker = ctx.docker
+    if docker is None:
+        note("docker unavailable; reconciliation skipped")
+        summary["skipped"] = len(_desired_running(store))
+        return summary
+
+    try:
+        ps_all = {row.get("Names", "").lstrip("/"): row
+                  for row in docker.ps(all=True)}
+        ps_running = {row.get("Names", "").lstrip("/"): row
+                      for row in docker.ps(all=False)}
+    except Exception as exc:
+        note(f"could not list containers ({exc}); reconciliation aborted")
+        summary["skipped"] = len(_desired_running(store))
+        return summary
+
+    for state in _desired_running(store):
+        deployment_id = state.get("deployment_id", "?")
+        project = state.get("project_name", "?")
+        name = state.get("container_name")
+        if not name:
+            _reconcile_compose(ctx, state, ps_all, summary, note)
+            continue
+        if name in ps_running:
+            summary["already_running"] += 1
+            note(f"{project} ({deployment_id}): container {name} already running")
+        elif name in ps_all:
+            try:
+                docker.start(name)
+                summary["reconciled"] += 1
+                note(f"{project} ({deployment_id}): container {name} was "
+                     f"stopped; started it")
+            except Exception as exc:
+                summary["missing"] += 1
+                note(f"{project} ({deployment_id}): failed to start "
+                     f"stopped container {name}: {exc}")
+        else:
+            _recreate_container(ctx, state, summary, note)
+    return summary
+
+
+def _desired_running(store) -> list:
+    try:
+        return [s for s in store.list_all() if s.get("status") == "running"]
+    except Exception as exc:
+        LOG.error("reconcile: could not read deployment store: %s", exc)
+        return []
+
+
+def _recreate_container(ctx, state: dict, summary: dict, note) -> None:
+    """Recreate a missing container from its stored spec (pipeline's docker.run)."""
+    deployment_id = state.get("deployment_id", "?")
+    project = state.get("project_name", "?")
+    name = state.get("container_name")
+    image = state.get("image")
+    docker = ctx.docker
+    if not image:
+        summary["missing"] += 1
+        note(f"{project} ({deployment_id}): container {name} missing and no "
+             f"image recorded in state; cannot recreate (redeploy required)")
+        return
+    ports = {}
+    host_port = state.get("host_port")
+    container_port = state.get("container_port")
+    if host_port and container_port:
+        try:
+            ports[int(host_port)] = int(container_port)
+        except (TypeError, ValueError):
+            pass
+    env = dict(state.get("env") or {})  # non-secret env only; secrets are not persisted
+    try:
+        docker.run(name, image, ports=ports or None, env=env or None,
+                   restart=DEFAULT_RESTART_POLICY)
+        summary["reconciled"] += 1
+        note(f"{project} ({deployment_id}): container {name} was missing; "
+             f"recreated from image {image}"
+             + (f" on :{host_port}->{container_port}" if ports else ""))
+    except Exception as exc:
+        summary["missing"] += 1
+        note(f"{project} ({deployment_id}): failed to recreate container "
+             f"{name} from {image}: {exc}")
+
+
+def _reconcile_compose(ctx, state: dict, ps_all: dict, summary: dict, note) -> None:
+    """Best-effort reconcile for docker-compose deployments."""
+    deployment_id = state.get("deployment_id", "?")
+    project = state.get("project_name", "?")
+    compose_project = state.get("compose_project")
+    if not compose_project:
+        summary["skipped"] += 1
+        note(f"{project} ({deployment_id}): no container_name and no "
+             f"compose_project recorded; skipping")
+        return
+    docker = ctx.docker
+    matched = [n for n in ps_all if compose_project in n]
+    if not matched:
+        summary["missing"] += 1
+        note(f"{project} ({deployment_id}): compose project {compose_project} "
+             f"has no containers; cannot recreate without its compose file "
+             f"(redeploy required)")
+        return
+    started = 0
+    for cname in matched:
+        status = (ps_all[cname].get("State") or "").lower()
+        if status != "running":
+            try:
+                docker.start(cname)
+                started += 1
+            except Exception as exc:
+                note(f"{project} ({deployment_id}): failed to start compose "
+                     f"container {cname}: {exc}")
+    if started:
+        summary["reconciled"] += 1
+        note(f"{project} ({deployment_id}): started {started} stopped "
+             f"compose container(s) of project {compose_project}")
+    else:
+        summary["already_running"] += 1
+        note(f"{project} ({deployment_id}): compose project {compose_project} "
+             f"already running")
