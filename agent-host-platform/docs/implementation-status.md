@@ -108,6 +108,23 @@ Security test totals after Phase 6: worker 216 pytest (28 new), API 157+1 vitest
 
 ---
 
+## Phase 7 resolution (2026-10-05)
+
+Scope: honest ingress design — DNS≠reachability; optional modular ingress
+(worker-managed `cloudflared` tunnel), provider-neutral interface.
+
+| What | Status |
+|---|---|
+| Ingress abstraction (`host-worker/ingress/`) | ✅ `IngressProvider` interface (`name`, `setup`, `add_route`, `remove_route`, `sync_routes`, `status`, `shutdown`); loopback-only targets enforced; route-table builder + `config.yml` renderer (hostname re-validated, YAML-injection safe). |
+| `cloudflare-tunnel` provider | ✅ Supervised `cloudflared tunnel --token <TOKEN> run` (outbound-only); pinned release 2026.10.0 with SHA-256 verification (official per-asset digests, amd64 re-verified by download); crash restart with backoff; argv-only subprocess; token never logged. Download failure / missing token → clear log, ingress stays disabled, worker keeps running. |
+| `ingress-sync` task type (18th) | ✅ Handler + policy allowlist + `deploy` permission + `safe` retry class; empty payload, pulls `GET /v1/worker/domains`; best-effort in-process sync after successful deploy/remove; PROTOCOL §3.2/§5 + Changelog updated. |
+| Control plane tunnel mode | ✅ `POST /v1/domains` accepts `ingress: 'tunnel'\|'direct'` (default: tunnel when `TUNNEL_INGRESS_HOSTNAME` set, else direct); CNAME `→ <tunnel-id>.cfargotunnel.com` in tunnel mode; 422 when tunnel requested without the hostname configured; tunnel-mode changes queue `ingress-sync` for the host. |
+| Docs | ✅ `docs/cloudflare.md` rewritten around the three honest modes; `docs/host-install.md` + installer + `.env.example` files cover the new vars; PROTOCOL changelog. |
+| Tests | ✅ worker 244 pytest (28 new ingress), API 166 vitest (8 new), JS SDK 24, Python SDK 24, CLI smoke 20/20 — all green. |
+| Accepted limitations (documented, not fixed) | For dashboard-created (token) tunnels, Cloudflare reads public-hostname routes from the tunnel's dashboard config, not from the worker's `config.yml` — the operator must add each hostname in **Zero Trust → Networks → Tunnels → Public hostnames**. Tunnel creation, token provisioning, and the dashboard hostname entries are human steps by design. The tunnel token is visible in the host's process table to local root (argv) — accepted, documented. |
+
+---
+
 ## Acceptance criteria mapping (spec §59, 38 items)
 
 | # | Criterion | Verdict |
