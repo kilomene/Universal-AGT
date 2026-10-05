@@ -21,6 +21,16 @@ class WorkerAPIError(Exception):
     """Raised when the control plane cannot be reached or rejects a call."""
 
 
+class RotationError(WorkerAPIError):
+    """Raised when host-token rotation cannot be completed safely.
+
+    The client NEVER adopts a new token it has not verified: if rotation
+    fails after the server issued a new token, the OLD token is still valid
+    for the remainder of the grace window, so the worker keeps running and
+    the operator can simply retry.
+    """
+
+
 # Client-side mirror of the task status machine (schema.sql + PROTOCOL §3.2).
 # The progress endpoint accepts: claimed | running | awaiting_approval |
 # completed | failed. Self-transitions on non-terminal states are allowed so
@@ -233,3 +243,86 @@ class ControlPlaneClient:
         if resp.status_code != 200:
             self._raise(resp, "host domains")
         return resp.json()
+
+    # -- token rotation (safe sequence) ------------------------------------
+    def rotate_host_token(self, host_id: str, grace_seconds: int = 300) -> str:
+        """Rotate this host's token without ever disconnecting the worker.
+
+        Safe sequence (mirrors POST /v1/hosts/:id/rotate-token):
+          1. authenticate current: the rotation call goes out on the
+             CURRENT token (self-match enforced server-side);
+          2. the server generates a new token, stores its hash, and — with
+             grace_seconds > 0 — keeps the OLD token valid for a grace
+             window instead of killing it instantly;
+          3. VERIFY the new token authenticates (a side-effect-free
+             GET /v1/worker/domains on a throwaway header set) BEFORE
+             adopting it — an unverified token is never used or stored;
+          4. adopt the new token in-memory (session Authorization <redacted>
+             and only then return it so the caller can persist it to
+             disk (persist_host_token).
+
+        On any failure after issuance the old token is still valid until
+        the grace window expires, so a RotationError here never strands
+        the worker: the caller can retry with the old token. The plaintext
+        token is never logged.
+        """
+        resp = self.session.post(
+            self._url(f"/v1/hosts/{host_id}/rotate-token"),
+            data=json.dumps({"grace_seconds": int(grace_seconds)}),
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            self._raise(resp, "host token rotation")
+        body = resp.json() or {}
+        new_token = body.get("host_token")
+        if not isinstance(new_token, str) or not new_token:
+            raise RotationError(
+                "host token rotation failed: server did not return a host_token"
+            )
+        # Verify the new token authenticates before adopting it.
+        verify = self.session.get(
+            self._url("/v1/worker/domains"),
+            headers={"Authorization": f"Bearer {new_token}"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if verify.status_code != 200:
+            raise RotationError(
+                "host token rotation failed: the new token did not "
+                f"authenticate (HTTP {verify.status_code}); the old token "
+                "remains valid for the rest of the grace window — retry"
+            )
+        # Adopt in memory only after a successful verification.
+        self._token = new_token
+        self.session.headers.update({"Authorization": f"Bearer {new_token}"})
+        return new_token
+
+
+def persist_host_token(config_path: str, new_token: str) -> None:
+    """Atomically rewrite the WORKER_HOST_TOKEN line in a worker.env file.
+
+    Preserves every other line (comments, ordering). Uses write-to-temp +
+    os.replace so a crash can never leave a half-written config. The file
+    is chmod'd 0600 (owner-only) since it holds a live credential. The
+    token value is never logged or printed by this function.
+    """
+    if not config_path or not os.path.isfile(config_path):
+        raise OSError(f"config file not found: {config_path!r}")
+    with open(config_path, "r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    out: list[str] = []
+    replaced = False
+    for line in lines:
+        stripped = line.strip()
+        bare = stripped[len("export "):] if stripped.startswith("export ") else stripped
+        if bare.startswith("WORKER_HOST_TOKEN=") and not replaced:
+            out.append(f"WORKER_HOST_TOKEN={new_token}\n")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"WORKER_HOST_TOKEN={new_token}\n")
+    tmp_path = config_path + ".tmp-rotate"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.writelines(out)
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, config_path)
