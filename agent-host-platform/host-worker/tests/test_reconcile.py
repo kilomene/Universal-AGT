@@ -30,7 +30,7 @@ class FakeDockerClient:
             self.states[name] = "running"
 
     def run(self, name, image, ports=None, env=None, memory=None, cpus=None,
-            restart="unless-stopped", extra_args=None, timeout=120):
+            restart="unless-stopped", timeout=120):
         self.run_calls.append({"name": name, "image": image, "ports": ports,
                                "env": env, "restart": restart})
         self.existing.add(name)
