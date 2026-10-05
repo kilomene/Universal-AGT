@@ -396,3 +396,45 @@ def test_deploy_helper_handles_bare_list_projects():
     deployment, task = client.deploy(project="bare-api", version="1.0.0")
     assert deployment["id"] == "d-1"
     assert task["id"] == "t-1"
+
+
+# -- JS/Python parity (Phase 8) -----------------------------------------
+
+# Canonical agent-facing method table. The JS SDK must expose the camelCase
+# twin of every entry; the parity test in client.test.js asserts the same
+# table. Add new API methods to BOTH clients and extend this table.
+PARITY_METHODS = [
+    "register_agent", "me", "rotate_agent_key",
+    "create_task", "get_task", "list_tasks", "cancel_task", "approve_task", "reject_task",
+    "get_logs", "tail_logs",
+    "list_hosts", "get_host",
+    "create_project", "list_projects", "get_project", "update_project",
+    "list_artifacts", "get_artifact", "init_artifact", "upload_artifact", "download_artifact",
+    "create_deployment", "get_deployment", "list_deployments", "rollback_deployment",
+    "list_services", "restart_service", "stop_service", "start_service",
+    "set_secret", "list_secrets", "delete_secret",
+    "add_domain", "list_domains", "remove_domain",
+    "list_events", "stream_events",
+    "deploy", "health",
+]
+
+
+def test_parity_method_table():
+    client = UahtClient("https://cp.example.com", "k", session=MagicMock())
+    missing = [m for m in PARITY_METHODS if not callable(getattr(client, m, None))]
+    assert not missing, f"methods missing from the Python SDK: {missing}"
+
+
+def test_rotate_agent_key_posts_and_adopts_new_key():
+    client, fake = client_with(
+        {"/v1/agents/me/rotate": lambda: make_response(200, {"api_key": "new-key"})}
+    )
+    res = client.rotate_agent_key()
+    method, url, kwargs = fake.calls[0]
+    assert method == "POST"
+    assert url == "https://cp.example.com/v1/agents/me/rotate"
+    assert kwargs["headers"]["Authorization"] == "Bearer sekret"
+    assert res == {"api_key": "new-key"}
+    # the server invalidates the old key immediately, so the client must
+    # adopt the new one or every later call breaks
+    assert client.api_key == "new-key"
