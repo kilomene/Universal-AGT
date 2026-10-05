@@ -5,6 +5,7 @@ import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { generateHostToken } from '../lib/tokens';
 import { provisioningOrDeploy, requireAgent, requireHost, requirePermission } from '../middleware/auth';
+import { rotationRateLimit } from '../middleware/rateLimit';
 import { publicHost } from './_helpers';
 
 export const hostsRouter = Router();
@@ -62,23 +63,64 @@ hostsRouter.post('/register', provisioningOrDeploy, async (req, res, next) => {
   }
 });
 
+// Upper bound for the rotation grace window (see below).
+const MAX_ROTATE_GRACE_S = 3600;
+
 // POST /v1/hosts/:id/rotate-token — HOST token only, and the token must
-// belong to the host in the path. Returns the NEW host token (shown once);
-// the old token stops working immediately. Emits host.token_rotated.
+// belong to the host in the path. Returns the NEW host token (shown once)
+// and emits host.token_rotated.
+//
+// Six-step rotation flow:
+//   1. authenticate current: requireHost + the token must match the path host
+//   2. generate new: generateHostToken (uagh_ prefix, 256 bits of entropy)
+//   3. hash/store new: only the SHA-256 hex digest is persisted
+//   4. invalidate old: immediately by default. A caller that asks for it
+//      ({"grace_seconds": N}, 1..3600) keeps the OLD token valid for a
+//      grace window instead — the safe sequence for live workers: the
+//      worker fetches the new token, verifies it authenticates, adopts
+//      it, and only then lets the old one die (at grace expiry at the
+//      latest). Without grace, an in-flight worker would be permanently
+//      disconnected the moment it rotated.
+//   5. return new: exactly once, in this response body — never stored
+//      plaintext anywhere
+//   6. never log plaintext: logs/events carry host names and ids only
+//
 // (The host_id in the URL is validated as a UUID by the DB lookup; a
 // non-existent id can never match req.auth.id, so it 403s like a mismatch.)
-hostsRouter.post('/:id/rotate-token', requireHost, async (req, res, next) => {
+hostsRouter.post('/:id/rotate-token', requireHost, rotationRateLimit, async (req, res, next) => {
   try {
     if (req.params.id !== req.auth!.id) {
       sendError(res, 403, 'forbidden', 'host token does not belong to this host');
       return;
     }
+    const rawGrace = (req.body ?? {}).grace_seconds;
+    let graceSeconds = 0;
+    if (rawGrace !== undefined) {
+      const n = Number(rawGrace);
+      if (!Number.isInteger(n) || n < 0 || n > MAX_ROTATE_GRACE_S) {
+        sendError(res, 400, 'bad_request', `grace_seconds must be an integer 0..${MAX_ROTATE_GRACE_S}`);
+        return;
+      }
+      graceSeconds = n;
+    }
     const pool = getPool();
     const { token, hash } = generateHostToken();
-    const { rowCount } = await pool.query(
-      `UPDATE hosts SET token_hash = $2, updated_at = now() WHERE id = $1`,
-      [req.auth!.id, hash],
-    );
+    const { rowCount } = graceSeconds > 0
+      ? await pool.query(
+          `UPDATE hosts
+             SET previous_token_hash = token_hash,
+                 previous_token_expires_at = now() + ($2 || ' seconds')::interval,
+                 token_hash = $3, updated_at = now()
+           WHERE id = $1`,
+          [req.auth!.id, String(graceSeconds), hash],
+        )
+      : await pool.query(
+          `UPDATE hosts
+             SET token_hash = $2, previous_token_hash = NULL,
+                 previous_token_expires_at = NULL, updated_at = now()
+           WHERE id = $1`,
+          [req.auth!.id, hash],
+        );
     if (!rowCount) {
       next(new HttpError(404, 'not_found', 'host not found'));
       return;
@@ -88,7 +130,7 @@ hostsRouter.post('/:id/rotate-token', requireHost, async (req, res, next) => {
       actor_type: 'host',
       actor_id: req.auth!.name,
       host_id: req.auth!.id,
-      payload: {},
+      payload: { grace_seconds: graceSeconds },
     });
     logger.info('host token rotated', { host: req.auth!.name });
     res.json({ host_token: token });
