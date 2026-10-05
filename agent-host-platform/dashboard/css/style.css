@@ -212,3 +212,46 @@ td .mono { color: var(--blue); }
 /* ---------- footer ---------- */
 .foot { text-align: center; padding: 16px; font-size: 12px; }
 .noscript { color: var(--red); text-align: center; padding: 20px; }
+
+/* ---------- overview strip ---------- */
+.strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 28px;
+  padding: 12px 20px;
+  align-items: center;
+}
+.stat { display: flex; flex-direction: column; min-width: 90px; }
+.stat-val { font-size: 22px; font-weight: 700; font-family: var(--mono); }
+.stat-val.bad { color: var(--red); }
+.stat-val.warn { color: var(--orange); }
+.stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+
+/* ---------- row action buttons ---------- */
+.actions-cell { white-space: nowrap; }
+.btn.danger { border-color: #f8514966; color: var(--red); }
+.btn.danger:hover { border-color: var(--red); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.row-actions { display: inline-flex; gap: 6px; }
+
+/* ---------- approvals dossier ---------- */
+.dossier { padding: 10px 12px; background: var(--bg-soft); border-top: 1px solid var(--panel-border); }
+.dossier dl { display: grid; grid-template-columns: 170px 1fr; gap: 4px 12px; margin: 0 0 10px; font-size: 12px; }
+.dossier dt { color: var(--muted); }
+.dossier dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.dossier .muted-note { color: var(--muted); font-size: 12px; }
+.appr-actions { display: flex; gap: 8px; margin-top: 6px; align-items: center; }
+.appr-msg { font-size: 12px; margin: 0; }
+.appr-msg.ok { color: var(--green); }
+.appr-msg.err { color: var(--red); }
+
+/* ---------- modal ---------- */
+.modal-card { max-width: 520px; }
+.modal-summary { font-size: 13px; margin: 12px 0; }
+.modal-summary dl { display: grid; grid-template-columns: 130px 1fr; gap: 6px 12px; margin: 0; }
+.modal-summary dt { color: var(--muted); }
+.modal-summary dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.modal-result { font-size: 13px; margin: 10px 0 0; }
+.modal-result.ok { color: var(--green); }
+.modal-result.err { color: var(--red); }
