@@ -24,6 +24,11 @@
 #   UAHT_REPO_DIR                     path to the Universal-AGT checkout
 #                                     (default: parent of this script's repo)
 #   UAHT_SKIP_APT=1                   skip apt installs (deps pre-installed)
+#   UAHT_INGRESS_ENABLED=1            enable worker-managed public ingress
+#                                     (Phase 7; default: disabled)
+#   UAHT_TUNNEL_TOKEN=<token>         cloudflared tunnel token from the
+#                                     Cloudflare dashboard (required when
+#                                     ingress is enabled)
 #
 # The worker is OUTBOUND ONLY: it opens HTTPS to the control plane and never
 # listens on any port. No inbound firewall rules, no tunnels, no IPs needed.
@@ -40,7 +45,7 @@
 #      usermod -aG docker agenthost
 #      mkdir -p /opt/agent-host/config /opt/agent-host/worker /srv/agent-apps
 #      cp -r <repo>/agent-host-platform/host-worker/{agent,executor,\
-#        deployments,docker,health,logs,updater} /opt/agent-host/worker/
+#        deployments,docker,health,logs,updater,ingress} /opt/agent-host/worker/
 #      chown -R agenthost:agenthost /opt/agent-host /srv/agent-apps
 # 3. Write /opt/agent-host/config/worker.env by hand (see host-worker/
 #    .env.example), mode 0600, owned by agenthost. To provision credentials
@@ -180,6 +185,12 @@ WORKER_HEARTBEAT_INTERVAL=30
 WORKER_WORK_DIR=/opt/agent-host
 WORKER_APPS_DIR=/srv/agent-apps
 WORKER_WORKER_VERSION=$UAHT_WORKER_VERSION
+# --- optional public ingress (Phase 7; disabled by default) -----------------
+# Set UAHT_INGRESS_ENABLED=1 + UAHT_TUNNEL_TOKEN in the installer environment
+# to enable the worker-managed cloudflared tunnel (outbound-only).
+WORKER_INGRESS_ENABLED=${UAHT_INGRESS_ENABLED:-false}
+WORKER_INGRESS_PROVIDER=cloudflare-tunnel
+UAHT_TUNNEL_TOKEN=${UAHT_TUNNEL_TOKEN:-}
 EOF
 chown "$WORKER_USER:$WORKER_USER" "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
