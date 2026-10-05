@@ -12,6 +12,18 @@ Content-Type: `application/json` everywhere unless noted.
 
 ## Changelog
 
+- **2026-10-05 — Phase 9 (end-to-end testing).**
+  - **Additive (backwards compatible):** `POST /v1/deployments` now injects
+    `artifact_checksum` + `artifact_size` into the `type=deploy` task payload
+    from the verified artifact row (422 when the artifact has no verified
+    checksum). Previously the worker refused every artifact-based deploy
+    with "no artifact_checksum in payload" because the task payload never
+    carried it — the E2E suite caught the wiring gap.
+  - **Worker fix (no protocol change):** the dispatcher no longer re-reports
+    `claimed` after a successful claim — the claim endpoint already moved
+    `queued → claimed` atomically, and re-reporting was a `claimed →
+    claimed` self-transition the state machine rejects (409), which failed
+    every dispatched task. First progress report is now `running`.
 - **2026-10-05 — Phase 7 (public ingress, honest architecture).**
   - **The honest problem (spec §28):** the persistent host is outbound-only,
     so DNS CNAME records alone CANNOT make it publicly reachable. Phase 7
@@ -548,7 +560,12 @@ like `256m|1g`; `resources.cpu` positive number; `restart` in
 
 ## 5. Task payloads by type
 
-- `deploy`: `{project_id, version, artifact_id?, manifest?}` (+ secrets injected server-side)
+- `deploy`: `{project_id, project_name, host_id, version, artifact_id?,
+  artifact_checksum?, artifact_size?, requested_host_port?, deployment_id,
+  manifest?}` — the control plane injects `project_name` (from the project
+  row) and `artifact_checksum`/`artifact_size` (from the verified artifact
+  row) on `POST /v1/deployments` (2026-10-05); the worker refuses artifact
+  deploys without `artifact_checksum` (+ secrets injected server-side)
 - `rollback`: `{deployment_id, target_deployment_id?}` — the control plane
   sets `target_deployment_id` to the last healthy deployment of the same
   project+host; a hand-built task may omit it (worker picks the newest
