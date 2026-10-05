@@ -1,0 +1,1 @@
+{"build":{"context":".","dockerfile":"Dockerfile"},"env":{"APP_NAME":"demo-app","APP_VERSION":"1.0.0"},"name":"demo-app","resources":{"cpu":0.1,"memory":"64m"},"restart":"unless-stopped","runtime":"docker","service":{"healthcheck":"/health","port":3000}}
