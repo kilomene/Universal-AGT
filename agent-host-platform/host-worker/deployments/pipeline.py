@@ -11,6 +11,14 @@ most defensive:
   * the previous healthy deployment's container is kept (stopped) so a
     failed healthcheck can roll back to it;
   * every subprocess call is an argv list — never shell=True.
+  * container names are unique per deployment attempt
+    (uaht-<project>-<version>-<deployment[:8]>): redeploying the same
+    version never stop+rms the live container — it survives until the new
+    one passes health, then it is stopped (kept, not removed) as before;
+  * before every `docker run` the host port is verified free both at OS
+    level (bind test) and Docker level (`docker ps` published-port scan);
+    a collision fails the task with a clear error instead of a cryptic
+    `docker run` failure.
 
 Deployment state is recorded under <work_dir>/deployments/<deployment_id>/
 via deployments.state.DeploymentStore. Secret env values are injected into
@@ -119,6 +127,53 @@ def pick_free_port(used: set, log=None) -> int:
     raise DeployError("could not find a free host port after 20 attempts")
 
 
+def published_host_ports(ports_text) -> list:
+    """All host ports published in a `docker ps` Ports cell, in order.
+
+    Cells look like "0.0.0.0:8080->3000/tcp, :::8080->3000/tcp" (or are
+    empty for unexposed containers). Pure function — unit tested.
+    """
+    return [int(m.group(1)) for m in re.finditer(r":(\d+)->", ports_text or "")]
+
+
+def verify_host_port_free(docker, host_port: int, log=None) -> None:
+    """Fail with DeployError unless host_port is free, twice over.
+
+    OS level: bind the port ourselves — catches anything listening on the
+    host (including docker's own published-port proxy). Docker level: scan
+    `docker ps -a` published ports — catches ports docker holds on a
+    specific interface that a wildcard bind might miss.
+
+    Called before every `docker run`; a collision fails the task with a
+    clear error instead of a cryptic `docker run` failure.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("0.0.0.0", host_port))
+    except OSError:
+        raise DeployError(
+            f"host port {host_port} is already in use on this host "
+            f"(OS bind test failed); refusing docker run"
+        )
+    try:
+        rows = docker.ps(all=True)
+    except Exception as exc:
+        raise DeployError(
+            f"could not list docker containers to verify port "
+            f"{host_port} is free: {exc}"
+        )
+    used = set()
+    for row in rows or []:
+        used.update(published_host_ports(row.get("Ports")))
+    if host_port in used:
+        raise DeployError(
+            f"host port {host_port} is already published by another docker "
+            f"container; refusing docker run"
+        )
+    if log:
+        log(f"host port {host_port} verified free (OS bind + docker ps)")
+
+
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -170,7 +225,14 @@ def deploy(ctx, task: dict) -> dict:
     image_tag = payload.get("image")  # alternative: run a prebuilt image
     safe_project = re.sub(r"[^a-z0-9_.-]+", "-", str(project_name).lower()).strip("-") or "app"
     safe_version = re.sub(r"[^a-z0-9_.-]+", "-", str(version).lower()).strip("-") or "v0"
-    container_name = f"uaht-{safe_project}-{safe_version}"
+    # Unique per deployment attempt: redeploying the same version must NOT
+    # stop+rm the live container before the new one passes health. The old
+    # container keeps its own name and survives until the new one is
+    # healthy; then it is stopped (kept, not removed) as before. The actual
+    # name is stored in state.json, which is what reconcile/handlers use —
+    # the uaht-<project>-<version>- prefix stays docker-ps-greppable.
+    attempt_suffix = re.sub(r"[^a-z0-9]+", "", str(deployment_id).lower())[:8] or "retry"
+    container_name = f"uaht-{safe_project}-{safe_version}-{attempt_suffix}"
     built_image = image_tag or f"uaht-{safe_project}:{safe_version}"
 
     if artifact_id:
@@ -325,7 +387,27 @@ def deploy(ctx, task: dict) -> dict:
     if runtime == "docker-compose":
         host_port = effective_health_port
     else:
-        host_port = pick_free_port(store.used_host_ports(), log=log)
+        requested = payload.get("requested_host_port")
+        if requested is not None:
+            # Fixed port reserved in the control plane's port registry for
+            # this deployment: use it, after verifying it is really free.
+            try:
+                requested_port = int(requested)
+            except (TypeError, ValueError):
+                raise DeployError(
+                    f"invalid requested_host_port {requested!r}; "
+                    f"expected an integer 1-65535"
+                )
+            if not 1 <= requested_port <= 65535:
+                raise DeployError(
+                    f"invalid requested_host_port {requested!r}; "
+                    f"expected an integer 1-65535"
+                )
+            host_port = requested_port
+            log(f"using registry-reserved host port {host_port}")
+        else:
+            host_port = pick_free_port(store.used_host_ports(), log=log)
+        verify_host_port_free(docker, host_port, log=log)
         if docker.container_exists(container_name):
             log(f"removing stale container {container_name}")
             docker.stop(container_name)
@@ -444,10 +526,7 @@ def _discover_compose_port(docker, compose_project: str, log) -> Optional[int]:
         names = row.get("Names", "")
         if compose_project not in names:
             continue
-        ports = row.get("Ports", "")
-        # e.g. "0.0.0.0:32768->3000/tcp"
-        import re as _re
-        m = _re.search(r"[\d.]+:(\d+)->\d+/", ports)
-        if m:
-            return int(m.group(1))
+        found = published_host_ports(row.get("Ports"))
+        if found:
+            return found[0]
     return None
