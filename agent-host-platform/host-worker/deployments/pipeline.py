@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Optional
 
 from deployments.manifest import parse_memory_mb, validate_manifest
+from deployments import compose_validate
 from deployments import gc
 from health import checker as health_checker
 from health import collector as health_collector
@@ -106,11 +107,21 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
     the pipeline stores downloads as <artifact_id>.bin, so an extension
     check would reject every real artifact.
 
-    Tar extraction uses ``tarfile.data_filter`` (Python 3.12+): it blocks
-    absolute paths, ``..`` escapes, and — critically — symlink/hardlink
-    members that point outside the destination (the pre-extract member
-    loop it replaces could be bypassed by extracting a symlink first and
-    then a file *through* it).
+    Tar member names are pre-scanned with an explicit confinement check:
+    absolute paths and ``..`` escapes fail fast with a clear DeployError
+    (data_filter would merely strip a leading "/" and keep going — a
+    malicious archive must FAIL, not silently land renamed files).
+    Extraction itself uses ``tarfile.data_filter`` (Python 3.12+): it
+    blocks — critically — symlink/hardlink members that point outside the
+    destination (the naive pre-extract loop it replaces could be bypassed
+    by extracting a symlink first and then a file *through* it).
+
+    Zip members are pre-scanned the same way; ``zipfile.extractall``
+    always materializes entries as regular files, so symlink-flagged
+    zip entries can never become real symlinks.
+
+    All extraction failures surface as DeployError with a clear message —
+    tar/zip library errors are wrapped, never leaked raw.
     """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
@@ -121,19 +132,34 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
             raise DeployError(f"archive member escapes destination: {member!r}")
         return target
 
-    if tarfile.is_tarfile(archive_path):
-        with tarfile.open(archive_path, "r") as tf:
-            tf.extractall(dest, filter="data")
-    elif zipfile.is_zipfile(archive_path):
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            for member in zf.namelist():
-                _safe_join(dest, member)
-            zf.extractall(dest)
-    else:
-        raise DeployError(
-            f"unsupported artifact format: {archive_path!r} "
-            "(expected a tar archive or a zip file)"
-        )
+    try:
+        if tarfile.is_tarfile(archive_path):
+            with tarfile.open(archive_path, "r") as tf:
+                # Pre-scan every member name: data_filter neutralizes
+                # absolute paths by stripping the leading "/" (extracting
+                # them inside dest), but a malicious archive must FAIL with
+                # a clear error, not silently land renamed files.
+                for member in tf.getnames():
+                    _safe_join(dest, member)
+                tf.extractall(dest, filter="data")
+        elif zipfile.is_zipfile(archive_path):
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                for member in zf.namelist():
+                    _safe_join(dest, member)
+                zf.extractall(dest)
+        else:
+            raise DeployError(
+                f"unsupported artifact format: {archive_path!r} "
+                "(expected a tar archive or a zip file)"
+            )
+    except DeployError:
+        raise
+    except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError) as exc:
+        # Corrupt archive, truncated stream, or a data_filter rejection
+        # (.. escape, symlink/hardlink pointing outside). Absolute paths
+        # are rejected earlier by the pre-scan. Nothing partial is
+        # trusted: extraction already aborted.
+        raise DeployError(f"archive extraction failed: {exc}") from exc
     return str(dest)
 
 
@@ -160,6 +186,59 @@ def pick_free_port(used: set, log=None) -> int:
         if port not in used:
             return port
     raise DeployError("could not find a free host port after 20 attempts")
+
+
+# Fields of the persisted deployment contract every docker-run rebuild must
+# come from. The pipeline writes them; environment-update and reconcile read
+# them back through run_spec_from_state(). States written before the full
+# contract existed simply lack the keys (handled as documented there).
+DEFAULT_RESTART_POLICY = "unless-stopped"
+
+
+def run_spec_from_state(state: dict) -> dict:
+    """Rebuild the ``docker run`` spec from a persisted deployment contract.
+
+    Returns ``{"image", "ports", "memory", "cpus", "restart"}``.
+
+    This is the SINGLE place environment-update and reconcile derive run
+    behavior from. They must never fall back to hard-coded defaults or
+    re-derive the spec from ``docker inspect`` while the contract is
+    present — a deployment's restart policy, resource limits, image,
+    container name and port mapping are deployment-time facts, and the
+    state file is where they live.
+
+    Back-compat: states written before the full contract was persisted
+    lack the newer keys. Missing ``restart`` falls back to
+    ``unless-stopped`` (the historical default); missing ``resources``
+    means no limits; a missing ``ports`` mapping falls back to the legacy
+    single ``host_port``/``container_port`` pair. Every fallback is a
+    documented degradation for old states, not a reconstruction path for
+    new ones.
+    """
+    resources = state.get("resources") or {}
+    ports: dict = {}
+    stored_ports = state.get("ports") or {}
+    for host_port, container_port in stored_ports.items():
+        try:
+            ports[int(host_port)] = int(container_port)
+        except (TypeError, ValueError):
+            continue
+    if not ports:
+        # Pre-contract states: single host_port/container_port pair.
+        host_port, container_port = state.get("host_port"), state.get("container_port")
+        try:
+            if host_port and container_port:
+                ports[int(host_port)] = int(container_port)
+        except (TypeError, ValueError):
+            pass
+    cpu = resources.get("cpu")
+    return {
+        "image": state.get("image"),
+        "ports": ports or None,
+        "memory": resources.get("memory"),
+        "cpus": str(cpu) if cpu else None,
+        "restart": state.get("restart") or DEFAULT_RESTART_POLICY,
+    }
 
 
 def published_host_ports(ports_text) -> list:
@@ -349,25 +428,47 @@ def deploy(ctx, task: dict) -> dict:
     secret_env = sanitize_env({**fetched_secrets, **payload_secrets}, log=log)
     run_env = {**manifest_env, **secret_env}  # secrets override manifest env
 
-    # -- 3. host resource check ---------------------------------------------
-    if resources.get("memory"):
-        need_mb = parse_memory_mb(resources["memory"])
-        have_mb = health_collector.total_ram_mb()
-        log(f"resource check: need {need_mb}MB ram, host has {have_mb}MB")
-        if have_mb and need_mb > have_mb:
-            raise DeployError(
-                f"insufficient host memory: manifest needs {need_mb}MB, "
-                f"host has {have_mb}MB"
-            )
-    if resources.get("cpu"):
-        need_cpu = float(resources["cpu"])
-        have_cpu = health_collector.total_cpu()
-        log(f"resource check: need {need_cpu} cpu, host has {have_cpu}")
-        if need_cpu > have_cpu:
-            raise DeployError(
-                f"insufficient host CPU: manifest needs {need_cpu}, "
-                f"host has {have_cpu}"
-            )
+    # -- 3. host resource check (admission control on RESERVED resources) ----
+    # allocated = sum of reservations from running deployments' manifests
+    # (see health.collector.allocated_resources); utilized = instantaneous
+    # measured usage, which is IRRELEVANT here. A deployment is admitted
+    # only when total - allocated covers its request: a host at 2% CPU can
+    # still refuse a deployment whose reservations are already full.
+    # Note: the previous deployment of this project (if any) is still
+    # 'running' at this point — both containers briefly exist during the
+    # healthcheck window, so its reservation correctly counts as allocated.
+    if resources.get("memory") or resources.get("cpu"):
+        allocated = health_collector.allocated_resources(store)
+        if resources.get("memory"):
+            need_mb = parse_memory_mb(resources["memory"])
+            total_mb = health_collector.total_ram_mb()
+            avail_mb = total_mb - allocated["ram_mb"]
+            log(f"resource check: need {need_mb}MB ram, host total "
+                f"{total_mb}MB, reserved {allocated['ram_mb']}MB, "
+                f"available {avail_mb:.0f}MB")
+            if total_mb > 0 and need_mb > avail_mb:
+                raise DeployError(
+                    f"insufficient reservable memory: deployment requests "
+                    f"{need_mb}MB but only {max(avail_mb, 0):.0f}MB is "
+                    f"available (host total {total_mb}MB, "
+                    f"{allocated['ram_mb']}MB already reserved by running "
+                    f"deployments)"
+                )
+        if resources.get("cpu"):
+            need_cpu = float(resources["cpu"])
+            total_cpus = health_collector.total_cpu()
+            avail_cpu = total_cpus - allocated["cpu"]
+            log(f"resource check: need {need_cpu} cpu, host total "
+                f"{total_cpus}, reserved {allocated['cpu']}, "
+                f"available {avail_cpu:.2f}")
+            if total_cpus > 0 and need_cpu > avail_cpu:
+                raise DeployError(
+                    f"insufficient reservable CPU: deployment requests "
+                    f"{need_cpu} but only {max(avail_cpu, 0):.2f} is "
+                    f"available (host total {total_cpus}, "
+                    f"{allocated['cpu']} already reserved by running "
+                    f"deployments)"
+                )
 
     docker = ctx.require_docker()
 
@@ -383,6 +484,7 @@ def deploy(ctx, task: dict) -> dict:
     effective_health_port = None  # for compose-discovered ports
     compose_file = None
     compose_project_name = None
+    compose_ports = None  # published host ports declared by the compose file
     image_built = False  # True only when THIS deploy ran docker build
     if runtime == "docker":
         if payload.get("image"):
@@ -433,10 +535,36 @@ def deploy(ctx, task: dict) -> dict:
                 f"could not read normalized compose model for {compose_file}: "
                 f"{exc}"
             )
+        # W5/W7: explicit DENY-list validation of the compose model BEFORE
+        # `compose up`. A task-controlled compose file must not smuggle
+        # privileged mode, host namespaces, host devices, added
+        # capabilities, custom security options, or bind mounts escaping
+        # the deployment workspace.
+        compose_errors = compose_validate.validate_compose_model(
+            compose_model, workspace=extract_base, compose_file=compose_file)
+        if compose_errors:
+            raise DeployError(
+                "compose file rejected by security policy: "
+                + "; ".join(compose_errors))
+        log("compose file passed security validation")
         wanted_ports = parse_compose_published_ports(compose_model)
         log(f"compose declares published host ports: {wanted_ports or 'none'}")
+        # Ports held by the previous generation of THIS project are not a
+        # collision (redeploy replaces its own stack in place).
+        previous_ports: set = set()
+        if previous:
+            if previous.get("host_port"):
+                previous_ports.add(int(previous["host_port"]))
+            for p in previous.get("compose_ports") or []:
+                try:
+                    previous_ports.add(int(p))
+                except (TypeError, ValueError):
+                    continue
         verify_compose_ports_free(docker, compose_project_name, wanted_ports,
-                                  log=log)
+                                  log=log,
+                                  registry_used=store.used_host_ports()
+                                  - previous_ports)
+        compose_ports = sorted(wanted_ports) or None
         log(f"docker compose up: {compose_file} (project {compose_project_name})")
         docker.compose_up(compose_file, project_name=compose_project_name,
                           build=True)
@@ -531,11 +659,27 @@ def deploy(ctx, task: dict) -> dict:
             "container_name": container_name if new_container_started else None,
             "compose_project": compose_project_name,
             "compose_file": compose_file,
+            "compose_ports": compose_ports,
             "image": built_image,
             "image_built": image_built,  # GC may only remove images we built
             "runtime": runtime,
             "host_port": host_port,
             "container_port": container_port,
+            # Full deployment contract (W4): every later rebuild of this
+            # deployment — env updates, restarts, post-reboot reconcile —
+            # derives its run behavior from THESE fields via
+            # run_spec_from_state(), never from hard-coded defaults or
+            # re-derived `docker inspect` output.
+            "ports": {str(host_port): container_port} if host_port else None,
+            "restart": restart_policy,
+            "resources": {
+                "cpu": resources.get("cpu"),
+                "memory": resources.get("memory"),
+            },
+            "volumes": manifest_data.get("volumes"),
+            "healthcheck": manifest_data.get("healthcheck"),
+            "domains": manifest_data.get("domains"),
+            "manifest": manifest_data,
             "healthcheck_path": healthcheck_path,
             "env": manifest_env,  # secrets deliberately NOT persisted
             "status": "running",
@@ -618,11 +762,22 @@ def deploy(ctx, task: dict) -> dict:
         "container_name": None,
         "compose_project": None,
         "compose_file": compose_file,
+        "compose_ports": compose_ports,
         "image": built_image,
         "image_built": image_built,
         "runtime": runtime,
         "host_port": None,
         "container_port": container_port,
+        "ports": None,
+        "restart": restart_policy,
+        "resources": {
+            "cpu": resources.get("cpu"),
+            "memory": resources.get("memory"),
+        },
+        "volumes": manifest_data.get("volumes"),
+        "healthcheck": manifest_data.get("healthcheck"),
+        "domains": manifest_data.get("domains"),
+        "manifest": manifest_data,
         "healthcheck_path": healthcheck_path,
         "env": manifest_env,
         "status": "rolled_back" if rolled_back_to else "failed",
@@ -735,13 +890,18 @@ def _parse_compose_short_port(spec: str) -> list:
 
 
 def verify_compose_ports_free(docker, compose_project: str,
-                              wanted_ports: list, log=None) -> None:
+                              wanted_ports: list, log=None,
+                              registry_used: Optional[set] = None) -> None:
     """Verify every host port a compose file wants to publish is free —
     the same OS-bind + docker-ps check `docker run` gets.
 
     Ports already held by THIS compose project's current stack are skipped:
     a redeploy replaces its own stack in place (`compose up` on the same
     project name), so its own ports are not a collision.
+
+    ``registry_used`` (optional): host ports the control-plane port
+    registry / deployment store has reserved for other deployments.
+    Catches the window where a port is allocated but not yet bound.
     """
     own: set = set()
     try:
@@ -750,6 +910,11 @@ def verify_compose_ports_free(docker, compose_project: str,
     except Exception:
         own = set()
     for port in sorted(set(wanted_ports) - own):
+        if registry_used and port in registry_used:
+            raise DeployError(
+                f"host port {port} is reserved by another deployment "
+                f"(port registry); refusing compose up"
+            )
         verify_host_port_free(docker, port, log=log)
     if log and wanted_ports:
         log(f"compose ports verified: wanted={sorted(set(wanted_ports))} "
