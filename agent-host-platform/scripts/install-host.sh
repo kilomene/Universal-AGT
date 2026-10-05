@@ -234,9 +234,11 @@ WORKER_WORKER_VERSION=$UAHT_WORKER_VERSION
 # --- optional public ingress (Phase 7; disabled by default) -----------------
 # Set UAHT_INGRESS_ENABLED=1 + UAHT_TUNNEL_TOKEN in the installer environment
 # to enable the worker-managed cloudflared tunnel (outbound-only).
+# UAHT_TUNNEL_TOKEN is the operator input; it is written into worker.env as
+# WORKER_TUNNEL_TOKEN (see docs/CONFIG.md).
 WORKER_INGRESS_ENABLED=${UAHT_INGRESS_ENABLED:-false}
 WORKER_INGRESS_PROVIDER=cloudflare-tunnel
-UAHT_TUNNEL_TOKEN=${UAHT_TUNNEL_TOKEN:-}
+WORKER_TUNNEL_TOKEN=$UAHT_TUNNEL_TOKEN
 EOF
 chown "$WORKER_USER:$WORKER_USER" "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
