@@ -123,9 +123,38 @@ Scope: honest ingress design — DNS≠reachability; optional modular ingress
 | Tests | ✅ worker 244 pytest (28 new ingress), API 166 vitest (8 new), JS SDK 24, Python SDK 24, CLI smoke 20/20 — all green. |
 | Accepted limitations (documented, not fixed) | For dashboard-created (token) tunnels, Cloudflare reads public-hostname routes from the tunnel's dashboard config, not from the worker's `config.yml` — the operator must add each hostname in **Zero Trust → Networks → Tunnels → Public hostnames**. Tunnel creation, token provisioning, and the dashboard hostname entries are human steps by design. The tunnel token is visible in the host's process table to local root (argv) — accepted, documented. |
 
----
+## Phase 9 resolution (2026-10-05)
 
-## Acceptance criteria mapping (spec §59, 38 items)
+Scope: deterministic E2E suite (demo app; agent-disappearance;
+manual approve/reject; broken app; health-fail rollback; multi-app)
+against a fake control plane + real API logic; mark live-infra needs
+explicitly. The suite caught **three real integration bugs** that no
+earlier suite could see (nothing had ever driven the real dispatcher
+against the real progress state machine):
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Worker dispatcher re-reported `claimed` after a successful claim. The claim endpoint already moves `queued → claimed` atomically, and the control-plane state machine has no self-transitions — so the re-report 409'd and the dispatcher's own error path then marked **every** task failed. | **Fixed.** Dispatcher goes straight to `running` (matches its own NB comment). |
+| 2 | `_ProgressStreamer._stop = threading.Event()` shadowed `threading.Thread._stop()` (internal cleanup called from `_wait_for_tstate_lock`), so `streamer.join()` raised `TypeError: 'Event' object is not callable` — also failing every dispatched task. No existing test ever started the streamer thread. | **Fixed.** Renamed to `_stop_event` with a comment explaining why. |
+| 3 | `POST /v1/deployments` never put `artifact_checksum` (or `project_name`) in the `type=deploy` task payload, but the worker *requires* both (`refusing to deploy: payload has artifact_id but no artifact_checksum`; `deploy payload needs project_id, project_name and version`). Every artifact-based deployment failed at the worker. | **Fixed** (additive, backwards compatible). The route now injects `project_name` (from the project row) and `artifact_checksum`/`artifact_size` (from the verified artifact row); 422 when the artifact has no verified checksum. PROTOCOL §5 + Changelog updated. |
+
+Supporting change (semantics-preserving, enables route tests): the
+progress route's lease SQL `now() + make_interval(secs => $6)` became
+`now() + ($6 || ' seconds')::interval` — identical in real Postgres,
+parseable by pg-mem. (The claim route keeps `FOR UPDATE SKIP LOCKED`,
+which pg-mem cannot plan; the atomic claim is instead covered by the
+Python E2E against the faithful in-memory plane.)
+
+| What | Status |
+|---|---|
+| Demo app (`examples/demo-app/`) | ✅ Zero-dependency Python stdlib app: `GET /` hello page, `GET /health` → 200, `GET /version`; `Dockerfile`; `agent.deploy.json` (valid per the manifest validator); README. |
+| Worker E2E (`host-worker/tests/test_e2e.py`, 6 scenarios) | ✅ All pass (~16s). Fake in-memory control plane over **real HTTP** (state machine, retry classification, event mirroring, and deployment creation all mirror the real routes); `SubprocessDockerClient` runs the artifact's **real** `server.py` as a subprocess with the mapped host port; the **real** `ControlPlaneClient`, **real** `TaskDispatcher`, **real** pipeline, **real** health checker, real stores. (a) full chain incl. secrets-in-env/not-in-state + exact event order; (b) agent disappears mid-deploy, reconnects, retrieves final state; (c) manual approve → proceeds / reject → never starts (zero docker calls); (d) broken build → task failed, logs retained, v1 still serving; (e) health-fail → auto-rollback, v1 restarted, v2 removed; (f) 3 apps on distinct ports/names/dirs, stop one leaves the others, logs separate. Every scenario asserts the task↔deployment↔project↔artifact↔host correlation chain. |
+| API flow tests (`control-plane/api/test/e2eFlows.test.ts`, 21 tests) | ✅ All pass. Real Express app on pg-mem: deployment creation auto/manual, `artifact_checksum` injection (+422 when missing), approve/reject permission (403 without `approve_deployments`) + semantics (409s), full `running → completed` progress with deployment mirroring + ports persistence + event order + log file, `running → failed` mirroring, retry-parking (`retrying`), illegal-transition 409, cross-host 403, cancel semantics (creator-cancel, non-owner 403, terminal 409, awaiting_approval escape hatch). |
+| Live-infra checklist (`docs/e2e-live-checklist.md`) | ✅ 14 concrete checks (commands + expected outputs + pass criteria) for the day we have Supabase + a real Linux host: migrations, registration gate, worker install (outbound-only verified), full Docker deploy, manual gate, agent disappearance, broken app, health-fail rollback, multi-app + port collision, reboot, crash, Cloudflare tunnel, secrets, sweeper behavior. |
+| Tests | ✅ worker 250 pytest (6 new E2E), API 187 vitest (21 new), JS SDK 28, Python SDK 27, CLI smoke 20/20, dashboard static check — all green. |
+| Honest limitations (documented, not fixed) | The E2E fake collapses the host→container port mapping (no network namespaces), fakes Docker build/push semantics (marker-file failures), and cannot test `FOR UPDATE SKIP LOCKED` contention, real reboot/systemd behavior, real Cloudflare, or real Postgres. Those are exactly what `docs/e2e-live-checklist.md` covers. The dispatcher's log-chunk streamer still 409s its `running → running` self-reports against the real state machine (swallowed by design — best-effort; the final report carries the tail). |
+
+---
 
 | # | Criterion | Verdict |
 |---|---|---|
@@ -134,25 +163,25 @@ Scope: honest ingress design — DNS≠reachability; optional modular ingress
 | 3 | Persistent host can authenticate | ✅ |
 | 4 | Host requires no publicly exposed IP | ✅ by design (outbound-only) |
 | 5 | Host connects outbound | ✅ |
-| 6 | Host survives reboot | ⚠️ containers return via restart policy; **no reconciliation** — needs live test |
-| 7 | Worker survives crash | ✅ systemd `Restart=always` — needs live test |
+| 6 | Host survives reboot | ⚠️ containers return via restart policy; **no reconciliation** — needs live test (checklist #10) |
+| 7 | Worker survives crash | ✅ systemd `Restart=always` — needs live test (checklist #11) |
 | 8 | Tasks persist | ✅ (DB-backed) |
 | 9 | Tasks are idempotent | ⚠️ task keys yes; **deployment replay broken** for artifact/manual |
 | 10 | Tasks are atomically claimed | ✅ (`FOR UPDATE SKIP LOCKED`) |
 | 11 | Artifacts upload | ✅ |
 | 12 | Artifacts verify | ✅ (SHA-256, quarantine) |
-| 13 | Automatic deployment works | ✅ (fake-docker proven; needs live test) |
-| 14 | Manual deployment works | ✅ (state machine; needs live test) |
-| 15 | Docker deployment works | ⚠️ (fake-docker only; no daemon here) |
+| 13 | Automatic deployment works | ✅ (E2E-proven locally incl. the checksum/project_name wiring fix; needs live Docker test — checklist #4) |
+| 14 | Manual deployment works | ✅ (E2E-proven: approve→proceeds, reject→never starts; needs live test — checklist #5) |
+| 15 | Docker deployment works | ⚠️ (E2E-proven via subprocess-backed fake; real daemon needs live host — checklist #4) |
 | 16 | Multiple applications work | ⚠️ (isolation design sound; no port registry — collision possible) |
 | 17 | Health checks work | ⚠️ (HTTP-only) |
-| 18 | Failed deployment handled | ✅ (fake-docker proven) |
-| 19 | Rollback works | ⚠️ worker-side ✅; **API endpoint ❌ always 500** |
+| 18 | Failed deployment handled | ✅ (E2E-proven: broken build fails clean, logs retained, previous version keeps serving) |
+| 19 | Rollback works | ✅ (worker-side auto-rollback E2E-proven; API endpoint fixed in Phase 3, route-tested) |
 | 20 | Logs work | ✅ |
 | 21 | Events work | ✅ |
-| 22 | Secrets protected | ⚠️ encrypted at rest; **delivery to hosts unimplemented** |
+| 22 | Secrets protected | ✅ (encrypted at rest + host delivery; E2E proves container-env injection, never in state.json/logs) |
 | 23 | Resource limits work | ⚠️ manifest→docker flags; no aggregate accounting |
-| 24 | Agent disappearance doesn't stop deployment | ✅ by design (control plane is source of truth) |
+| 24 | Agent disappearance doesn't stop deployment | ✅ (E2E-proven: completes with no agent polling; state retrievable on reconnect; live variant — checklist #6) |
 | 25 | Host disappearance detected | ❌ no sweeper |
 | 26 | Host reconnects | ⚠️ fixed 5s retry, no backoff |
 | 27 | Worker updates safely | ⚠️ no post-restart gate |
@@ -164,11 +193,11 @@ Scope: honest ingress design — DNS≠reachability; optional modular ingress
 | 33 | Cloudflare works where configured | ✅ (mocked; needs live CF test) |
 | 34 | Public ingress works | ❌ **not designed** — Phase 7 |
 | 35 | Domain routing works | ⚠️ DNS only; no traffic path |
-| 36 | Security tests pass | ✅ Phase 6 findings resolved; worker 216, API 158, JS 24, Python 24, CLI smoke 20/20 |
-| 37 | End-to-end tests pass | ❌ no E2E suite yet |
+| 36 | Security tests pass | ✅ Phase 6 findings resolved; worker 250, API 187, JS 28, Python 27, CLI smoke 20/20 |
+| 37 | End-to-end tests pass | ✅ 6/6 worker E2E + 21/21 API flow tests green locally; live-infra variants in `docs/e2e-live-checklist.md` |
 | 38 | Documentation accurate | ⚠️ mostly; `agent-integration.md` missing, some drift |
 
-**Score: 15 ✅ · 16 ⚠️ · 7 ❌** (of 38)
+**Score: 18 ✅ · 14 ⚠️ · 6 ❌** (of 38)
 
 ---
 
@@ -181,7 +210,7 @@ Scope: honest ingress design — DNS≠reachability; optional modular ingress
 - **Phase 6** — fix security findings 1–18 in priority order; add security tests (auth bypass, permission bypass, path traversal, tar-slip, extra_args rejection, artifact scoping); document worker privilege rationale.
 - **Phase 7** — honest ingress design: document why DNS≠reachability; implement optional modular ingress (cloudflared tunnel managed by worker, or control-plane-relayed); keep provider-neutral interface.
 - **Phase 8** — dashboard approvals UI + destructive-action confirmations + agents/projects pages; CLI `--json` already there — verify all commands; SDK parity re-check.
-- **Phase 9** — deterministic E2E suite (demo app; agent-disappearance; manual approve/reject; broken app; health-fail rollback; multi-app) against fake docker + real API logic; mark live-infra needs explicitly.
+- **Phase 9** — ✅ done 2026-10-05: deterministic E2E suite (demo app; agent-disappearance; manual approve/reject; broken app; health-fail rollback; multi-app) — 6/6 worker E2E + 21/21 API flow tests green locally; live-infra needs marked explicitly in `docs/e2e-live-checklist.md`.
 - **Phase 10** — update all docs to match reality; production deployment guide.
 
 ## What was NOT rebuilt
