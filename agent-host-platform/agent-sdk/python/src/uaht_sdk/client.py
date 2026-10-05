@@ -137,6 +137,15 @@ class UahtClient:
     def me(self):
         return self._get("/agents/me")
 
+    def rotate_agent_key(self):
+        """Rotate this agent's own API key (protocol §3.1). The server
+        invalidates the old key immediately, so the client adopts the new
+        key on success and keeps working without a manual re-auth."""
+        res = self._post("/agents/me/rotate", {})
+        if isinstance(res, dict) and res.get("api_key"):
+            self.api_key = res["api_key"]
+        return res
+
     # -- §3.2 Tasks ---------------------------------------------------
     def create_task(self, type, payload=None, idempotency_key=None, priority=None, host_id=None, mode=None):
         return self._post(
