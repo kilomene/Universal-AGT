@@ -303,6 +303,21 @@ def test_remove_domain():
     assert kwargs["json"] == {"deployment_id": "d-1", "hostname": "api.example.com"}
 
 
+def test_get_domain():
+    client, fake = client_with(
+        {"/v1/domains/api.example.com": lambda: make_response(
+            200, {"domain": {"hostname": "api.example.com", "status": "active",
+                             "dns_configured": True, "tunnel_configured": True,
+                             "https_reachable": True}})}
+    )
+    out = client.get_domain("api.example.com")
+    method, url, kwargs = fake.calls[0]
+    assert method == "GET"
+    assert url == "https://cp.example.com/v1/domains/api.example.com"
+    assert out["domain"]["status"] == "active"
+    assert out["domain"]["tunnel_configured"] is True
+
+
 def test_get_logs_creates_task_and_polls_to_terminal():
     states = [
         {"task": {"id": "t-9", "status": "running", "result": {"logs": "line1\n"}}},
@@ -438,3 +453,26 @@ def test_rotate_agent_key_posts_and_adopts_new_key():
     # the server invalidates the old key immediately, so the client must
     # adopt the new one or every later call breaks
     assert client.api_key == "new-key"
+
+
+def test_rotate_agent_key_error_keeps_old_key():
+    client, fake = client_with(
+        {"/v1/agents/me/rotate": lambda: make_response(403, {"error": {"code": "forbidden", "message": "missing or invalid bearer token"}})}
+    )
+    with pytest.raises(UahtError) as exc:
+        client.rotate_agent_key()
+    assert exc.value.code == "forbidden"
+    assert exc.value.status == 403
+    # a failed rotation must not clobber the working key
+    assert client.api_key == "sekret"
+
+
+def test_permission_error_surfaces_cleanly():
+    client, fake = client_with(
+        {"/v1/deployments": lambda: make_response(403, {"error": {"code": "forbidden", "message": "missing permission: deploy"}})}
+    )
+    with pytest.raises(UahtError) as exc:
+        client.create_deployment("p1", "v1")
+    assert exc.value.code == "forbidden"
+    assert exc.value.status == 403
+    assert exc.value.message == "missing permission: deploy"
