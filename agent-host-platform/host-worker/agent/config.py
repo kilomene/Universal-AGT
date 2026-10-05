@@ -65,6 +65,9 @@ class WorkerConfig:
     worker_version: str = "0.1.0"
     capabilities: list = field(default_factory=list)
     config_path: str = ""
+    # Crash-loop detection (see deployments.crashloop).
+    crash_loop_threshold: int = 5    # restarts inside the window -> crash loop
+    crash_loop_window_s: int = 300   # observation window, seconds
 
     @classmethod
     def load(cls, config_path: str | None = None, **overrides) -> "WorkerConfig":
@@ -96,6 +99,8 @@ class WorkerConfig:
             "apps_dir": ENV_PREFIX + "APPS_DIR",
             "worker_version": ENV_PREFIX + "WORKER_VERSION",
             "capabilities": ENV_PREFIX + "CAPABILITIES",  # comma-separated
+            "crash_loop_threshold": ENV_PREFIX + "CRASH_LOOP_THRESHOLD",
+            "crash_loop_window_s": ENV_PREFIX + "CRASH_LOOP_WINDOW_S",
         }
         for field_name, env_name in env_map.items():
             if env_name in os.environ:
@@ -115,6 +120,12 @@ class WorkerConfig:
             apps_dir=str(values.get("apps_dir", "/srv/agent-apps")),
             worker_version=str(values.get("worker_version", "0.1.0")),
             config_path=path,
+            crash_loop_threshold=_as_int(
+                values.get("crash_loop_threshold", 5), "crash_loop_threshold"
+            ),
+            crash_loop_window_s=_as_int(
+                values.get("crash_loop_window_s", 300), "crash_loop_window_s"
+            ),
         )
         caps = values.get("capabilities", "")
         if isinstance(caps, str) and caps.strip():
@@ -174,4 +185,6 @@ class WorkerConfig:
             "worker_version": self.worker_version,
             "capabilities": self.capabilities,
             "config_path": self.config_path,
+            "crash_loop_threshold": self.crash_loop_threshold,
+            "crash_loop_window_s": self.crash_loop_window_s,
         }
