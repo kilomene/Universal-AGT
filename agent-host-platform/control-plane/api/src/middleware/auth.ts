@@ -14,6 +14,50 @@ export interface AuthContext {
   permissions: Record<string, boolean>;
 }
 
+// Canonical permission model (least privilege, PROTOCOL §1).
+//
+// Agent permissions are a flat JSONB map on the agent row
+// (agents.permissions): {"deploy": true, ...}. Every mutating agent
+// endpoint is guarded by requirePermission(<one of these>); read-only
+// agent endpoints use 'read_status'. Host-kind callers have NO agent
+// permissions (permissions: {}) and are never checked against this list —
+// host endpoints enforce host self-identity (requireHost + path-id match)
+// instead.
+//
+// Endpoint -> permission mapping:
+//   deploy:                create/update projects, create deployments,
+//                          create/rollback tasks (task types deploy, remove,
+//                          rollback, build, docker-*, environment-update,
+//                          artifact-upload, ingress-sync), artifact init +
+//                          content upload, cancel other agents' tasks,
+//                          register new hosts (alternative to the
+//                          provisioning token)
+//   approve_deployments:   approve/reject awaiting_approval tasks
+//   read_status:           all read-only agent endpoints (tasks, hosts,
+//                          deployments, services, projects, artifacts,
+//                          events, domains listing is NOT here — see below)
+//   restart:               restart/start services
+//   stop:                  stop services
+//   manage_secrets:        create/list/delete project secrets (plaintext
+//                          values are never returned by the list endpoint)
+//   manage_domains:        create/list/delete deployment domain entries
+//
+// "Host admin" lifecycle (register/rotate) is deliberately NOT a
+// permission: host registration requires the UAHT_PROVISIONING_TOKEN
+// (or an agent with deploy) via provisioningOrDeploy, and token rotation
+// is host self-service only (requireHost + the token must belong to the
+// host in the path). No agent permission can mint or rotate host tokens.
+export const PERMISSIONS = [
+  'deploy',
+  'approve_deployments',
+  'read_status',
+  'restart',
+  'stop',
+  'manage_secrets',
+  'manage_domains',
+] as const;
+export type PermissionName = (typeof PERMISSIONS)[number];
+
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
@@ -69,7 +113,12 @@ export async function attachAuth(req: Request, _res: Response, next: NextFunctio
       return next();
     }
 
-    const hostRes = await pool.query(`SELECT id, name FROM hosts WHERE token_hash = $1`, [hash]);
+    const hostRes = await pool.query(
+      `SELECT id, name FROM hosts
+        WHERE token_hash = $1
+           OR (previous_token_hash = $1 AND previous_token_expires_at > now())`,
+      [hash],
+    );
     if (hostRes.rows[0]) {
       const row = hostRes.rows[0];
       req.auth = { kind: 'host', id: row.id, name: row.name, permissions: {} };
