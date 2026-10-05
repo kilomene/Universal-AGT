@@ -14,6 +14,10 @@ import {
 import { decideRetryOutcome } from '../lib/retryPolicy';
 import { canTransitionTask, isTaskStatus, isTerminalTaskStatus } from '../lib/stateMachine';
 import { readTaskSweeperConfig } from '../lib/taskSweeper';
+import {
+  failDomainsForDeployment,
+  reprovisionDomainsForDeployment,
+} from './domains';
 import { requireHost } from '../middleware/auth';
 import { getDecryptedProjectSecrets } from './secrets';
 import { isUuid, publicHost } from './_helpers';
@@ -357,6 +361,39 @@ async function mirrorDeploymentState(
   if (task.type === 'deploy' && !isRollbackTask && nextStatus === 'completed') {
     await releaseSupersededPortAllocations(pool, deployment.project_id, deployment.host_id, deploymentId);
   }
+
+  // Domain lifecycle: a domain must never silently point at a dead
+  // deployment. Terminal transitions fail attached domains (with an event
+  // each, and the dead routes are dropped from the remote tunnel table);
+  // a deployment coming back to `running` re-provisions its failed domains.
+  // These hooks must never take down progress reporting: domain
+  // bookkeeping failures are logged, not raised.
+  if (depStatus && ['failed', 'stopped', 'rolled_back'].includes(depStatus)) {
+    try {
+      const failed = await failDomainsForDeployment(pool, deploymentId, `deployment ${depStatus}`);
+      if (failed > 0) {
+        logger.info('domains failed with deployment', { deployment: deploymentId, depStatus, failed });
+      }
+    } catch (err) {
+      logger.warn('failDomainsForDeployment hook failed', {
+        deployment: deploymentId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (depStatus === 'running' && (task.type === 'deploy' || task.type === 'start')) {
+    try {
+      const healed = await reprovisionDomainsForDeployment(pool, deploymentId);
+      if (healed > 0) {
+        logger.info('domains reprovisioned with deployment', { deployment: deploymentId, healed });
+      }
+    } catch (err) {
+      logger.warn('reprovisionDomainsForDeployment hook failed', {
+        deployment: deploymentId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => {
@@ -485,33 +522,35 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
 
 // ---------------------------------------------------------------------------
 // GET /v1/worker/domains — HOST token only.
-// Every domain entry on this host's non-terminal deployments, so the worker
-// can rebuild its ingress route table (Phase 7):
+// Every ACTIVE tunnel-mode domain on this host's routable deployments, so
+// the worker can rebuild its LOCAL ingress route mirror (Phase 7):
 //   {domains: [{deployment_id, hostname, ingress}]}
-// 'ingress' defaults to 'direct' for entries recorded before Phase 7.
+// Source of truth is the `domains` table (migration 007); only 'active'
+// rows are returned, so the worker never routes a failed/removed domain.
+// NOTE: this mirror does not change routing for token-based tunnels — the
+// authoritative route table is the remote tunnel configuration, which the
+// control plane writes via the Cloudflare API. See docs/cloudflare.md.
 // ---------------------------------------------------------------------------
 workerRouter.get('/domains', requireHost, async (req, res, next) => {
   try {
     const pool = getPool();
     const { rows } = await pool.query(
-      `SELECT id AS deployment_id, domains FROM deployments
-       WHERE host_id = $1 AND status NOT IN ('removed', 'rolled_back', 'failed')`,
-      [req.auth!.id],
+      `SELECT d.deployment_id, d.hostname, d.ingress
+       FROM domains d
+       JOIN deployments dep ON dep.id = d.deployment_id
+       WHERE dep.host_id = $1
+         AND d.status = 'active'
+         AND d.ingress = 'tunnel'
+         AND NOT (dep.status = ANY($2))`,
+      [req.auth!.id, ['failed', 'rolled_back', 'stopped', 'stopping']],
     );
-    const out: Array<{ deployment_id: string; hostname: string; ingress: string }> = [];
-    for (const row of rows) {
-      const entries = Array.isArray(row.domains) ? row.domains : [];
-      for (const e of entries) {
-        if (e && typeof e.hostname === 'string') {
-          out.push({
-            deployment_id: row.deployment_id,
-            hostname: e.hostname,
-            ingress: e.ingress === 'tunnel' ? 'tunnel' : 'direct',
-          });
-        }
-      }
-    }
-    res.json({ domains: out });
+    res.json({
+      domains: rows.map((r) => ({
+        deployment_id: r.deployment_id,
+        hostname: r.hostname,
+        ingress: r.ingress,
+      })),
+    });
   } catch (err) {
     next(err);
   }
