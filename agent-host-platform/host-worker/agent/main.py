@@ -5,9 +5,14 @@ Startup:
      writes them to worker.env; main.py REQUIRES them — it never mints
      credentials on its own)
   2. build WorkerContext (API client, docker client if present, stores)
-  3. start the heartbeat thread (every HEARTBEAT_INTERVAL seconds)
-  4. claim loop: POST /v1/worker/tasks/claim?wait=POLL_WAIT, dispatch each
-     claimed task in a small thread pool, repeat forever
+  3. post-reboot reconciliation: desired-running deployments in state.json
+     vs actual Docker state — restart stopped containers, recreate missing
+     ones (corrupt state.json is quarantined, never fatal)
+  4. start the heartbeat thread (every HEARTBEAT_INTERVAL seconds; consecutive
+     failures back off exponentially with jitter)
+  5. claim loop: POST /v1/worker/tasks/claim?wait=POLL_WAIT, dispatch each
+     claimed task in a small thread pool, repeat forever (claim failures
+     back off exponentially with jitter)
 
 The worker is OUTBOUND ONLY: it opens HTTPS connections to the control
 plane and never listens on any port. SIGTERM/SIGINT shut it down cleanly.
@@ -25,8 +30,11 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from agent.api import ControlPlaneClient, WorkerAPIError
+from agent import backoff as backoff_mod
 from agent.config import ConfigError, WorkerConfig
 from agent.context import WorkerContext
+from deployments import crashloop as crashloop_mod
+from deployments import reconcile as reconcile_mod
 from deployments.state import DeploymentStore
 from docker.client import DockerClient, DockerMissing
 from executor.dispatcher import TaskDispatcher
@@ -90,17 +98,36 @@ def _safe_docker_version(docker) -> str:
 
 
 def heartbeat_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
-    """POST heartbeat every interval; apply advertised worker updates."""
+    """POST heartbeat every interval; apply advertised worker updates.
+
+    Consecutive failures back off exponentially (5s -> 300s cap, jittered)
+    so a dead control plane never hot-spins. Every wait goes through
+    stop_event.wait so SIGTERM stays responsive.
+    """
     config = ctx.config
     api = ctx.api
     failures = 0
     while not stop_event.is_set():
+        wait_secs = config.heartbeat_interval
         try:
             payload = health_collector.collect_metrics(
                 docker_client=ctx.docker,
                 deployment_store=ctx.deployment_store,
                 config=config,
             )
+            # One-shot boot reconciliation summary, sent on the first heartbeat.
+            if getattr(ctx, "reconciliation_report", None) is not None:
+                payload["reconciliation"] = ctx.reconciliation_report
+                ctx.reconciliation_report = None
+            # Crash-loop observation pass; issues ride along in the payload
+            # (the control plane turns them into service.crash_loop events).
+            issues = crashloop_mod.evaluate(
+                ctx,
+                threshold=config.crash_loop_threshold,
+                window_s=config.crash_loop_window_s,
+            )
+            if issues:
+                payload["issues"] = issues
             resp = api.heartbeat(config.host_id, payload)
             failures = 0
             LOG.info("heartbeat ok (pending_tasks=%s)",
@@ -115,16 +142,28 @@ def heartbeat_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
                           config.worker_version, exc)
         except WorkerAPIError as exc:
             failures += 1
-            LOG.warning("heartbeat failed (%d in a row): %s", failures, exc)
+            wait_secs = backoff_mod.backoff_delay(failures)
+            LOG.warning("heartbeat failed (%d in a row, retry in %.0fs): %s",
+                        failures, wait_secs, exc)
         except Exception:
-            LOG.error("heartbeat loop error:\n%s", traceback.format_exc(limit=5))
-        stop_event.wait(config.heartbeat_interval)
+            failures += 1
+            wait_secs = backoff_mod.backoff_delay(failures)
+            LOG.error("heartbeat loop error (retry in %.0fs):\n%s",
+                      wait_secs, traceback.format_exc(limit=5))
+        stop_event.wait(wait_secs)
 
 
 def claim_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
+    """Long-poll for tasks; consecutive claim failures back off exponentially.
+
+    A 204 (no work) or a claimed task both prove the control plane is
+    reachable, so either resets the failure counter. All waits go through
+    stop_event.wait so SIGTERM stays responsive during backoff.
+    """
     config = ctx.config
     api = ctx.api
     dispatcher = TaskDispatcher(ctx, api)
+    failures = 0
     with ThreadPoolExecutor(max_workers=MAX_DISPATCH_WORKERS,
                             thread_name_prefix="dispatch") as pool:
         while not stop_event.is_set():
@@ -132,13 +171,20 @@ def claim_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
                 task = api.claim_task(config.host_id, config.capabilities,
                                       config.poll_wait)
             except WorkerAPIError as exc:
-                LOG.warning("claim failed: %s", exc)
-                stop_event.wait(5)
+                failures += 1
+                wait_secs = backoff_mod.backoff_delay(failures)
+                LOG.warning("claim failed (%d in a row, retry in %.0fs): %s",
+                            failures, wait_secs, exc)
+                stop_event.wait(wait_secs)
                 continue
             except Exception:
-                LOG.error("claim loop error:\n%s", traceback.format_exc(limit=5))
-                stop_event.wait(5)
+                failures += 1
+                wait_secs = backoff_mod.backoff_delay(failures)
+                LOG.error("claim loop error (retry in %.0fs):\n%s",
+                          wait_secs, traceback.format_exc(limit=5))
+                stop_event.wait(wait_secs)
                 continue
+            failures = 0  # reachable: 204 or a claimed task
             if task is None:
                 continue  # 204: nothing within the wait window; long-poll again
             task_id = task.get("id", "?")
@@ -175,6 +221,12 @@ def main(argv=None) -> int:
              {k: v for k, v in config.redacted().items() if k != "host_token"})
 
     ctx = build_context(config)
+
+    # Post-reboot reconciliation: desired state (local state.json) vs actual
+    # Docker state, before any claiming starts. The summary rides along on
+    # the first heartbeat payload.
+    ctx.reconciliation_report = reconcile_mod.reconcile(ctx)
+
     stop_event = threading.Event()
 
     def _stop(signum, frame):
