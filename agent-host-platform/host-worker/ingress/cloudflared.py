@@ -15,8 +15,9 @@ The worker never auto-trusts "latest": an unknown version or a checksum
 mismatch refuses the binary. A failed download logs clearly and leaves
 ingress disabled — the worker keeps running its deployment duties.
 
-The tunnel token comes from worker config / the ``UAHT_TUNNEL_TOKEN``
-environment variable. It is never logged, never appears in status output,
+The tunnel token comes from worker config / the ``WORKER_TUNNEL_TOKEN``
+environment variable (the installer accepts ``UAHT_TUNNEL_TOKEN`` and maps
+it into ``worker.env``). It is never logged, never appears in status output,
 and never lives in the repo.
 
 Route application: the provider rewrites ``config.yml`` (the canonical
