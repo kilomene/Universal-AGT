@@ -56,6 +56,7 @@ function setupDb() {
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'online',
       token_hash TEXT NOT NULL,
+      previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
@@ -88,6 +89,22 @@ function setupDb() {
     CREATE TABLE port_allocations (
       host_id TEXT NOT NULL, port INT NOT NULL, deployment_id TEXT NOT NULL,
       PRIMARY KEY (host_id, port)
+    );
+    CREATE TABLE domains (
+      id TEXT PRIMARY KEY, hostname TEXT NOT NULL,
+      deployment_id TEXT, host_id TEXT,
+      ingress TEXT NOT NULL DEFAULT 'tunnel',
+      status TEXT NOT NULL DEFAULT 'requested',
+      cf_record_id TEXT,
+      dns_configured BOOLEAN NOT NULL DEFAULT false,
+      tunnel_configured BOOLEAN NOT NULL DEFAULT false,
+      https_reachable BOOLEAN NOT NULL DEFAULT false,
+      https_status INT,
+      https_checked_at TIMESTAMPTZ,
+      verified_at TIMESTAMPTZ,
+      error TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE TABLE events (
       id SERIAL PRIMARY KEY, type TEXT NOT NULL,
@@ -134,7 +151,7 @@ async function seedProject(name: string) {
 }
 
 async function wipe() {
-  for (const t of ['events', 'port_allocations', 'tasks', 'deployments', 'artifacts', 'hosts', 'agents', 'projects']) {
+  for (const t of ['events', 'domains', 'port_allocations', 'tasks', 'deployments', 'artifacts', 'hosts', 'agents', 'projects']) {
     await state.pool.query(`DELETE FROM ${t}`);
   }
 }
