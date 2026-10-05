@@ -290,3 +290,98 @@ def test_remove_domain():
     assert method == "DELETE"
     assert url == "https://cp.example.com/v1/domains"
     assert kwargs["json"] == {"deployment_id": "d-1", "hostname": "api.example.com"}
+
+
+def test_get_logs_creates_task_and_polls_to_terminal():
+    states = [
+        {"task": {"id": "t-9", "status": "running", "result": {"logs": "line1\n"}}},
+        {"task": {"id": "t-9", "status": "completed", "result": {"logs": "line1\nline2\n"}}},
+    ]
+    idx = [0]
+
+    def fake_request(self, method, url, **kwargs):
+        fake_request.calls.append((method, url, kwargs))
+        if url.endswith("/v1/tasks") and method == "POST":
+            return make_response(201, {"task": {"id": "t-9", "status": "queued"}})
+        if url.endswith("/v1/tasks/t-9"):
+            resp = make_response(200, states[idx[0]])
+            idx[0] = min(idx[0] + 1, len(states) - 1)
+            return resp
+        raise AssertionError(f"unexpected: {method} {url}")
+
+    fake_request.calls = []
+    session = MagicMock()
+    session.request = fake_request.__get__(session, type(session))
+    client = UahtClient("https://cp.example.com", "k", session=session)
+
+    logs = client.get_logs(deployment_id="d-1", poll_interval=0.001)
+    assert logs == "line1\nline2\n"
+    method, url, kwargs = fake_request.calls[0]
+    assert method == "POST" and url.endswith("/v1/tasks")
+    assert kwargs["json"] == {"type": "logs", "payload": {"deployment_id": "d-1"},
+                              "idempotency_key": None, "priority": None,
+                              "host_id": None, "mode": None}
+
+
+def test_get_logs_polls_existing_task_id():
+    client, fake = client_with(
+        {"/v1/tasks/t-7": lambda: make_response(200, {"task": {"id": "t-7", "status": "completed",
+                                                              "result": {"logs": "boot ok"}}})}
+    )
+    logs = client.get_logs(task_id="t-7", poll_interval=0.001)
+    assert logs == "boot ok"
+    assert fake.calls[0][1].endswith("/v1/tasks/t-7")
+
+
+def test_get_logs_requires_an_id():
+    client, _ = client_with({})
+    with pytest.raises(TypeError):
+        client.get_logs()
+
+
+def test_tail_logs_yields_incremental_chunks():
+    states = [
+        {"task": {"id": "t-8", "status": "running", "result": {"logs": "a"}}},
+        {"task": {"id": "t-8", "status": "running", "result": {"logs": "ab"}}},
+        {"task": {"id": "t-8", "status": "completed", "result": {"logs": "abc"}}},
+    ]
+    idx = [0]
+
+    def fake_request(self, method, url, **kwargs):
+        if url.endswith("/v1/tasks/t-8"):
+            resp = make_response(200, states[idx[0]])
+            idx[0] = min(idx[0] + 1, len(states) - 1)
+            return resp
+        raise AssertionError(f"unexpected: {method} {url}")
+
+    session = MagicMock()
+    session.request = fake_request.__get__(session, type(session))
+    client = UahtClient("https://cp.example.com", "k", session=session)
+
+    chunks = list(client.get_logs(task_id="t-8", follow=True, poll_interval=0.001))
+    assert chunks == ["a", "b", "c"]
+
+
+def test_get_logs_timeout():
+    client, fake = client_with(
+        {"/v1/tasks/t-6": lambda: make_response(200, {"task": {"id": "t-6", "status": "running", "result": {}}})}
+    )
+    with pytest.raises(UahtError) as exc:
+        client.get_logs(task_id="t-6", poll_interval=0.001, timeout=0.01)
+    assert exc.value.code == "timeout"
+
+
+def test_deploy_helper_handles_bare_list_projects():
+    # list_projects returning a bare list (not {"projects": [...]}) must not
+    # raise AttributeError.
+    client, fake = client_with(
+        {
+            "/v1/projects": lambda: make_response(200, [{"id": "p-1", "name": "bare-api"}]),
+            "/v1/deployments": lambda: make_response(
+                201, {"deployment": {"id": "d-1"}, "task": {"id": "t-1", "status": "queued"}}
+            ),
+        }
+    )
+    deployment, task = client.deploy(project="bare-api", version="1.0.0")
+    assert deployment["id"] == "d-1"
+    assert task["id"] == "t-1"
