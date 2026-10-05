@@ -156,6 +156,10 @@ def test_build_routes_skips_with_reasons():
          "ingress": "tunnel"},                      # terminal status
         {"deployment_id": "dep-1", "hostname": "not a hostname!!",
          "ingress": "tunnel"},                      # invalid hostname
+        {"deployment_id": "dep-1", "hostname": "db.internal",
+         "ingress": "tunnel"},                      # internal-only name (W10)
+        {"deployment_id": "dep-1", "hostname": "*.example.com",
+         "ingress": "tunnel"},                      # wildcard (W10)
         {"deployment_id": "dep-1", "hostname": "api.example.com",
          "ingress": "tunnel"},                      # ok
         {"deployment_id": "dep-2", "hostname": "api.example.com",
@@ -172,6 +176,8 @@ def test_build_routes_skips_with_reasons():
     assert "no host port" in reasons["noport.example.com"]
     assert "removed" in reasons["dead.example.com"]
     assert "invalid hostname" in reasons["not a hostname!!"]
+    assert "invalid hostname" in reasons["db.internal"]
+    assert "invalid hostname" in reasons["*.example.com"]
     assert "duplicate" in reasons["api.example.com"]
 
 
@@ -186,6 +192,24 @@ def test_hostname_validation():
     assert not is_valid_hostname("not a hostname!!")
     assert not is_valid_hostname("x\n  - service: evil")
     assert not is_valid_hostname("")
+
+
+def test_hostname_validation_w10_hardening():
+    # wildcards: every hostname is explicit
+    for bad in ("*.example.com", "api.*.example.com", "*"):
+        assert not is_valid_hostname(bad), bad
+    # localhost / special-use / internal-only names
+    for bad in ("localhost", "api.localhost", "printer.local",
+                "db.internal", "x.invalid", "y.example",
+                "z.test", "q.onion"):
+        assert not is_valid_hostname(bad), bad
+    # IP literals
+    for bad in ("127.0.0.1", "10.0.0.5", "192.168.1.1", "8.8.8.8"):
+        assert not is_valid_hostname(bad), bad
+    # normal names still pass
+    for good in ("api.example.com", "deep.sub.domain.co",
+                 "abc123.cfargotunnel.com"):
+        assert is_valid_hostname(good), good
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +240,18 @@ def test_render_cloudflared_config_empty_routes():
     assert "ingress:" in text
     assert "http_status:404" in text
     assert "hostname:" not in text
+
+
+def test_rendered_config_states_non_authoritative_mirror():
+    # W9: for token-based tunnels the remote tunnel configuration is the
+    # routing authority; the local config.yml is a mirror only. The
+    # rendered file must say so — nothing may imply it routes traffic.
+    text = render_cloudflared_config([
+        {"hostname": "api.example.com", "target_host": "127.0.0.1",
+         "target_port": 8080},
+    ])
+    assert "NON-AUTHORITATIVE" in text
+    assert "remote" in text.lower()
 
 
 def test_render_refuses_bad_hostname():
@@ -454,3 +490,28 @@ def test_build_ingress_config_from_worker_config():
     assert cfg.enabled is True
     assert cfg.provider == "cloudflare-tunnel"
     assert cfg.tunnel_token == "tok123"
+
+
+def test_apply_routes_rewrites_mirror_without_restarting_tunnel(tmp_path):
+    # W9: the local config.yml is a NON-AUTHORITATIVE mirror — route
+    # changes must not terminate the tunnel process (routing comes from
+    # the remote tunnel configuration; a restart would only drop
+    # in-flight connections for no benefit).
+    import subprocess
+    from ingress.cloudflared import CloudflaredTunnelProvider
+    p = CloudflaredTunnelProvider()
+    p._config_path = str(tmp_path / "config.yml")
+    p._routes = {"api.example.com": {
+        "hostname": "api.example.com",
+        "target_host": "127.0.0.1", "target_port": 8080}}
+    proc = subprocess.Popen(["sleep", "60"])
+    p._proc = proc
+    try:
+        p._apply_routes()
+        assert proc.poll() is None, "tunnel process was restarted on a route change"
+        text = (tmp_path / "config.yml").read_text()
+        assert "NON-AUTHORITATIVE" in text
+        assert "hostname: api.example.com" in text
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
