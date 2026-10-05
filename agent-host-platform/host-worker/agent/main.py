@@ -33,7 +33,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from agent.api import ControlPlaneClient, WorkerAPIError
+from agent.api import ControlPlaneClient, RotationError, WorkerAPIError, persist_host_token
 from agent import backoff as backoff_mod
 from agent.config import ConfigError, WorkerConfig
 from agent.context import WorkerContext
@@ -61,6 +61,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "readable, docker reachable-or-skipped) and exit "
                              "0/1 without starting the worker loop; used by "
                              "the post-update health gate")
+    parser.add_argument("--rotate-token", action="store_true",
+                        help="rotate this host's control-plane token using "
+                             "the safe sequence (fetch new -> verify it "
+                             "authenticates -> persist to the config file), "
+                             "then exit 0/1 without starting the worker loop")
     return parser.parse_args(argv)
 
 
@@ -101,6 +106,36 @@ def run_self_check(config: WorkerConfig) -> tuple[bool, dict]:
         return False, report
     report["ok"] = True
     return True, report
+
+
+def run_token_rotation(config: WorkerConfig) -> int:
+    """--rotate-token: safe host-token rotation, then exit.
+
+    Sequence: authenticate with the current token -> server issues a new
+    token with a grace window on the old one -> verify the new token
+    authenticates -> persist it atomically to the config file -> exit 0.
+    On any failure the old token is still valid (grace window), so the
+    worker is never stranded; exit 1 and the operator can retry. The
+    plaintext token is never logged.
+    """
+    LOG.info("rotating host token for host %s", config.host_name)
+    client = ControlPlaneClient(config.control_plane_url, config.host_token)
+    try:
+        new_token = client.rotate_host_token(config.host_id)
+    except (WorkerAPIError, RotationError) as exc:
+        LOG.error("token rotation failed: %s", exc)
+        return 1
+    try:
+        persist_host_token(config.config_path, new_token)
+    except OSError as exc:
+        LOG.error(
+            "rotation succeeded server-side but the new token could not be "
+            "saved to %s: %s — the old token remains valid for the grace "
+            "window; fix the file permissions and retry",
+            config.config_path, exc)
+        return 1
+    LOG.info("host token rotated and saved to %s", config.config_path)
+    return 0
 
 
 def detect_capabilities(docker) -> list:
@@ -270,6 +305,9 @@ def main(argv=None) -> int:
         ok, report = run_self_check(config)
         print(json.dumps(report))
         return 0 if ok else 1
+
+    if args.rotate_token:
+        return run_token_rotation(config)
 
     LOG.info("starting host worker %s as %s (config: %s)",
              config.worker_version, config.host_name,
