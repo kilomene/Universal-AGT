@@ -62,12 +62,25 @@ await client.deleteSecret("proj-uuid", "DB_PASSWORD");
 ## Live event stream
 
 ```js
-for await (const event of client.streamEvents()) {
+for await (const event of client.streamEvents({ since: "2026-10-05T00:00:00Z", limit: 50 })) {
   console.log(event.type, event.deployment_id || event.task_id);
 }
 ```
 
 Pass an `AbortSignal` via `{ signal }` to close the stream from the consumer.
+The server replays the last `limit` events before live-pushing.
+
+## Logs
+
+```js
+// Create a `logs` task for a deployment and poll it to terminal.
+const text = await client.getLogs({ deploymentId: "dep-uuid" });
+
+// Or poll an existing logs task by id, and stream chunks as they arrive:
+for await (const chunk of await client.getLogs({ taskId: "task-uuid", follow: true })) {
+  process.stdout.write(chunk);
+}
+```
 
 ## Error shape
 
