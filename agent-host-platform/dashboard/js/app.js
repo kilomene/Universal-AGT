@@ -5,13 +5,22 @@
  * uses relative URLs.
  *
  * Auth: the API key is kept in sessionStorage only (cleared when the tab
- * closes) and is sent as `Authorization: Bearer <key>` on every fetch.
+ * closes) and is sent as `Authorization: Bearer <key>` on every fetch,
+ * INCLUDING mutating calls (never a query param). A 401 re-arms the auth
+ * gate; a 403 means the key is valid but lacks the permission — the panel or
+ * action shows "not permitted" instead of signing the user out.
+ *
  * EventSource cannot set request headers, so the live stream at
  * GET /v1/events/stream carries the key as `?api_key=` INSTEAD — that is a
  * deliberate tradeoff (query params can show up in access logs), and the
  * control-plane API team was told to accept that parameter on the stream
  * endpoint. If the API rejects it, events will just fail closed with the
  * banner below; panels keep polling.
+ *
+ * NOTE: there is no GET /v1/agents list endpoint in the control-plane API
+ * (only /agents/register, /agents/me, /agents/me/rotate), so the dashboard
+ * has no agents table. "Agents active" in the overview strip is derived from
+ * recent events (actor_type='agent' seen in the last 15 minutes).
  */
 (function () {
   'use strict';
@@ -22,13 +31,19 @@
   var KEY_STORE = 'uagt_api_key';
   var REFRESH_MS = 10000;
   var MAX_EVENTS = 200;
-  var ONLINE_WINDOW_S = 90; // heartbeat freshness used to derive host status
+  var ONLINE_WINDOW_S = 90; // heartbeat freshness fallback when host.status is absent
+  var AGENT_ACTIVE_WINDOW_MS = 15 * 60 * 1000;
 
   var state = {
     key: sessionStorage.getItem(KEY_STORE) || '',
     source: null,
     refreshTimer: null,
-    hardReconnectAt: 0
+    hardReconnectAt: 0,
+    cache: {},          // panel id -> last response body (drives the overview strip)
+    hostsById: {},      // host id -> host row (for name lookups in other panels)
+    approvalDetail: {}, // task id -> Promise<dossier> (fetched once per task)
+    expanded: {},       // task id -> true while its dossier row is open
+    pendingApprove: null // task id currently staged in the approve modal
   };
 
   function el(id) { return document.getElementById(id); }
@@ -40,7 +55,9 @@
   }
 
   function short(id) {
-    if (!id) return '&mdash;';
+    // Returns the literal em dash for missing ids (NOT the &mdash; entity)
+    // so callers can safely wrap the result in esc() without double-escaping.
+    if (!id) return '\u2014';
     var s = String(id);
     return esc(s.length > 12 ? s.slice(0, 8) + '\u2026' : s);
   }
@@ -63,6 +80,15 @@
     var h = Math.floor(m / 60);
     if (h < 24) return h + 'h ago';
     return Math.floor(h / 24) + 'd ago';
+  }
+
+  function fmtBytes(n) {
+    if (n == null || isNaN(Number(n))) return '\u2014';
+    var v = Number(n);
+    var units = ['B', 'KB', 'MB', 'GB'];
+    var i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + ' ' + units[i];
   }
 
   function setConn(mode, detail) {
@@ -110,14 +136,43 @@
 
   /* ---------------- API ---------------- */
 
+  function forbiddenError(path, res) {
+    var e = new Error('not permitted (HTTP 403 on ' + path + ') — this key lacks the permission');
+    e.code = 'forbidden';
+    e.status = 403;
+    return e;
+  }
+
+  // Read call (GET). 401 re-arms the auth gate; 403 is a per-panel error.
   function api(path) {
     return fetch(API + path, { headers: authHeaders() }).then(function (res) {
-      if (res.status === 401 || res.status === 403) {
-        requireAuth('That API key was rejected (HTTP ' + res.status + ').');
+      if (res.status === 401) {
+        requireAuth('That API key was rejected (HTTP 401).');
         throw new Error('unauthorized');
       }
+      if (res.status === 403) throw forbiddenError(path, res);
       if (!res.ok) {
         throw new Error('HTTP ' + res.status + ' on ' + path);
+      }
+      if (res.status === 204) return null;
+      return res.json();
+    });
+  }
+
+  // Mutating call (POST/PUT/DELETE). Bearer <redacted> header, never a query
+  // param. 401 re-arms the auth gate; 403 surfaces as `forbidden` so the
+  // caller can show "not permitted" next to the action.
+  function apiWrite(method, path) {
+    return fetch(API + path, { method: method, headers: authHeaders() }).then(function (res) {
+      if (res.status === 401) {
+        requireAuth('That API key was rejected (HTTP 401).');
+        throw new Error('unauthorized');
+      }
+      if (res.status === 403) throw forbiddenError(path, res);
+      if (!res.ok) {
+        var e = new Error('HTTP ' + res.status + ' on ' + path);
+        e.status = res.status;
+        throw e;
       }
       if (res.status === 204) return null;
       return res.json();
@@ -145,7 +200,8 @@
     building: 'st-running', starting: 'st-running', healthcheck: 'st-running',
     stopping: 'st-warn', stopped: 'st-muted', rolled_back: 'st-warn',
     healthy: 'st-ok', unhealthy: 'st-bad', passing: 'st-ok', failing: 'st-bad',
-    online: 'st-ok', offline: 'st-muted', unknown: 'st-muted'
+    online: 'st-ok', offline: 'st-muted', unknown: 'st-muted',
+    degraded: 'st-warn', draining: 'st-warn'
   };
 
   function badge(status) {
@@ -165,8 +221,19 @@
     return '<tr class="empty"><td colspan="' + cols + '">' + esc(label) + '</td></tr>';
   }
 
+  function rowsOf(body, keys) {
+    if (!body) return [];
+    for (var i = 0; i < keys.length; i++) {
+      if (Array.isArray(body[keys[i]])) return body[keys[i]];
+    }
+    return [];
+  }
+
   /* ---------------- panel renderers ---------------- */
 
+  // Server-side truth first: the control plane's stale-host sweeper maintains
+  // host.status (online|degraded|offline|draining). Client-side heartbeat
+  // freshness is only a fallback when the field is absent (older API).
   function hostStatus(host) {
     if (host.status) return host.status;
     var last = host.last_seen || host.last_heartbeat_at;
@@ -175,8 +242,17 @@
     return ageS <= ONLINE_WINDOW_S ? 'online' : 'offline';
   }
 
+  function hostName(id) {
+    if (!id) return '\u2014';
+    var h = state.hostsById[id];
+    if (h) return h.name || h.host_name || String(id).slice(0, 8);
+    return String(id).slice(0, 8);
+  }
+
   function renderHosts(body) {
-    var hosts = body && (body.hosts || body.items || body.data) || [];
+    var hosts = rowsOf(body, ['hosts', 'items', 'data']);
+    state.hostsById = {};
+    hosts.forEach(function (h) { if (h && h.id) state.hostsById[h.id] = h; });
     if (!hosts.length) {
       el('hostsBody').innerHTML = emptyRow(8, 'No hosts registered yet.');
       return;
@@ -199,10 +275,19 @@
     }).join('');
   }
 
+  function svcActionButtons(s) {
+    var id = esc(s.id);
+    return '<span class="row-actions">' +
+      '<button class="btn small" type="button" data-svc-action="restart" data-id="' + id + '">Restart</button>' +
+      '<button class="btn small" type="button" data-svc-action="start" data-id="' + id + '">Start</button>' +
+      '<button class="btn small danger" type="button" data-svc-action="stop" data-id="' + id + '">Stop</button>' +
+      '</span>';
+  }
+
   function renderServices(body) {
-    var svcs = body && (body.services || body.items || body.data) || [];
+    var svcs = rowsOf(body, ['services', 'items', 'data']);
     if (!svcs.length) {
-      el('servicesBody').innerHTML = emptyRow(7, 'No running services.');
+      el('servicesBody').innerHTML = emptyRow(8, 'No running services.');
       return;
     }
     el('servicesBody').innerHTML = svcs.map(function (s) {
@@ -212,19 +297,20 @@
       }).join(', ') || '\u2014';
       var domains = (s.domains || []).map(esc).join(', ') || '\u2014';
       return '<tr>' +
-        '<td><span class="mono">' + esc(s.name || s.service_name || short(s.id)) + '</span></td>' +
+        '<td><span class="mono">' + esc(s.project_name || s.name || s.service_name || short(s.id)) + '</span></td>' +
         '<td class="mono">' + esc(s.version || '\u2014') + '</td>' +
         '<td>' + badge(s.status || 'running') + '</td>' +
         '<td>' + badge(s.health_status || s.health || 'unknown') + '</td>' +
-        '<td><span class="mono">' + esc(s.host_name || short(s.host_id)) + '</span></td>' +
+        '<td><span class="mono">' + esc(s.host_name || hostName(s.host_id) || '\u2014') + '</span></td>' +
         '<td class="mono">' + portList + '</td>' +
         '<td class="mono">' + domains + '</td>' +
+        '<td class="actions-cell">' + svcActionButtons(s) + '</td>' +
         '</tr>';
     }).join('');
   }
 
   function renderDeployments(body) {
-    var deps = body && (body.deployments || body.items || body.data) || [];
+    var deps = rowsOf(body, ['deployments', 'items', 'data']);
     if (!deps.length) {
       el('deploymentsBody').innerHTML = emptyRow(6, 'No deployments.');
       return;
@@ -236,14 +322,14 @@
         '<td class="mono">' + esc(dep.version || '\u2014') + '</td>' +
         '<td>' + badge(dep.status) + '</td>' +
         '<td>' + badge(dep.health_status || 'unknown') + '</td>' +
-        '<td><span class="mono">' + esc(dep.host_name || short(dep.host_id)) + '</span></td>' +
+        '<td><span class="mono">' + esc(dep.host_name || hostName(dep.host_id) || '\u2014') + '</span></td>' +
         '<td>' + esc(timeAgo(dep.created_at)) + '</td>' +
         '</tr>';
     }).join('');
   }
 
   function renderTasks(body) {
-    var tasks = body && (body.tasks || body.items || body.data) || [];
+    var tasks = rowsOf(body, ['tasks', 'items', 'data']);
     if (!tasks.length) {
       el('tasksBody').innerHTML = emptyRow(6, 'No tasks.');
       return;
@@ -258,6 +344,293 @@
         '<td>' + esc(timeAgo(t.created_at)) + '</td>' +
         '</tr>';
     }).join('');
+  }
+
+  function renderProjects(body) {
+    var projects = rowsOf(body, ['projects', 'items', 'data']);
+    if (!projects.length) {
+      el('projectsBody').innerHTML = emptyRow(4, 'No projects.');
+      return;
+    }
+    el('projectsBody').innerHTML = projects.map(function (p) {
+      return '<tr>' +
+        '<td><span class="mono">' + esc(p.name || short(p.id)) + '</span></td>' +
+        '<td class="mono">' + esc(p.owner || '\u2014') + '</td>' +
+        '<td class="mono">' + esc(p.runtime || '\u2014') + '</td>' +
+        '<td>' + esc(timeAgo(p.updated_at || p.created_at)) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  /* ---------------- approvals ---------------- */
+
+  // One approval dossier per task, fetched lazily and cached: everything an
+  // approver needs, assembled from existing endpoints only —
+  // task -> deployment -> project -> artifact (+ domain list).
+  function fetchApprovalDetail(task) {
+    var id = task.id;
+    if (state.approvalDetail[id]) return state.approvalDetail[id];
+    var payload = task.payload || {};
+
+    function get(path, key) {
+      return api(path).then(function (b) {
+        return (b && b[key]) || null;
+      }).catch(function () { return null; }); // partial dossier beats a failed panel
+    }
+
+    var jobs = {};
+    if (payload.deployment_id) jobs.deployment = get('/deployments/' + payload.deployment_id, 'deployment');
+    if (payload.project_id) jobs.project = get('/projects/' + payload.project_id, 'project');
+    if (payload.artifact_id) jobs.artifact = get('/artifacts/' + payload.artifact_id, 'artifact');
+    if (payload.deployment_id) jobs.domains = get('/domains?deployment_id=' + payload.deployment_id, 'domains');
+
+    var p = Promise.all(Object.keys(jobs).map(function (k) {
+      return jobs[k].then(function (v) { return [k, v]; });
+    })).then(function (pairs) {
+      var d = {};
+      pairs.forEach(function (kv) { d[kv[0]] = kv[1]; });
+      return d;
+    });
+    state.approvalDetail[id] = p;
+    return p;
+  }
+
+  function actionSummary(task) {
+    var payload = task.payload || {};
+    switch (task.type) {
+      case 'deploy':
+        return 'Deploy version ' + (payload.version || '?') + ' to ' +
+          hostName(payload.host_id || task.assigned_to);
+      case 'rollback':
+        return 'Roll back deployment ' + short(payload.deployment_id);
+      case 'restart': case 'start': case 'stop':
+        return task.type.charAt(0).toUpperCase() + task.type.slice(1) +
+          ' service ' + short(payload.deployment_id);
+      case 'remove':
+        return 'Remove deployment ' + short(payload.deployment_id);
+      default:
+        return 'Run task type "' + (task.type || '?') + '"';
+    }
+  }
+
+  function manifestOf(payload, project) {
+    return payload.manifest || (project && project.configuration) || null;
+  }
+
+  function dossierHtml(task, detail) {
+    var payload = task.payload || {};
+    var project = detail.project || null;
+    var artifact = detail.artifact || null;
+    var deployment = detail.deployment || null;
+    var domains = detail.domains || (deployment && deployment.domains) || [];
+    var manifest = manifestOf(payload, project);
+    var resources = manifest && manifest.resources;
+    var env = manifest && manifest.env;
+
+    function row(label, value) {
+      return '<dt>' + esc(label) + '</dt><dd>' + value + '</dd>';
+    }
+
+    var html = '<div class="dossier"><dl>';
+    html += row('Requested action', esc(actionSummary(task)));
+    html += row('Project', esc((project && project.name) || payload.project_id || '\u2014'));
+    html += row('Version', esc(payload.version || (deployment && deployment.version) || '\u2014'));
+    html += row('Host', esc(hostName(payload.host_id || task.assigned_to || (deployment && deployment.host_id))));
+    html += row('Artifact', artifact
+      ? esc(artifact.filename || artifact.id) + ' &middot; ' + esc(fmtBytes(artifact.size))
+      : esc(payload.artifact_id ? short(payload.artifact_id) + ' (unavailable)' : '\u2014'));
+    if (payload.requested_host_port != null) {
+      html += row('Requested host port', esc(payload.requested_host_port));
+    }
+    html += row('Resources', resources
+      ? esc('memory=' + (resources.memory || '?') + ' cpu=' + (resources.cpu || '?'))
+      : '<span class="muted-note">not specified</span>');
+    html += row('Domains', domains && domains.length
+      ? esc(domains.map(function (d) { return d.hostname || d; }).join(', '))
+      : '<span class="muted-note">none</span>');
+    html += row('Environment', env && Object.keys(env).length
+      ? esc(Object.keys(env).join(', ') + ' (' + Object.keys(env).length + ' vars)')
+      : '<span class="muted-note">none declared</span>');
+    html += row('Task id', esc(task.id));
+    html += '</dl>';
+    html += '<div class="appr-actions">' +
+      '<button class="btn small primary" type="button" data-approve="' + esc(task.id) + '">Approve</button>' +
+      '<button class="btn small danger" type="button" data-reject="' + esc(task.id) + '">Reject</button>' +
+      '<p class="appr-msg" id="apprMsg-' + esc(task.id) + '" hidden></p>' +
+      '</div></div>';
+    return html;
+  }
+
+  function renderApprovals(body) {
+    var tasks = rowsOf(body, ['tasks', 'items', 'data']);
+    if (!tasks.length) {
+      el('approvalsBody').innerHTML = emptyRow(7, 'Nothing awaiting approval.');
+      return;
+    }
+    el('approvalsBody').innerHTML = tasks.map(function (t) {
+      var open = !!state.expanded[t.id];
+      var summary =
+        '<tr>' +
+        '<td class="mono">' + short(t.id) + '</td>' +
+        '<td class="mono">' + esc(t.type || '\u2014') + '</td>' +
+        '<td class="mono">' + esc(short(t.payload && t.payload.project_id)) + '</td>' +
+        '<td class="mono">' + esc((t.payload && t.payload.version) || '\u2014') + '</td>' +
+        '<td><span class="mono">' + esc(hostName((t.payload && t.payload.host_id) || t.assigned_to)) + '</span></td>' +
+        '<td>' + esc(timeAgo(t.created_at)) + '</td>' +
+        '<td class="actions-cell"><button class="btn small" type="button" data-toggle="' + esc(t.id) + '">' +
+        (open ? 'Hide' : 'Details') + '</button></td>' +
+        '</tr>';
+      var detail =
+        '<tr class="appr-detail" data-detail-for="' + esc(t.id) + '"' + (open ? '' : ' hidden') + '>' +
+        '<td colspan="7"><div class="dossier"><span class="muted-note">Loading dossier&hellip;</span></div></td>' +
+        '</tr>';
+      return summary + detail;
+    }).join('');
+    // Fill any dossiers that are currently expanded (cached after first load).
+    tasks.forEach(function (t) {
+      if (!state.expanded[t.id]) return;
+      fetchApprovalDetail(t).then(function (detail) {
+        var row = document.querySelector('tr.appr-detail[data-detail-for="' + t.id + '"]');
+        if (row) row.querySelector('td').innerHTML = dossierHtml(t, detail);
+      });
+    });
+  }
+
+  function apprMsg(taskId, text, ok) {
+    var m = el('apprMsg-' + taskId);
+    if (!m) return;
+    m.textContent = text;
+    m.className = 'appr-msg ' + (ok ? 'ok' : 'err');
+    m.hidden = false;
+  }
+
+  function afterDecision(taskId, verb, res) {
+    var task = (res && res.task) || {};
+    apprMsg(taskId, verb + 'd — task is now ' + (task.status || 'updated') + '.', true);
+    delete state.approvalDetail[taskId]; // force a fresh dossier on next poll
+    setTimeout(refreshAll, 800);
+  }
+
+  function decisionError(taskId, verb, err) {
+    if (err && err.message === 'unauthorized') return; // requireAuth already ran
+    var msg = err && err.code === 'forbidden'
+      ? 'not permitted — this key lacks the approve_deployments permission'
+      : 'failed: ' + (err && err.message ? err.message : err);
+    apprMsg(taskId, msg, false);
+  }
+
+  function openApproveModal(taskId) {
+    var tasks = rowsOf(state.cache.approvals, ['tasks', 'items', 'data']);
+    var task = null;
+    for (var i = 0; i < tasks.length; i++) {
+      if (tasks[i].id === taskId) { task = tasks[i]; break; }
+    }
+    if (!task) return;
+    state.pendingApprove = taskId;
+    el('approveModalTitle').textContent = 'Approve this deployment?';
+    el('approveModalResult').hidden = true;
+    el('approveModalConfirm').disabled = false;
+    fetchApprovalDetail(task).then(function (detail) {
+      if (state.pendingApprove !== taskId) return; // user moved on
+      var payload = task.payload || {};
+      el('approveModalSummary').innerHTML = '<dl>' +
+        '<dt>Action</dt><dd>' + esc(actionSummary(task)) + '</dd>' +
+        '<dt>Project</dt><dd>' + esc((detail.project && detail.project.name) || payload.project_id || '\u2014') + '</dd>' +
+        '<dt>Version</dt><dd>' + esc(payload.version || '\u2014') + '</dd>' +
+        '<dt>Host</dt><dd>' + esc(hostName(payload.host_id || task.assigned_to)) + '</dd>' +
+        '<dt>Artifact</dt><dd>' + (detail.artifact
+          ? esc(detail.artifact.filename || detail.artifact.id) + ' &middot; ' + esc(fmtBytes(detail.artifact.size))
+          : '\u2014') + '</dd>' +
+        '</dl>' +
+        '<p class="muted-note" style="color:var(--muted);font-size:12px">' +
+        'Approving queues the task for the host worker to execute. This cannot be undone from here — ' +
+        'the task can still be cancelled afterwards while it is not running.</p>';
+    });
+    el('approveModal').hidden = false;
+  }
+
+  function closeApproveModal() {
+    el('approveModal').hidden = true;
+    state.pendingApprove = null;
+  }
+
+  /* ---------------- service actions ---------------- */
+
+  function svcMsg(text, isErr) {
+    var p = el('servicesError');
+    p.textContent = text;
+    p.hidden = false;
+    if (!isErr) {
+      setTimeout(function () { p.hidden = true; }, 4000);
+    }
+  }
+
+  function serviceAction(id, action) {
+    var label = action === 'stop' ? 'Stop' : action === 'start' ? 'Start' : 'Restart';
+    if (action === 'stop') {
+      // Destructive: stop takes the service's containers down.
+      if (!window.confirm('Stop service ' + id.slice(0, 8) + '\u2026? Its containers will be taken down.')) return;
+    }
+    apiWrite('POST', '/services/' + id + '/' + action).then(function (res) {
+      var task = (res && res.task) || {};
+      svcMsg(label + ' requested — control task ' + (task.id ? task.id.slice(0, 8) + '\u2026 ' : '') + 'queued.', false);
+      setTimeout(refreshAll, 800);
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') return; // requireAuth already ran
+      if (err && err.code === 'forbidden') {
+        svcMsg('not permitted — this key lacks the ' + (action === 'stop' ? 'stop' : 'restart') + ' permission.', true);
+      } else {
+        svcMsg(label + ' failed: ' + (err && err.message ? err.message : err), true);
+      }
+    });
+  }
+
+  /* ---------------- overview strip ---------------- */
+
+  function setStat(id, text, tone) {
+    var s = el(id);
+    s.textContent = text;
+    s.classList.remove('bad', 'warn');
+    if (tone) s.classList.add(tone);
+  }
+
+  var INACTIVE_DEPLOYMENT = { failed: 1, stopped: 1, rolled_back: 1 };
+
+  function renderOverview() {
+    var c = state.cache;
+
+    var hosts = rowsOf(c.hosts, ['hosts', 'items', 'data']);
+    var online = hosts.filter(function (h) { return hostStatus(h) === 'online'; }).length;
+    setStat('statHosts', hosts.length ? online + '/' + hosts.length : '\u2014');
+
+    var events = rowsOf(c.recentEvents, ['events', 'items', 'data']);
+    var cutoff = Date.now() - AGENT_ACTIVE_WINDOW_MS;
+    var agents = {};
+    events.forEach(function (e) {
+      if (e && e.actor_type === 'agent' && e.actor_id) {
+        var t = new Date(e.created_at).getTime();
+        if (!isNaN(t) && t >= cutoff) agents[e.actor_id] = 1;
+      }
+    });
+    setStat('statAgents', String(Object.keys(agents).length));
+
+    var svcs = rowsOf(c.services, ['services', 'items', 'data']);
+    var running = svcs.filter(function (s) { return String(s.status).toLowerCase() === 'running'; }).length;
+    setStat('statApps', String(running));
+
+    var deps = rowsOf(c.deployments, ['deployments', 'items', 'data']);
+    var active = deps.filter(function (d) { return !INACTIVE_DEPLOYMENT[String(d.status).toLowerCase()]; }).length;
+    setStat('statDeployments', String(active));
+    var dayAgo = Date.now() - 24 * 3600 * 1000;
+    var failed24 = deps.filter(function (d) {
+      if (String(d.status).toLowerCase() !== 'failed') return false;
+      var t = new Date(d.created_at).getTime();
+      return !isNaN(t) && t >= dayAgo;
+    }).length;
+    setStat('statFailed', String(failed24), failed24 > 0 ? 'bad' : null);
+
+    var pending = rowsOf(c.approvals, ['tasks', 'items', 'data']).length;
+    setStat('statApprovals', String(pending), pending > 0 ? 'warn' : null);
   }
 
   /* ---------------- events ---------------- */
@@ -352,10 +725,12 @@
   /* ---------------- refresh loop ---------------- */
 
   var PANELS = [
+    { id: 'approvals',   path: '/tasks?status=awaiting_approval&limit=50', render: renderApprovals },
     { id: 'hosts',       path: '/hosts',            render: renderHosts },
     { id: 'services',    path: '/services',         render: renderServices },
-    { id: 'deployments', path: '/deployments?limit=20', render: renderDeployments },
-    { id: 'tasks',       path: '/tasks?limit=20',   render: renderTasks }
+    { id: 'deployments', path: '/deployments?limit=200', render: renderDeployments },
+    { id: 'tasks',       path: '/tasks?limit=20',   render: renderTasks },
+    { id: 'projects',    path: '/projects',         render: renderProjects }
   ];
 
   function refreshAll() {
@@ -363,6 +738,7 @@
     var anyOk = false;
     var jobs = PANELS.map(function (p) {
       return api(p.path).then(function (body) {
+        state.cache[p.id] = body;
         p.render(body);
         panelOk(p.id);
         anyOk = true;
@@ -379,7 +755,15 @@
         el('agentName').textContent = label;
       }).catch(function () { /* non-fatal */ })
     );
+    // Recent events feed the "agents active" overview stat (there is no
+    // GET /v1/agents list endpoint, so counts come from actor activity).
+    jobs.push(
+      api('/events?since=' + encodeURIComponent(new Date(Date.now() - AGENT_ACTIVE_WINDOW_MS).toISOString()) + '&limit=200')
+        .then(function (body) { state.cache.recentEvents = body; })
+        .catch(function () { state.cache.recentEvents = null; })
+    );
     Promise.all(jobs).then(function () {
+      renderOverview();
       if (anyOk && el('conn').classList.contains('unknown')) setConn('live');
     });
   }
@@ -419,6 +803,81 @@
     stopAll();
     setConn('connecting');
     showAuth();
+  });
+
+  // Approvals table: delegated clicks for Details / Approve / Reject.
+  el('approvalsBody').addEventListener('click', function (e) {
+    var t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    var toggleId = t.getAttribute('data-toggle');
+    if (toggleId) {
+      var taskId = toggleId;
+      state.expanded[taskId] = !state.expanded[taskId];
+      if (state.expanded[taskId]) {
+        // Fetch the dossier now (cached), then re-render to fill it.
+        var tasks = rowsOf(state.cache.approvals, ['tasks', 'items', 'data']);
+        var task = null;
+        for (var i = 0; i < tasks.length; i++) {
+          if (tasks[i].id === taskId) { task = tasks[i]; break; }
+        }
+        if (task) {
+          fetchApprovalDetail(task).then(function () {
+            if (state.cache.approvals) renderApprovals(state.cache.approvals);
+          });
+        }
+      }
+      if (state.cache.approvals) renderApprovals(state.cache.approvals);
+      return;
+    }
+    var approveId = t.getAttribute('data-approve');
+    if (approveId) { openApproveModal(approveId); return; }
+    var rejectId = t.getAttribute('data-reject');
+    if (rejectId) {
+      if (!window.confirm('Reject task ' + rejectId.slice(0, 8) + '\u2026? It will be cancelled and never executed.')) return;
+      apiWrite('POST', '/tasks/' + rejectId + '/reject')
+        .then(function (res) { afterDecision(rejectId, 'Reject', res); })
+        .catch(function (err) { decisionError(rejectId, 'Reject', err); });
+    }
+  });
+
+  // Applications table: delegated clicks for Restart / Stop / Start.
+  el('servicesBody').addEventListener('click', function (e) {
+    var t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    var action = t.getAttribute('data-svc-action');
+    var id = t.getAttribute('data-id');
+    if (action && id) serviceAction(id, action);
+  });
+
+  // Approve confirmation modal.
+  el('approveModalCancel').addEventListener('click', closeApproveModal);
+  el('approveModal').addEventListener('click', function (e) {
+    if (e.target === el('approveModal')) closeApproveModal(); // backdrop click
+  });
+  el('approveModalConfirm').addEventListener('click', function () {
+    var taskId = state.pendingApprove;
+    if (!taskId) return;
+    el('approveModalConfirm').disabled = true;
+    var result = el('approveModalResult');
+    result.hidden = true;
+    apiWrite('POST', '/tasks/' + taskId + '/approve').then(function (res) {
+      var task = (res && res.task) || {};
+      result.textContent = 'Approved — task is now ' + (task.status || 'queued') + '.';
+      result.className = 'modal-result ok';
+      result.hidden = false;
+      el('approveModalConfirm').disabled = true;
+      delete state.approvalDetail[taskId];
+      delete state.expanded[taskId];
+      setTimeout(function () { closeApproveModal(); refreshAll(); }, 900);
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') return; // requireAuth already ran
+      result.textContent = err && err.code === 'forbidden'
+        ? 'not permitted — this key lacks the approve_deployments permission.'
+        : 'Approve failed: ' + (err && err.message ? err.message : err);
+      result.className = 'modal-result err';
+      result.hidden = false;
+      el('approveModalConfirm').disabled = false;
+    });
   });
 
   // Boot: key already in this tab's session storage? Go straight in.
