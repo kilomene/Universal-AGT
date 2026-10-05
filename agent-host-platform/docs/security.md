@@ -19,10 +19,17 @@ Two bearer-token credential kinds, both sent as
   never yields a usable token.
 - Agent and host tokens are **not interchangeable**: a host token can never
   call agent endpoints and vice versa. The token kind is bound at issuance.
-- Registration endpoints are one-time bootstrap calls; how they are
-  protected (operator-issued bootstrap secret, mTLS, admin console) is a
-  control-plane deployment decision — they must not be left open in
-  production.
+- Registration endpoints are one-time bootstrap calls; agent registration
+  is additionally gated (2026-10-05): `POST /v1/agents/register` requires
+  header `X-Provisioning-Token: <UAHT_PROVISIONING_TOKEN>` (constant-time
+  compare). With the env var unset, only the very first registration is
+  open (bootstrap mode); afterwards registration returns 403 until the
+  operator sets the token. In production (`NODE_ENV=production`) the
+  server refuses to start without `UAHT_PROVISIONING_TOKEN`.
+- Credentials rotate without downtime: `POST /v1/agents/me/rotate` and
+  `POST /v1/hosts/:id/rotate-token` issue a new credential, invalidate the
+  old one immediately, and emit `agent.key_rotated` / `host.token_rotated`.
+  Rotate on any suspected compromise.
 - HTTPS only in production. Bearer tokens over plain HTTP are compromised
   by definition.
 
@@ -49,6 +56,25 @@ workloads. Its defenses:
   of inspection commands derived from task fields. It never executes a raw
   shell string received over the network. A compromised or malicious task
   payload cannot become host shell access through the executor.
+- **`extra_args` removed (2026-10-05, critical).** `docker-run` used to
+  accept caller-supplied docker flags verbatim — `--privileged`,
+  `-v /:/host` straight to host root. The field is gone from the protocol:
+  the worker's policy layer rejects any `docker-run` task carrying it
+  (`TaskRejected`, task reported `failed`, nothing executed), and
+  `DockerClient.run()` no longer has the parameter at all.
+- **Archive extraction.** Tar archives extract with `tarfile.data_filter`
+  (blocks absolute paths, `..` escapes, and symlink/hardlink members that
+  resolve outside the destination — the old pre-scan loop could be bypassed
+  by a symlink member followed by a file *through* it). Zip members are
+  still checked individually (zip has no filter API).
+- **Manifest path confinement.** `build.dockerfile`, `build.context`, and
+  `compose_file` from an artifact's `agent.deploy.json` (or task payload)
+  are resolved strictly inside the extracted artifact tree — `..` and
+  absolute paths are rejected before any `docker build` / `compose up`.
+- **No config exfiltration.** `artifact-upload` refuses to read anything at
+  or under the worker's `config/` directory (where `worker.env` — host
+  token, control-plane URL — lives), in addition to the work_dir
+  confinement that already applies.
 - **Outbound-only networking.** The worker dials out to the control plane;
   it opens no inbound ports, so there is no listening service to attack and
   no callback for the control plane to be tricked into calling.
@@ -59,7 +85,20 @@ workloads. Its defenses:
   `ProtectSystem=strict`, and a minimal writable path set.
 - **Self-update channel.** Worker updates are pulled by the worker from the
   control plane over its authenticated channel (emits `worker.updated`);
-  there is no push-to-host mechanism to hijack.
+  there is no push-to-host mechanism to hijack. The release tarball's
+  SHA-256 is verified before install, the new tree must byte-compile and
+  import cleanly, and — since 2026-10-05 — the updater health-gates the
+  restart: the new worker writes a boot marker (`<work_dir>/worker.status.json`
+  with version + boot timestamp, also checkable via
+  `agent-host-worker --self-check`), and the updater rolls the `current`
+  symlink back and restarts the previous release if the new version is not
+  healthy within `WORKER_UPDATE_HEALTH_TIMEOUT_S` (default 120s).
+  - **Explicit trust-model note:** update authorization is "the control
+    plane said so, and the SHA-256 matches what the control plane said".
+    A compromised control plane can therefore push arbitrary worker code —
+    this is accepted and by design (the control plane is already the
+    trusted orchestrator: it issues every task the worker runs). Code
+    signing with an offline key is future work, not a current control.
 
 Containers themselves run under Docker's isolation with the resource
 limits from `agent.deploy.json` (`resources.memory` / `resources.cpu`);
@@ -71,9 +110,16 @@ the worker sets those limits on every `docker run` it issues.
   `POST /v1/artifacts/init`; the server verifies both on
   `PUT /v1/artifacts/:id/content` and rejects mismatches (the artifact is
   quarantined, `artifact.upload_failed` is emitted).
+- Uploads are wire-capped (2026-10-05): `ARTIFACT_MAX_BYTES` (default 500MB)
+  is enforced on `Content-Length` before anything is written, per-chunk
+  while streaming (a lying or absent `Content-Length` can't bypass it),
+  and on the declared `size` at init — all 413 `payload_too_large`.
 - Download: the worker verifies the SHA-256 **again** after downloading,
   before building. A tampered artifact in transit or at rest fails the
   task instead of being built.
+- Download scoping (2026-10-05): a host token may only download artifacts
+  referenced by tasks that host claimed (`payload.artifact_id`); any other
+  host gets 403. Agents keep `read_status` downloads.
 - The worker validates `agent.deploy.json` against the PROTOCOL §4 rules
   before any build; invalid manifests fail fast with no partial state.
 
@@ -83,9 +129,14 @@ the worker sets those limits on every `docker run` it issues.
 - They are **never returned** by any read endpoint: `GET .../secrets`
   lists names only.
 - The worker receives decrypted values **only inside the task payload of a
-  deployment it is actively executing**, over its authenticated channel.
+  deployment it is actively executing**, over its authenticated channel —
+  or by pulling `GET /v1/worker/projects/:project_id/secrets` (host token;
+  the server only answers when the host has a claimed/active task or a live
+  deployment for that project, else 403). At deploy time the worker injects
+  them as container env (payload-carried values win on collision).
 - Secrets never appear in logs, events, or task results. The worker's log
-  redaction strips known secret values from `log_chunk`s before upload.
+  redaction strips known secret values from `log_chunk`s before upload, and
+  secret env is never persisted to the worker's `state.json`.
 - Managing secrets requires the `manage_secrets` permission — keep it off
   every key that doesn't strictly need it.
 
@@ -96,27 +147,97 @@ the worker sets those limits on every `docker run` it issues.
   error shape.
 - **600 req/min per host token** — heartbeats and task claims are chatty by
   design.
+- **10 req/min per IP for unauthenticated requests**
+  (`RATE_LIMIT_UNAUTH_PER_MIN`, 2026-10-05) — registration and other open
+  endpoints are throttled against enumeration floods. `/v1/health` is mounted
+  before the limiter and stays cheap.
 
 Exceeding the limit never corrupts state: mutating endpoints are
 idempotent-keyed, so a client can back off and retry the identical request.
+
+## Worker privilege model
+
+The worker is deliberately powerful — it has to be, to run Docker
+workloads. This section states exactly what it can do after the Phase 6
+fixes, and where the trust boundary sits.
+
+**What the worker holds (and why):**
+- **Docker group membership + RW on the Docker socket.** Required to
+  `docker run/build/compose` agent workloads at all. This is
+  root-equivalent on the host by Docker's own design — there is no
+  unprivileged way to manage containers. The systemd unit mitigates with
+  `NoNewPrivileges` / `ProtectSystem=strict`, but the socket itself is the
+  crown jewel: anyone who can speak to it owns the host.
+- **RW on `/srv/agent-apps`** (`apps_dir`). Deployment working state lives
+  here; the worker writes extracted artifacts and build contexts nowhere
+  else.
+- **RW on `/opt/agent-host`** (`work_dir`). Task logs, deployment
+  `state.json`, downloaded artifacts, update releases. `config/worker.env`
+  (host token, control-plane URL) lives here too — readable by the worker
+  process (it must be), but never servable: `artifact-upload` refuses any
+  path at/under `config/`.
+- **Outbound HTTPS to the control plane only.** No inbound ports, no
+  listening sockets.
+
+**What the worker can still do by design (operator trust boundary):**
+- `deploy`, `build`/`docker-build`, `docker-run`, `docker-compose`, and
+  `environment-update` tasks execute **arbitrary agent-supplied container
+  code**. That is the product, not a bug: these task types are fully
+  privileged *inside containers* by design. The Phase 6 fixes removed the
+  paths that escaped the container boundary without going through the
+  image/container abstraction (`extra_args` flag injection, tar symlink
+  escapes, manifest path traversal). What remains is Docker's own isolation
+  plus the resource limits from `agent.deploy.json`.
+- The worker will never execute a host shell string from the network, read
+  host files outside its two directories on an agent's behalf, or exfiltrate
+  its own credentials.
+
+**In short:** trust the worker with containers, because containers are the
+job; trust Docker's isolation for the boundary; and treat the control plane
+as the trusted orchestrator (see the self-update trust note above) —
+a compromised control plane means compromised workers, full stop.
+
+## Accepted limitations
+
+- **No replay protection on bearer tokens.** Requests are authenticated by
+  a static bearer token over TLS; there is no per-request nonce/signature,
+  so a captured request could be replayed within the token's lifetime.
+  Mitigations in place: TLS-everywhere, credential rotation endpoints, and
+  short-lived operational use of keys. HMAC request signing is tracked as
+  future work — deliberately not invented mid-phase.
+- **Self-update trusts the control plane's SHA-256** (see above): a
+  compromised control plane can push worker code. Accepted as the
+  orchestrator trust boundary.
 
 ## Audit: the append-only event journal
 
 Every security-relevant action emits an event:
 `agent.connected/disconnected`, `task.*`, `artifact.*`,
 `deployment.*`, `service.*`, `host.registered/online/offline`,
-`secret.updated`, `worker.updated`. Events are **append-only** — there is
-no delete or update endpoint — and are cursor-paginated, so an auditor can
-replay the full history of who did what, when, from which actor.
+`secret.updated`, `worker.updated`, `agent.key_rotated`,
+`host.token_rotated`. Events are **append-only** — there is no delete or
+update endpoint — and are cursor-paginated, so an auditor can replay the
+full history of who did what, when, from which actor.
+
+`UPDATE`/`DELETE` are blocked by the `trg_events_no_update_delete` row
+trigger, and `TRUNCATE` is blocked by the `trg_no_truncate_events` event
+trigger (migration `005_events_truncate_block.sql`; needs superuser to
+install — row-level triggers cannot intercept `TRUNCATE`).
 
 ## Operational checklist
 
 - [ ] Control plane served over HTTPS with a valid certificate.
+- [ ] `UAHT_PROVISIONING_TOKEN` set (server refuses to boot in production
+      without it); `DATA_ENCRYPTION_KEY` set (64 hex chars).
 - [ ] Registration/bootstrap endpoints locked down after initial setup.
 - [ ] Agent keys issued with minimal permissions; `manage_secrets` and
       `approve_deployments` granted sparingly.
 - [ ] Host tokens live only in `/etc/uagt/worker.env` (mode `0600`).
 - [ ] Dashboard users authenticate with agent keys (session-scoped); the
       control plane accepts `?api_key=` **only** on `/v1/events/stream`.
+- [ ] `ARTIFACT_MAX_BYTES` sized for the workload (default 500MB).
+- [ ] Migration `005_events_truncate_block.sql` applied as superuser
+      (re-apply after any database restore).
 - [ ] Review the event journal periodically for `task.rejected`,
-      `artifact.upload_failed`, and unexpected `host.offline` flaps.
+      `artifact.upload_failed`, `agent.key_rotated` / `host.token_rotated`,
+      and unexpected `host.offline` flaps.
