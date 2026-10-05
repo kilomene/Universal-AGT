@@ -69,9 +69,9 @@ export AGENT_KEY=uag_...
 
 ```bash
 # Option A: provisioning token (hands-off bootstrap, no agent key needed)
-# .env: PROVISIONING_TOKEN=<openssl rand -hex 32>
+# .env: UAHT_PROVISIONING_TOKEN=<openssl rand -hex 32>
 curl -s -X POST localhost:3000/v1/hosts/register \
-  -H "Authorization: Bearer $PROVISIONING_TOKEN" \
+  -H "Authorization: Bearer $UAHT_PROVISIONING_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"name":"persistent-host-01","capabilities":["docker"]}'
 
@@ -84,8 +84,8 @@ curl -s -X POST localhost:3000/v1/hosts/register \
 ```
 
 Design choice: `POST /v1/hosts/register` accepts **either** a matching
-`PROVISIONING_TOKEN` bearer (for unattended first-boot provisioning) **or**
-an agent token carrying `deploy`. When `PROVISIONING_TOKEN` is unset, only
+`UAHT_PROVISIONING_TOKEN` bearer (for unattended first-boot provisioning) **or**
+an agent token carrying `deploy`. When `UAHT_PROVISIONING_TOKEN` is unset, only
 the agent path works.
 
 ## Auth
