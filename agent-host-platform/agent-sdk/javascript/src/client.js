@@ -330,8 +330,10 @@ export class UahtClient {
   }
 
   // ---- §3.10 Domains ----
-  addDomain(deploymentId, hostname) {
-    return this._post("/domains", { deployment_id: deploymentId, hostname });
+  addDomain(deploymentId, hostname, ingress) {
+    const body = { deployment_id: deploymentId, hostname };
+    if (ingress !== undefined && ingress !== null) body.ingress = ingress; // 'tunnel' | 'direct' (Phase 7)
+    return this._post("/domains", body);
   }
   listDomains(deploymentId) {
     return this._get("/domains", { deployment_id: deploymentId });
