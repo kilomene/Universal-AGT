@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 *.tsbuildinfo
+.pytest_cache/
 
 # Runtime data (never commit)
 .env
