@@ -59,7 +59,7 @@ fails loudly with a precise error at the first step that cannot be met):
    `WORKER_WORK_DIR=/opt/agent-host`, `WORKER_APPS_DIR=/srv/agent-apps`,
    `WORKER_WORKER_VERSION`, plus the optional ingress keys
    (`WORKER_INGRESS_ENABLED`, `WORKER_INGRESS_PROVIDER`,
-   `UAHT_TUNNEL_TOKEN`).
+   `WORKER_TUNNEL_TOKEN` — installer input: `UAHT_TUNNEL_TOKEN`).
 6. **systemd.** Installs `agent-host-worker.service` (the unit shipped at
    `host-worker/agent/agent-host-worker.service`), runs
    `daemon-reload`, then `systemctl enable --now agent-host-worker`.
@@ -75,7 +75,7 @@ fails loudly with a precise error at the first step that cannot be met):
 ## Getting a host token (one-time)
 
 From any machine that can reach the control plane. Host registration needs
-either the provisioning bearer (`PROVISIONING_TOKEN`, hands-off first
+either the provisioning bearer (`UAHT_PROVISIONING_TOKEN`, hands-off first
 boot) or an agent API key with the `deploy` permission:
 
 ```bash
@@ -204,7 +204,7 @@ inbound ports):
 ```bash
 WORKER_INGRESS_ENABLED=true
 WORKER_INGRESS_PROVIDER=cloudflare-tunnel
-UAHT_TUNNEL_TOKEN=<tunnel token from step 1>   # never in the repo, never logged
+WORKER_TUNNEL_TOKEN=<redacted>
 ```
 
    (or pass `UAHT_INGRESS_ENABLED=1 UAHT_TUNNEL_TOKEN=...` to
