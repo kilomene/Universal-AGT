@@ -12,6 +12,8 @@ const pool_1 = require("./db/pool");
 const migrate_1 = require("./db/migrate");
 const errors_1 = require("./lib/errors");
 const events_1 = require("./lib/events");
+const hostSweeper_1 = require("./lib/hostSweeper");
+const taskSweeper_1 = require("./lib/taskSweeper");
 const log_1 = require("./lib/log");
 const agents_1 = require("./routes/agents");
 const artifacts_1 = require("./routes/artifacts");
@@ -87,11 +89,24 @@ function createApp() {
     return app;
 }
 async function main() {
+    // Security (2026-10-05): agent registration is gated by UAHT_PROVISIONING_TOKEN.
+    // In production the token is required at startup — fail fast rather than
+    // boot with an open bootstrap window. Outside production, an unset token
+    // only permits the very first agent registration (bootstrap mode).
+    if (process.env.NODE_ENV === 'production' && !process.env.UAHT_PROVISIONING_TOKEN) {
+        log_1.logger.error('refusing to start: UAHT_PROVISIONING_TOKEN is not set (required in production)');
+        process.exit(1);
+    }
+    if (!process.env.UAHT_PROVISIONING_TOKEN) {
+        log_1.logger.warn('UAHT_PROVISIONING_TOKEN is not set: agent registration is open only until the first agent registers (bootstrap mode)');
+    }
     const pool = (0, pool_1.getPool)();
     const applied = await (0, migrate_1.runMigrations)(pool);
     if (applied.length)
         log_1.logger.info('migrations applied at startup', { applied });
     await (0, events_1.startEventBus)(pool);
+    const stopHostSweeper = (0, hostSweeper_1.startHostSweeper)(pool);
+    const stopTaskSweeper = (0, taskSweeper_1.startTaskSweeper)(pool);
     const port = Number(process.env.PORT ?? 3000);
     const server = createApp().listen(port, () => {
         log_1.logger.info('control plane api listening', { port });
@@ -99,6 +114,8 @@ async function main() {
     const shutdown = async (signal) => {
         log_1.logger.info('shutting down', { signal });
         server.close();
+        stopHostSweeper();
+        stopTaskSweeper();
         await (0, events_1.stopEventBus)().catch(() => { });
         await (0, pool_1.closePool)().catch(() => { });
         process.exit(0);
