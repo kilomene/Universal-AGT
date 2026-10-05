@@ -2,10 +2,12 @@
 // Source of truth: database schema check constraint + PROTOCOL §3.2.
 //
 //   queued -> claimed | cancelled
-//   claimed -> running | failed | cancelled
-//   running -> completed | failed | awaiting_approval | cancelled
+//   claimed -> running | failed | retrying | cancelled
+//   running -> completed | failed | retrying | awaiting_approval | cancelled
 //   awaiting_approval -> queued (approved) | cancelled (rejected)
-//   retrying -> queued
+//   retrying -> queued            (the stuck-task sweeper moves it back;
+//                                  a `failed` report the retry policy
+//                                  approves becomes `retrying`)
 //   completed | failed | cancelled are terminal
 
 export const TASK_STATUSES = [
@@ -23,8 +25,8 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   queued: ['claimed', 'cancelled'],
-  claimed: ['running', 'failed', 'cancelled'],
-  running: ['completed', 'failed', 'awaiting_approval', 'cancelled'],
+  claimed: ['running', 'failed', 'retrying', 'cancelled'],
+  running: ['completed', 'failed', 'retrying', 'awaiting_approval', 'cancelled'],
   awaiting_approval: ['queued', 'cancelled'],
   retrying: ['queued'],
   completed: [],
