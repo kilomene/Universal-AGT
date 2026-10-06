@@ -114,6 +114,7 @@ describe('isPublicIpAddress', () => {
     '192.169.0.1',
     '223.255.255.255',
     '::ffff:8.8.8.8', // IPv4-mapped, embedded address is public
+    '::ffff:808:808', // same address in hex form — still public
     '2606:4700:4700::1111',
     '2001:4860:4860::8888',
   ])('allows public address %s', (ip) => {
@@ -127,6 +128,7 @@ describe('isPublicIpAddress', () => {
     '172.16.0.1',
     '172.31.255.255',
     '192.168.0.1',
+    '192.168.1.1',
     '192.168.255.255',
     // loopback
     '127.0.0.1',
@@ -161,8 +163,21 @@ describe('isPublicIpAddress', () => {
     // IPv4-mapped IPv6 with a private embedded address
     '::ffff:127.0.0.1',
     '::ffff:10.0.0.1',
+    '::ffff:172.16.0.1',
     '::ffff:192.168.1.1',
     '::ffff:169.254.169.254',
+    // the same mapped addresses in hex form — classification must not
+    // depend on textual representation
+    '::ffff:7f00:1', // == ::ffff:127.0.0.1
+    '::ffff:a00:1', // == ::ffff:10.0.0.1
+    '::ffff:ac10:1', // == ::ffff:172.16.0.1
+    '::ffff:c0a8:101', // == ::ffff:192.168.1.1
+    '::ffff:a9fe:a9fe', // == ::ffff:169.254.169.254
+    '::FFFF:10.0.0.1', // uppercase hex prefix
+    '0:0:0:0:0:ffff:10.0.0.1', // full-length mapped form
+    // 6to4 embeds an arbitrary IPv4 address (same SSRF class as NAT64)
+    '2002:a9fe:a9fe::1', // embeds 169.254.169.254
+    '2002:0a00:0001::', // embeds 10.0.0.1
     // not an IP at all: fail closed
     '',
     'not-an-ip',
@@ -293,6 +308,40 @@ describe('probeHttps (SSRF)', () => {
     await expect(probeHttps('down.example.com')).resolves.toEqual({
       reachable: false,
       status: null,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DNS rebinding model (§3): the connection must use the validated/pinned
+// IP even when DNS changes after validation.
+// ---------------------------------------------------------------------------
+describe('DNS rebinding model', () => {
+  it('a DNS flip after validation cannot redirect the pinned connection', async () => {
+    // Validation sees a public address; the probe opens its (mocked)
+    // connection against that validation result.
+    dnsMock.set(['93.184.216.34'], []);
+    httpsMock.setRespond(200);
+    await probeHttps('rebind.example.com');
+    expect(httpsMock.get).toHaveBeenCalledTimes(1);
+    // The attacker's DNS now flips to an internal address — after our
+    // validation ran. The socket-level lookup must still answer with the
+    // address we validated, never the new answer.
+    dnsMock.set(['169.254.169.254'], []);
+    await expect(pinnedIpOf()).resolves.toEqual({
+      address: '93.184.216.34',
+      family: 4,
+    });
+  });
+
+  it('a rebinding flip to another public IP is still ignored', async () => {
+    dnsMock.set(['93.184.216.34'], []);
+    httpsMock.setRespond(200);
+    await probeHttps('rebind2.example.com');
+    dnsMock.set(['1.1.1.1'], []);
+    await expect(pinnedIpOf()).resolves.toEqual({
+      address: '93.184.216.34',
+      family: 4,
     });
   });
 });
