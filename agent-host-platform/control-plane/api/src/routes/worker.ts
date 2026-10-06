@@ -467,15 +467,41 @@ async function mirrorDeploymentState(
         // result.status === 'rollback_failed'. Recording 'rolled_back'
         // unconditionally lied about the deployment's state; persist the
         // failure honestly instead.
+        //
+        // Part 2: a rollback succeeds ONLY when the target was proven
+        // healthy. The target_health_status check is the backstop — a
+        // report of 'rolled_back' (or a legacy report without a status)
+        // with an unverified/unhealthy target is recorded as a failure,
+        // never as a success.
+        const reported = (reportedResult ?? {}) as Record<string, unknown>;
+        const reportedHealth =
+          typeof reported.target_health_status === 'string'
+            ? reported.target_health_status
+            : null;
+        const reportedRollbackStatus =
+          typeof reported.rollback_status === 'string'
+            ? reported.rollback_status
+            : 'failed';
         const rollbackFailed =
-          reportedResult !== null &&
-          reportedResult !== undefined &&
-          (reportedResult as Record<string, unknown>).status === 'rollback_failed';
+          reported.status === 'rollback_failed' ||
+          (reportedHealth !== null && reportedHealth !== 'healthy');
         depStatus = rollbackFailed ? 'rollback_failed' : 'rolled_back';
         depEvent = rollbackFailed
           ? {
               type: 'deployment.rollback_failed',
-              payload: { version: deployment.version },
+              // Part 2C: the failure event carries the health verdict and
+              // the reason — status strings only, never secrets.
+              payload: {
+                version: deployment.version,
+                target_health_status: reportedHealth ?? 'unknown',
+                rollback_status: reportedRollbackStatus,
+                reason:
+                  reportedHealth === 'unhealthy'
+                    ? 'target health check failed'
+                    : reportedRollbackStatus === 'partially_reconciled'
+                      ? 'port-registry settle failed after healthy restore'
+                      : 'target health could not be verified',
+              },
             }
           : {
               type: 'deployment.rolled_back',
