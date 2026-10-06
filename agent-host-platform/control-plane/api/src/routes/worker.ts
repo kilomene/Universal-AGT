@@ -292,12 +292,19 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
 // report is requeued by the stuck-task sweeper. Every progress report
 // refreshes the lease, so an actively-reporting worker is never swept.
 // ---------------------------------------------------------------------------
-async function tryClaim(pool: Pool, hostId: string, leaseS: number) {
+// Exported for the test-suite: the claim SQL is verified structurally there
+// (pg-mem cannot run FOR UPDATE SKIP LOCKED).
+export async function tryClaim(pool: Pool, hostId: string, leaseS: number) {
+  // §13: `assigned_to` is the AGENT-requested host pin (set at task
+  // creation) — it is deliberately NOT stamped here. Stamping the claiming
+  // host into assigned_to pinned every claimed task to its worker: after a
+  // host died mid-task and the sweeper requeued it (clearing claimed_by but
+  // not assigned_to), the claim filter below — (assigned_to IS NULL OR
+  // assigned_to = $1) — let no other host ever claim the requeued task.
   const { rows } = await pool.query(
     `UPDATE tasks SET
        status = 'claimed',
        claimed_by = $1,
-       assigned_to = $1,
        attempts = attempts + 1,
        lease_expires_at = now() + make_interval(secs => $2),
        last_progress_at = now(),
@@ -455,14 +462,28 @@ async function mirrorDeploymentState(
       }
     } else if (nextStatus === 'completed') {
       if (isRollbackTask) {
-        depStatus = 'rolled_back';
-        depEvent = {
-          type: 'deployment.rolled_back',
-          payload: {
-            version: deployment.version,
-            rolled_back_to: payload.target_deployment_id ?? null,
-          },
-        };
+        // §6: a rollback task can report task-status 'completed' while the
+        // rollback itself failed — the worker signals that with
+        // result.status === 'rollback_failed'. Recording 'rolled_back'
+        // unconditionally lied about the deployment's state; persist the
+        // failure honestly instead.
+        const rollbackFailed =
+          reportedResult !== null &&
+          reportedResult !== undefined &&
+          (reportedResult as Record<string, unknown>).status === 'rollback_failed';
+        depStatus = rollbackFailed ? 'rollback_failed' : 'rolled_back';
+        depEvent = rollbackFailed
+          ? {
+              type: 'deployment.rollback_failed',
+              payload: { version: deployment.version },
+            }
+          : {
+              type: 'deployment.rolled_back',
+              payload: {
+                version: deployment.version,
+                rolled_back_to: payload.target_deployment_id ?? null,
+              },
+            };
       } else if (task.type === 'deploy') {
         depStatus = 'running';
         depEvent = { type: 'deployment.completed', payload: { version: deployment.version } };
@@ -545,7 +566,7 @@ async function mirrorDeploymentState(
     // cannot cover the Cloudflare calls inside these hooks, and they must
     // never take down progress reporting — failures are logged, not
     // raised). They only run when the deployment status actually changed.
-    if (changed && depStatus && ['failed', 'stopped', 'rolled_back'].includes(depStatus)) {
+    if (changed && depStatus && ['failed', 'stopped', 'rolled_back', 'rollback_failed'].includes(depStatus)) {
       try {
         const failed = await failDomainsForDeployment(pool, deploymentId, `deployment ${depStatus}`);
         if (failed > 0) {
