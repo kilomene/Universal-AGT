@@ -12,6 +12,43 @@ Content-Type: `application/json` everywhere unless noted.
 
 ## Changelog
 
+- **2026-10-06 — Final Remaining Fixes pass (authorization, scheduler, rollback, agent lifecycle).**
+  - **Permissions:** the enforced registry is now **8** names — `admin` added
+    (operator-grade actions: agent suspend/resume/revoke, project owner
+    assignment and membership management; the `UAHT_PROVISIONING_TOKEN`
+    bearer is accepted as operator auth wherever `requireOperator` is used).
+  - **Agents (operator):** new `POST /v1/agents/:id/suspend`, `/resume`,
+    `/revoke` (self suspend/revoke → 403; revoke replaces the API key hash
+    with an unmatchable random value and is irreversible). New events
+    `agent.suspended`, `agent.resumed`, `agent.revoked` (payloads carry no
+    secrets). Canonical event count 46 → 49.
+  - **Projects/ACL:** migration `011` adds `projects.owner_agent_id`
+    (backfilled from the legacy `owner` name; unresolvable owners recorded
+    in `migration_reports`, never silently assigned), plus the
+    `project_members` and `agent_host_access` tables. New operator-only
+    `POST /v1/projects/:id/owner {agent_id}`; membership management via
+    `GET|POST /v1/projects/:id/members` and
+    `DELETE /v1/projects/:id/members/:agent_id`. Legacy-open rule: projects
+    with `owner_agent_id IS NULL` and hosts with zero `agent_host_access`
+    rows stay accessible to every agent. Central `src/lib/authz.ts` is now
+    enforced on the projects, deployments, tasks, artifacts, secrets,
+    services, and domains routes.
+  - **Deployments:** `POST /v1/deployments` accepts `host_id: null` — the
+    control plane selects the host (online, not draining, capabilities,
+    CPU/RAM headroom, host targeting ACL) inside a transaction with the
+    host rows locked (`SELECT … FOR UPDATE`), so check and reservation are
+    atomic; the deployment row always carries a concrete `host_id`. No
+    eligible host → 503 `no_capacity`. New deployment status
+    `rollback_failed` (migration `012` widens the `deployments.status`
+    CHECK): a rollback that fails is persisted honestly as `rollback_failed`
+    instead of being recorded as `rolled_back`.
+  - **Tasks:** the claim no longer stamps `assigned_to` — that field is
+    exclusively the agent-requested host pin set at task creation — so a
+    task requeued after its host died is claimable by any capable host.
+  - **Domains:** domain routes now enforce the deployment ACL via
+    `authorizeDeploymentAccess`; the probe's fail-closed IP classifier
+    additionally denies `2002::/16` (6to4 — embeds an arbitrary IPv4 address
+    in bits 16–47, the same SSRF class as the NAT64 ranges).
 - **2026-10-05 — W15 contract audit (doc corrections only; no wire changes).**
   - **Permissions:** §1 listed `read_logs` and `remove` — those permissions do
     not exist. The real set is `deploy`, `read_status`, `restart`, `stop`,
@@ -267,7 +304,14 @@ never call agent endpoints and vice versa.
 Agent permissions (enforced per endpoint; the complete set — an agent row's
 `permissions` JSONB carries a subset of these):
 `deploy`, `read_status`, `restart`, `stop`, `manage_secrets`,
-`manage_domains`, `approve_deployments`
+`manage_domains`, `approve_deployments`, `admin`
+
+`admin` is operator-grade: agent suspend/resume/revoke, project owner
+assignment (`POST /v1/projects/:id/owner`) and project membership
+management. `requireOperator` accepts either an agent with `admin` or the
+`UAHT_PROVISIONING_TOKEN` bearer, so a deployment without any admin agent
+still has an operator path. An agent can never suspend or revoke itself
+(403).
 
 Error shape (all failures):
 
@@ -278,7 +322,8 @@ Error shape (all failures):
 Common codes: `bad_request`, `unauthorized`, `forbidden`, `not_found`,
 `conflict` (idempotency key reused with *different* payload),
 `unprocessable` (manifest/validation failure), `payload_too_large` (HTTP 413),
-`rate_limited`.
+`no_capacity` (HTTP 503 — `POST /v1/deployments` with `host_id: null` and no
+eligible host), `rate_limited`.
 
 ---
 
@@ -316,6 +361,17 @@ POST /v1/agents/register        {name, type?, capabilities?[], permissions?{}}
 GET  /v1/agents/me              → caller's own agent row (no secret fields)
 POST /v1/agents/me/rotate       → 200 {api_key:"<new show-once key>"}
                                 # old key invalidated immediately
+POST /v1/agents/:id/suspend     # operator only (admin permission or the
+                                # provisioning token): active → suspended;
+                                # the suspended key is rejected everywhere
+                                # immediately; self-suspend → 403
+POST /v1/agents/:id/resume      # operator only: suspended → active
+                                # (revoked agents cannot be resumed)
+POST /v1/agents/:id/revoke      # operator only: any non-revoked →
+                                # revoked; the API key hash is replaced with
+                                # an unmatchable random value, so the key
+                                # dies instantly and permanently;
+                                # self-revoke → 403
 ```
 
 ### 3.2 Tasks — the durable work queue (agent API key)
@@ -370,6 +426,11 @@ Status machine: `queued → claimed → running → completed|failed`
 `cancelled` reachable from any non-terminal state;
 `claimed|running → retrying → queued` when a failure is retryable — see
 Changelog 2026-10-05.)
+
+`assigned_to` is the agent-requested host pin from task creation (`host_id`
+on `POST /v1/tasks`) — the claim never stamps it, so a requeued task is
+claimable by any capable host. `claimed_by` is the host that actually won
+the claim.
 
 **Retry rule:** a worker-reported `failed` becomes `retrying` (sweeper moves
 it back to `queued`) when `attempts < max_attempts` and the task type is
@@ -435,10 +496,16 @@ POST /v1/hosts/:id/rotate-token   # host token only, :id must match the token's
 
 ```
 POST /v1/projects   {name, owner?, repository?, runtime?, configuration?}
-                     # needs deploy
+                     # needs deploy; the creating agent becomes the owner
+                     # (owner_agent_id) unless the row predates ACLs
 GET  /v1/projects   GET /v1/projects/:id   # needs read_status
 PUT  /v1/projects/:id            # needs deploy; accepts {configuration?,
                                  # repository?, runtime?} (validated manifest)
+GET  /v1/projects/:id/members   # needs read_status
+POST /v1/projects/:id/members   {agent_id}  # needs deploy; grant access
+DELETE /v1/projects/:id/members/:agent_id  # needs deploy; revoke access
+POST /v1/projects/:id/owner    {agent_id}  # OPERATOR only: assign or
+                                 # reassign the explicit project owner
 
 POST /v1/artifacts/init           # needs deploy
   {project_id, filename, size, checksum:"sha256:<hex>", version}
@@ -465,6 +532,11 @@ POST /v1/deployments
                           # The worker verifies it is free before `docker run`.
    idempotency_key?}
   → creates a task type=deploy (+ a deployment row); 201 {deployment, task}
+  # host_id omitted or null = "any capable host": the control plane
+  # selects a host (online, not draining, capabilities, CPU/RAM headroom,
+  # host targeting ACL) inside the request transaction and the deployment
+  # row always carries the concrete selected host_id. No eligible host →
+  # 503 no_capacity. An explicit host_id is pinned as before.
 
 GET  /v1/deployments?project_id=&host_id=&status=&limit=
 GET  /v1/deployments/:id         → {deployment, task?}
@@ -493,10 +565,18 @@ Deployment object:
 {
   "id":"uuid","project_id":"uuid","host_id":"uuid","version":"1.0.0",
   "status":"running",            # requested|approved|building|starting|
-                                 # healthcheck|running|failed|rolled_back|stopped|stopping
+                                 # healthcheck|running|failed|rolled_back|
+                                 # rollback_failed|stopped|stopping
   "container_ids":[],"ports":{},"domains":[],
   "health_status":"healthy", "rollback_of": null
 }
+
+`rollback_failed` is terminal and honest: when the worker reports a
+rollback task `completed` but the rollback itself failed
+(`result.status === 'rollback_failed'`), the control plane persists
+`rollback_failed` — never `rolled_back`. It is treated as a terminal,
+non-routable deployment status (GC-eligible, domains failed, ingress
+excluded) like `failed`.
 ```
 
 ### 3.7 Secrets (agent API key, manage_secrets)
@@ -529,12 +609,16 @@ Event object:
  "payload": {...}, "created_at": "..."}
 ```
 
-Canonical event types (46 — every type the server emits, verified against
-`routes/` + `lib/` + `middleware/` 2026-10-06; the earlier "41" under-counted
-— the W15 audit missed `auth.failed`, `host.worker_outdated`,
-`domain.degraded`, `domain.recovered`, and `domain.reconcile`):
+Canonical event types (49 — every type the server emits, verified against
+`routes/` + `lib/` + `middleware/` 2026-10-06; the earlier "46" under-counted
+— the agent lifecycle events below were added after that count):
 
-- Agents: `agent.connected`, `agent.key_rotated`
+- Agents: `agent.connected`, `agent.key_rotated`, `agent.suspended`
+  (operator suspended the agent; key rejected immediately),
+  `agent.resumed` (operator reactivated a suspended agent),
+  `agent.revoked` (operator revoked the agent; key hash replaced with an
+  unmatchable random value — permanent. Payloads carry `agent_id`,
+  `agent_name`, `previous_status` only — no secrets)
 - Auth: `auth.failed` (bad provisioning token at a registration gate)
 - Tasks: `task.created`, `task.claimed`, `task.started`, `task.retrying`,
   `task.awaiting_approval`, `task.approved`, `task.rejected`,
