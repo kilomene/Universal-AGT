@@ -53,6 +53,15 @@ DENIED_HOST_NAMESPACES = {
 #: Service keys denied whenever they are set and non-empty.
 DENIED_WHEN_NONEMPTY = ("devices", "cap_add", "security_opt")
 
+#: Namespace-sharing keys whose values must never reference an arbitrary
+#: container. `network_mode: "container:<name>"`, `pid: "container:<name>"`
+#: and `ipc: "container:<name>"` join the network/PID/IPC namespace of ANY
+#: container on the host — including other deployments' containers or host
+#: infrastructure. (W16 audit: previously only the literal "host" was
+#: denied.) `service:<name>` stays allowed: it references a sibling service
+#: in the same compose file, which the agent already fully controls.
+DENIED_NAMESPACE_JOIN_PREFIXES = ("container:",)
+
 #: Basenames that are never mountable, wherever they resolve.
 DENIED_MOUNT_BASENAMES = ("docker.sock",)
 
@@ -339,10 +348,17 @@ def _validate_service(svc_name: str, svc: dict, file_dir: Path,
                 f"service {svc_name!r}: {flag} is denied by security policy")
     for key, denied_values in DENIED_HOST_NAMESPACES.items():
         value = svc.get(key)
-        if isinstance(value, str) and value.lower() in denied_values:
-            errors.append(
-                f"service {svc_name!r}: {key}={value!r} is denied "
-                f"(host namespace escape)")
+        if isinstance(value, str):
+            if value.lower() in denied_values:
+                errors.append(
+                    f"service {svc_name!r}: {key}={value!r} is denied "
+                    f"(host namespace escape)")
+            elif key in ("network_mode", "pid", "ipc") and value.lower().startswith(
+                DENIED_NAMESPACE_JOIN_PREFIXES
+            ):
+                errors.append(
+                    f"service {svc_name!r}: {key}={value!r} is denied "
+                    f"(cross-container namespace sharing)")
     for key in DENIED_WHEN_NONEMPTY:
         if svc.get(key):
             errors.append(
