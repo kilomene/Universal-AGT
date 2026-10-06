@@ -1,5 +1,12 @@
 -- 005_events_truncate_block.sql
 --
+-- migrate: no-transaction
+--
+-- (CREATE EVENT TRIGGER is forbidden inside a transaction block, so this
+-- migration runs outside one. Every statement below is idempotent:
+-- CREATE OR REPLACE FUNCTION, DROP EVENT TRIGGER IF EXISTS, then CREATE,
+-- so a retry after a partial failure is safe.)
+--
 -- The events table is append-only (001: trg_events_no_update_delete blocks
 -- UPDATE/DELETE), but a row-level trigger CANNOT block TRUNCATE — TRUNCATE
 -- bypasses row triggers entirely. This migration closes that hole with an
