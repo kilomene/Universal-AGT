@@ -620,7 +620,7 @@ File the record next to this doc (e.g.
                        ▼
                 ┌──────────────┐
                 │ PostgreSQL / │  (Supabase, direct/session connection
-                │   Supabase   │   port 5432; migrations 001–015)
+                │   Supabase   │   port 5432; migrations 001–016)
                 └──────────────┘
 ```
 
@@ -680,7 +680,7 @@ Only `001`'s `CREATE EXTENSION pgcrypto` needs elevation — apply it
 once as superuser (Supabase SQL editor). The remaining fourteen
 migrations must be executed **as the actual non-superuser production
 role**. **Do NOT claim Supabase production readiness until the full
-001–015 chain has been executed successfully under that
+001–016 chain has been executed successfully under that
 non-superuser role** — limitation 2 in §5 stands until then.
 (Connection shape: direct/session connection, port 5432 — the SSE
 event bus holds a persistent `LISTEN uag_events`, unsupported by
@@ -877,7 +877,7 @@ API token, zone, or domain — §5 limitation 3.)
 
 | Area | Code complete | Live infrastructure verified |
 |---|---|---|
-| Migrations 001–015 chain | yes (local pg-mem / superuser CI) | **NOT YET** — needs real Postgres + non-superuser production role (§7.2) |
+| Migrations 001–016 chain | yes (local pg-mem / superuser CI) | **NOT YET** — needs real Postgres + non-superuser production role (§7.2) |
 | Control plane boot + `GET /v1/health` | yes (tests + contract checks) | **NOT YET** (§7.3) |
 | Worker install (systemd unit `agent-host-worker`) | yes (installer + unit file) | **NOT YET** (§7.4) |
 | Outbound-only host (zero listening sockets) | yes (code: `main.py`, `api.py`) | **NOT YET** (§7.1, Step 3) |
