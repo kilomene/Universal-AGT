@@ -184,7 +184,9 @@ log "installing worker code to $WORKER_DIR"
 # shellcheck disable=SC2086
 for pkg in $WORKER_PACKAGES; do
   [ -d "$WORKER_SRC/$pkg" ] || fail "worker package missing from source: $WORKER_SRC/$pkg"
-  rm -rf "$WORKER_DIR/$pkg"
+  # SC2115-safe: :? aborts if either side is ever empty (rm -rf must never
+  # see an empty expansion).
+  rm -rf "${WORKER_DIR:?}/${pkg:?}"
   cp -r "$WORKER_SRC/$pkg" "$WORKER_DIR/$pkg"
 done
 chown -R "$WORKER_USER:$WORKER_USER" /opt/agent-host "$APPS_DIR"
