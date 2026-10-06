@@ -12,9 +12,11 @@
 
 import io
 import json
+import re
 import subprocess
 import sys
 from contextlib import redirect_stdout
+from pathlib import Path
 
 SUBCOMMANDS = ["hosts", "apps", "deploy", "logs", "restart", "stop", "start",
                "status", "rollback", "domains", "tasks", "events",
@@ -63,6 +65,18 @@ class FakeClient:
     def get_task(self, *a, **k):
         return {"task": {"id": "t9", "status": "completed",
                          "result": {"logs": "line1\nline2\n"}}}
+
+    def get_host(self, *a, **k):
+        return {"host": {"id": "h1", "name": "n1", "status": "online"}}
+
+    def register_host(self, *a, **k):
+        return {"host": {"id": "h1", "name": "edge-01"}, "host_token": "sekret"}
+
+    def rotate_agent_key(self, *a, **k):
+        return {"api_key": "new-key"}
+
+    def get_domain(self, *a, **k):
+        return {"domain": {"hostname": "ex.com", "status": "active"}}
 
     def restart_service(self, *a, **k):
         return {"task": {"id": "t2", "status": "queued"}}
@@ -138,7 +152,10 @@ class FakeClient:
 # argv (after the global --json) -> True if the command streams JSON lines
 JSON_INVOCATIONS = [
     (["hosts"], False),
+    (["hosts", "register", "--name", "edge-01"], False),
+    (["hosts", "get", "--host", "h1"], False),
     (["apps"], False),
+    (["apps", "--host", "n1"], False),  # name resolves to the host id (server needs a UUID)
     (["deploy", "--project", "web", "--version", "1.0"], False),
     (["deploy", "--project", "web", "--version", "1.0", "--host", "h1", "--host-port", "8080"], False),
     (["logs", "--deployment", "d1"], False),
@@ -149,13 +166,16 @@ JSON_INVOCATIONS = [
     (["status", "--deployment", "d1"], False),
     (["rollback", "--deployment", "d1"], False),
     (["domains", "list", "--deployment", "d1"], False),
+    (["domains", "get", "--hostname", "ex.com"], False),
     (["domains", "add", "--deployment", "d1", "--hostname", "ex.com"], False),
     (["domains", "rm", "--deployment", "d1", "--hostname", "ex.com"], False),
     (["tasks"], False),
+    (["tasks", "status", "--task", "t1"], False),
     (["events"], False),
     (["events", "--follow"], True),
     (["agents", "me"], False),
     (["agents", "register", "--name", "n1"], False),
+    (["agents", "rotate"], False),
     (["projects", "list"], False),
     (["projects", "create", "--name", "web"], False),
     (["projects", "get", "--project", "p1"], False),
@@ -177,7 +197,7 @@ def check_json():
     import agent_host_cli.main as main
 
     orig_client = main._client
-    main._client = lambda args: FakeClient()  # noqa: E731 - stubbed, no network
+    main._client = lambda args, **k: FakeClient()  # noqa: E731 - stubbed, no network
     try:
         for argv, json_lines in JSON_INVOCATIONS:
             buf = io.StringIO()
@@ -208,8 +228,31 @@ def check_json():
     return failures, len(JSON_INVOCATIONS)
 
 
+def check_version():
+    """§61: `agent-host --version` exits 0 and reports the pyproject version."""
+    failures = []
+    try:
+        r = subprocess.run(["agent-host", "--version"], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return [("--version", "agent-host not on PATH")], 0
+    if r.returncode != 0:
+        return [("--version", f"exit code {r.returncode}: {r.stderr.strip()[:200]}")], 1
+    out = r.stdout.strip()
+    if not re.fullmatch(r"agent-host \d+\.\d+\.\d+(-\S+)?", out):
+        failures.append(("--version", f"unexpected output: {out!r}"))
+        return failures, 1
+    # the served version must be the packaged one, not a stale literal
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    m = re.search(r'^version = "([^"]+)"', pyproject.read_text(), re.M)
+    if m and out != f"agent-host {m.group(1)}":
+        failures.append(("--version", f"serves {out!r} but pyproject says {m.group(1)!r}"))
+    return failures, 1
+
+
 def main():
     failures, n_help = check_help()
+    vfailures, n_version = check_version()
+    failures.extend(vfailures)
     jfailures, n_json = check_json()
     failures.extend(jfailures)
     if failures:
@@ -218,6 +261,7 @@ def main():
         sys.exit(1)
     print(f"OK: all {n_help} help invocations exited 0, "
           f"help lists all {len(SUBCOMMANDS)} subcommands, "
+          f"--version serves the packaged version, "
           f"all {n_json} commands emit valid JSON under --json")
 
 
