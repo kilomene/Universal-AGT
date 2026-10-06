@@ -7,10 +7,11 @@ worker ever runs it, the NORMALIZED model (``docker compose config
 DENY (per service):
   * ``privileged: true``
   * ``network_mode: host``
-  * ``pid: host`` | ``ipc: host`` | ``uts: host``
+  * ``pid: host`` | ``ipc: host`` | ``uts: host`` | ``userns_mode: host``
   * ``devices: [...]``            (any host device node)
   * ``cap_add: [...]``            (any added Linux capability)
   * ``security_opt: [...]``      (any custom security option)
+  * ``runtime: <anything>``       (custom OCI runtime selection)
   * ``volumes`` whose host source escapes the deployment workspace
     (bind mounts; this includes /var/run/docker.sock anywhere, even
     smuggled in under a workspace-relative name)
@@ -48,10 +49,17 @@ DENIED_HOST_NAMESPACES = {
     "pid": {"host"},
     "ipc": {"host"},
     "uts": {"host"},
+    # userns_mode: host disables user-namespace remapping — on hosts with
+    # userns-remap configured this maps container root to host root.
+    "userns_mode": {"host"},
 }
 
 #: Service keys denied whenever they are set and non-empty.
-DENIED_WHEN_NONEMPTY = ("devices", "cap_add", "security_opt")
+#:
+#: * devices / cap_add / security_opt — direct host-escape primitives;
+#: * runtime — selects the OCI runtime binary; a non-default runtime is an
+#:   intentional host-level capability, never an agent default.
+DENIED_WHEN_NONEMPTY = ("devices", "cap_add", "security_opt", "runtime")
 
 #: Namespace-sharing keys whose values must never reference an arbitrary
 #: container. `network_mode: "container:<name>"`, `pid: "container:<name>"`
