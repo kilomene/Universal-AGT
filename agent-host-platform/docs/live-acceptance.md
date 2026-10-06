@@ -191,6 +191,16 @@ declares its `resources`; the deployment row's `reserved_cpu` /
 `reserved_ram_mb` must equal those normalized values (not the project
 configuration's). A deploy whose manifest exceeds remaining host
 capacity is rejected with `no_capacity` before any task is created.
+**Tarball-verification check:** re-upload the demo artifact with a
+tampered `agent.deploy.json` (e.g. bump `resources.cpu`) while keeping
+the init-registered manifest — the PUT must return 422 and the artifact
+row must land in `failed`, never `ready`.
+
+**Supersede check (Issue #2):** deploy v2 of the demo app and wait for
+`deployment.completed`; the v1 deployment row must read `superseded`
+(not `running`), and the host's consumed reservation must equal v2's
+reservation only. Then roll back to v1: v2 → `rolled_back`, v1 →
+`running` again.
 
 (The remaining steps' `curl`/`docker` commands run **on the host**
 via ssh or console; `<redacted>`/API calls run from your
@@ -610,7 +620,7 @@ File the record next to this doc (e.g.
                        ▼
                 ┌──────────────┐
                 │ PostgreSQL / │  (Supabase, direct/session connection
-                │   Supabase   │   port 5432; migrations 001–014)
+                │   Supabase   │   port 5432; migrations 001–015)
                 └──────────────┘
 ```
 
@@ -667,10 +677,10 @@ select table_name from information_schema.tables
 ```
 
 Only `001`'s `CREATE EXTENSION pgcrypto` needs elevation — apply it
-once as superuser (Supabase SQL editor). The remaining eleven
+once as superuser (Supabase SQL editor). The remaining fourteen
 migrations must be executed **as the actual non-superuser production
 role**. **Do NOT claim Supabase production readiness until the full
-001–012 chain has been executed successfully under that
+001–015 chain has been executed successfully under that
 non-superuser role** — limitation 2 in §5 stands until then.
 (Connection shape: direct/session connection, port 5432 — the SSE
 event bus holds a persistent `LISTEN uag_events`, unsupported by
@@ -867,7 +877,7 @@ API token, zone, or domain — §5 limitation 3.)
 
 | Area | Code complete | Live infrastructure verified |
 |---|---|---|
-| Migrations 001–012 chain | yes (local pg-mem / superuser CI) | **NOT YET** — needs real Postgres + non-superuser production role (§7.2) |
+| Migrations 001–015 chain | yes (local pg-mem / superuser CI) | **NOT YET** — needs real Postgres + non-superuser production role (§7.2) |
 | Control plane boot + `GET /v1/health` | yes (tests + contract checks) | **NOT YET** (§7.3) |
 | Worker install (systemd unit `agent-host-worker`) | yes (installer + unit file) | **NOT YET** (§7.4) |
 | Outbound-only host (zero listening sockets) | yes (code: `main.py`, `api.py`) | **NOT YET** (§7.1, Step 3) |
