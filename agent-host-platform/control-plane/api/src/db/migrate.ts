@@ -24,6 +24,29 @@ function findMigrationsDir(): string {
 }
 
 // ---------------------------------------------------------------------------
+// no-transaction migrations.
+//
+// PostgreSQL forbids some statements inside a transaction block
+// (notably CREATE EVENT TRIGGER). A migration whose header (first 10 lines)
+// contains:
+//
+//   -- migrate: no-transaction
+//
+// runs WITHOUT the BEGIN/COMMIT wrapper. Such migrations MUST be written
+// idempotently (CREATE OR REPLACE / DROP IF EXISTS), because a failure
+// partway through cannot be rolled back and the file will be retried.
+//
+// Only the header is honored: a marker buried deeper in the file cannot
+// silently disable the transactional safety of the migration.
+// ---------------------------------------------------------------------------
+
+const NO_TRANSACTION_MARKER = /^[ \t]*--[ \t]*migrate:[ \t]*no-transaction[ \t]*$/im;
+
+export function requiresNoTransaction(sql: string): boolean {
+  return NO_TRANSACTION_MARKER.test(sql.split('\n').slice(0, 10).join('\n'));
+}
+
+// ---------------------------------------------------------------------------
 // §46 privilege preflight.
 //
 // Migrations that need elevated privileges are declared here. Before such a
@@ -122,16 +145,30 @@ export async function runMigrations(pool: Pool): Promise<string[]> {
     // silently skipped — a missing privilege is a hard error here.
     await checkMigrationPrivileges(pool, file);
     const sql = readFileSync(join(migrationsDir, file), 'utf8');
+    const noTx = requiresNoTransaction(sql);
     const client = await pool.connect();
     try {
-      await client.query('BEGIN');
-      await client.query(sql);
-      await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file]);
-      await client.query('COMMIT');
-      logger.info('migration applied', { file });
+      if (noTx) {
+        // Statements like CREATE EVENT TRIGGER cannot run inside a
+        // transaction block. The migration must be idempotent (see header
+        // contract above); record it applied only after it succeeds.
+        await client.query(sql);
+        await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file]);
+        logger.info('migration applied (no-transaction)', { file });
+      } else {
+        await client.query('BEGIN');
+        try {
+          await client.query(sql);
+          await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file]);
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        }
+        logger.info('migration applied', { file });
+      }
       newlyApplied.push(file);
     } catch (err) {
-      await client.query('ROLLBACK');
       throw new Error(`migration ${file} failed: ${String(err)}`);
     } finally {
       client.release();
