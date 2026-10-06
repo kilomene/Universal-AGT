@@ -9,7 +9,7 @@
 | Suite | Result |
 |---|---|
 | Host worker pytest | 634 passed, 2 skipped |
-| Control Plane API vitest | 394 passed (29 files) |
+| Control Plane API vitest | 400 passed (30 files) |
 | `tsc --noEmit` | clean |
 | JS SDK (`node --test`) | 44 passed |
 | Python SDK pytest | 43 passed |
@@ -164,8 +164,14 @@
 
 ### SDKs / CLI / dashboard (WS-H/H2)
 - Python SDK test fixture tripped the secrets sweep (`client.api_key = "uagh_old"` → renamed to the filtered placeholder `uagh_old_not_real`).
-- 4 further client-surface defects fixed and tested (endpoint/contract mismatches across SDK, CLI, dashboard); agent-neutrality verified end-to-end (no Muse-only paths; Instinct uses the identical contract).
-- SDK READMEs gained `tailLogs`/`tail_logs`, domain methods, `rotateKey`/`rotate_agent_key`; CLI README lists all 19 commands.
+- **CLI `apps --host <name>` sent the name as `host_id`** (`main.py` `cmd_apps`) — the backend 400s unless `host_id` is a UUID. Now resolves name→id via `_resolve_host_id` first.
+- **Python SDK `get_domain` didn't URL-encode the hostname** (JS SDK used `encodeURIComponent`) — now `quote(hostname, safe='')`; JS/Python parity test added.
+- **`docs/agent-integration.md` documented `GET /v1/projects?limit=&cursor=`** — the backend ignores both params. Doc corrected; the honored `&limit=` on `GET /v1/services` documented.
+- **PROTOCOL §3.8 said 41 event types; the server emits 46** — list synced + changelog; stale-sync notes removed from `api.md`/`agent-integration.md`.
+- Agent-neutrality verified end-to-end: zero `grok` source references, no Tailscale, no Muse-only DB logic; Instinct uses the identical contract.
+
+### Stale-pending artifact reaper (coordinator, §16/§60)
+- **Gap: an artifact `init`ed but never PUT stayed `pending` forever** with no cleanup path (a retry with the same project+version 409s against the unique constraint). New `src/lib/artifactSweeper.ts`: every 300s (configurable) it fails `pending` rows older than 24h (configurable) with an `artifact.upload_failed` event (`reason: 'abandoned'`), transactionally (insert-in-tx, publish-after-commit) with a CAS guard so a concurrent upload completion wins the race. Wired into `index.ts` start/stop.
 
 ### Registration idempotency (coordinator, §7)
 - **Gap: `POST /v1/hosts/register` and `POST /v1/agents/register` were not idempotent.** A retried register after a lost response 409'd with no credential recovery path. Both routes now accept an optional `idempotency_key` (migration 010): same key + equal params → 200 replay with a **fresh** credential (original is hash-only and unrecoverable; host replay uses a 300s rotation grace, agent replay matches `/me/rotate` immediate semantics) + `idempotent_replay: true`; same key + different params → 409; no key → unchanged behavior. 7 new tests.
@@ -192,6 +198,7 @@
 - Decompression-bomb and member-count caps on archive extraction.
 - Tunnel token via environment (never argv).
 - Build-consistency gate (`scripts/check-build-consistency.sh`, 9 checks).
+- Stale-pending artifact sweeper (fails abandoned uploads with audit events).
 - Production config validator extended (tunnel/DNS/rate-limit/heartbeat/log-level checks).
 - Backup & restore procedure (documented, code-path-validated).
 
@@ -215,6 +222,7 @@
 ## 6. Every test added/changed
 - **API (new files):** `test/taskQueueHardening.test.ts` (24: CAS, mirror gating, cancel compensation, rollback/domain idempotency, degraded lifecycle, C1 proof, drain refusal, heartbeat enrichment, `worker.updated`, request_id), `test/registrationIdempotency.test.ts` (7), `test/domainReconcile.test.ts` (8, fake-Cloudflare double).
 - **API (extended):** `test/security.test.ts` (+7: provisioning dual-header, auth.failed ×3, request-id ×3), `test/config.test.ts` (+12), `test/hostSweeper.test.ts` (+3), `test/configConsistency.test.ts`, `test/cloudflareTunnel.test.ts`, plus test-schema patches for new columns across 12 files.
+- **API (new):** `test/artifactSweeper.test.ts` (6: stale-pending fail + event, fresh rows untouched, non-pending untouched, idempotence, config defaults/overrides).
 - **Worker (new files):** `test_drain.py` (24), `test_ws_f_hardening.py` (40), `test_log_retention.py`, `test_tunnel_token.py` (14), `test_resilience_agent_gone.py`, `test_resilience_concurrent.py`, `test_resilience_cp_outage.py`, `test_resilience_failure_matrix.py`, `test_resilience_network.py`, `test_resilience_worker_crash.py`, `test_deployment_contract.py`, `test_handlers_rollback.py`, `test_reconcile.py`, `test_rollback_gc_window.py`, `test_self_update.py`.
 - **Worker (extended):** `test_ingress.py` (+5), `test_phase4.py`, `test_resources.py`, `test_compose_security.py`, `test_config_env.py`.
 - **Clients:** JS SDK `client.test.js` extended; Python SDK `test_client.py` (fixture fix); CLI `smoke_help.py` extended (37 commands JSON-valid).
