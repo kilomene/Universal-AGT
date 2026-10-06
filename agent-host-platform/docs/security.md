@@ -41,10 +41,10 @@ Two bearer-token credential kinds, both sent as
 
 ## Permissions (least privilege)
 
-Agent API keys carry a scoped permission set, enforced per endpoint:
+Agent API keys carry a scoped permission set, enforced per endpoint
+(canonical list — `src/middleware/auth.ts`, `PERMISSIONS`):
 
-`deploy`, `read_status`, `read_logs`, `restart`, `stop`, `remove`,
-`manage_domains`, `approve_deployments`, `manage_secrets`
+`deploy`, `approve_deployments`, `read_status`, `restart`, `stop`, `manage_secrets`, `manage_domains`
 
 Register agents with the minimal set for their job. A deploy-only CI agent
 gets `deploy` + `read_status` — it cannot restart services, approve other
@@ -242,10 +242,12 @@ a compromised control plane means compromised workers, full stop.
 ## Audit: the append-only event journal
 
 Every security-relevant action emits an event:
-`agent.connected/disconnected`, `task.*`, `artifact.*`,
-`deployment.*`, `service.*`, `host.registered/online/offline`,
-`secret.changed`, `secret.deleted`, `worker.updated`, `agent.key_rotated`,
-`host.token_rotated`. Events are **append-only** — there is no delete or
+`agent.connected`, `task.*`, `artifact.*`,
+`deployment.*`, `service.*`, `host.registered/online/degraded/offline`,
+`secret.changed`, `secret.deleted`, `agent.key_rotated`,
+`host.token_rotated`, `auth.failed` (a presented-but-rejected credential at
+a registration gate — never the credential value). Events are
+**append-only** — there is no delete or
 update endpoint — and are cursor-paginated, so an auditor can replay the
 full history of who did what, when, from which actor.
 
@@ -294,8 +296,12 @@ it automatically because the application role name varies by deployment.
 - [ ] Dashboard users authenticate with agent keys (session-scoped); the
       control plane accepts `?api_key=` **only** on `/v1/events/stream`.
 - [ ] `ARTIFACT_MAX_BYTES` sized for the workload (default 500MB).
-- [ ] Migration `005_events_truncate_block.sql` applied as superuser
-      (re-apply after any database restore).
+- [ ] Migration `005_events_truncate_block.sql` applied as the table
+      owner (plain `REVOKE` — no superuser needed; the only migration
+      needing elevated privilege on a fresh database is `001` for the
+      `pgcrypto` extension). `005` is database-global, not a schema
+      object: `pg_dump` schema-only dumps do not capture it, so re-apply
+      it after any database restore.
 - [ ] Review the event journal periodically for `task.rejected`,
       `artifact.upload_failed`, `agent.key_rotated` / `host.token_rotated`,
       and unexpected `host.offline` flaps.
