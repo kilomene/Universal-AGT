@@ -10,6 +10,7 @@ import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { requireAgent, requirePermission } from '../middleware/auth';
+import { authorizeArtifactAccess, authorizeProjectAccess, inList, listAccessibleProjectIds } from '../lib/authz';
 import { isUuid } from './_helpers';
 
 export const artifactsRouter = Router();
@@ -85,11 +86,8 @@ artifactsRouter.post('/init', requireAgent, requirePermission('deploy'), async (
       return;
     }
     const pool = getPool();
-    const project = await pool.query('SELECT id FROM projects WHERE id = $1', [project_id]);
-    if (!project.rows[0]) {
-      sendError(res, 404, 'not_found', 'project not found');
-      return;
-    }
+    // §10: via project -> owner/ACL (also 404s on a missing project).
+    await authorizeProjectAccess(pool, req.auth!.id, project_id);
     const id = randomUUID();
     const safeName = basename(filename);
     const storagePath = `${id}/${safeName}`;
@@ -269,11 +267,9 @@ artifactsRouter.get('/:id', requireAgent, requirePermission('read_status'), asyn
       return;
     }
     const pool = getPool();
+    // §10: via artifact -> project -> project ACL.
+    await authorizeArtifactAccess(pool, req.auth!.id, req.params.id);
     const { rows } = await pool.query('SELECT * FROM artifacts WHERE id = $1', [req.params.id]);
-    if (!rows[0]) {
-      next(new HttpError(404, 'not_found', 'artifact not found'));
-      return;
-    }
     res.json({ artifact: rows[0] });
   } catch (err) {
     next(err);
@@ -285,15 +281,24 @@ artifactsRouter.get('/', requireAgent, requirePermission('read_status'), async (
   try {
     const { project_id } = req.query;
     const pool = getPool();
+    // §10: only artifacts of projects the agent may access.
+    const accessibleIds = await listAccessibleProjectIds(pool, req.auth!.id);
     let rows;
     if (project_id !== undefined) {
       if (!isUuid(project_id)) {
         sendError(res, 400, 'bad_request', 'project_id must be a UUID');
         return;
       }
+      await authorizeProjectAccess(pool, req.auth!.id, project_id);
       rows = (await pool.query('SELECT * FROM artifacts WHERE project_id = $1 ORDER BY created_at DESC', [project_id])).rows;
     } else {
-      rows = (await pool.query('SELECT * FROM artifacts ORDER BY created_at DESC LIMIT 500')).rows;
+      if (accessibleIds.length === 0) {
+        res.json({ artifacts: [] });
+        return;
+      }
+      const params: unknown[] = [];
+      const cond = inList('project_id', accessibleIds, params);
+      rows = (await pool.query(`SELECT * FROM artifacts WHERE ${cond} ORDER BY created_at DESC LIMIT 500`, params)).rows;
     }
     res.json({ artifacts: rows });
   } catch (err) {
@@ -319,6 +324,10 @@ artifactsRouter.get('/:id/download', async (req, res, next) => {
       return;
     }
     const pool = getPool();
+    if (req.auth.kind === 'agent') {
+      // §10: via artifact -> project -> project ACL.
+      await authorizeArtifactAccess(pool, req.auth.id, req.params.id);
+    }
     const { rows } = await pool.query('SELECT * FROM artifacts WHERE id = $1', [req.params.id]);
     const artifact = rows[0];
     if (!artifact) {
