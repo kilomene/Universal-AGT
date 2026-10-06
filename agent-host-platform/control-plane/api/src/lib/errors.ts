@@ -12,6 +12,7 @@ export type ErrorCode =
   | 'rate_limited'
   | 'worker_outdated'
   | 'bad_gateway'
+  | 'no_capacity'
   | 'internal';
 
 export function sendError(res: Response, status: number, code: ErrorCode, message: string): void {
