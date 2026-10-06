@@ -1,12 +1,16 @@
 import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
+import type { Pool } from 'pg';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { decideIdempotency, findTaskByIdempotencyKey, taskIdempotencyBody } from '../lib/idempotency';
+import { logger } from '../lib/log';
+import { releasePortAllocations } from '../lib/ports';
 import { canTransitionTask, isTaskStatus } from '../lib/stateMachine';
 import { requireAgent, requirePermission } from '../middleware/auth';
 import { decodeCursor, encodeCursor, isUuid, parseLimit } from './_helpers';
+import { failDomainsForDeployment } from './domains';
 
 export const tasksRouter = Router();
 
@@ -69,6 +73,31 @@ export function permissionForTaskType(type: string): string {
 async function getTask(pool: ReturnType<typeof getPool>, id: string) {
   const { rows } = await pool.query('SELECT * FROM tasks WHERE id = $1', [id]);
   return rows[0] ?? null;
+}
+
+/**
+ * §50 compensation for a deploy task cancelled before it ever ran: the
+ * deployment will never be built, so release its port reservation (which
+ * would otherwise leak forever — nothing else releases it) and fail any
+ * attached domains (they can never route). The deployment row itself is
+ * deliberately left in its requested/approved/building state — the
+ * established contract is that a rejected/cancelled deploy simply never
+ * starts (e2eFlows: reject leaves it 'requested').
+ */
+async function compensateCancelledDeploy(pool: Pool, task: Record<string, any>): Promise<void> {
+  const deploymentId = (task.payload as Record<string, unknown> | null)?.deployment_id;
+  if (typeof deploymentId !== 'string' || !isUuid(deploymentId)) return;
+  await releasePortAllocations(pool, deploymentId);
+  // Domain bookkeeping must not fail the cancel.
+  try {
+    await failDomainsForDeployment(pool, deploymentId, 'deploy task cancelled');
+  } catch (err) {
+    logger.warn('failDomainsForDeployment hook failed (cancel compensation)', {
+      deployment: deploymentId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+  logger.info('cancelled deploy task compensated', { task: task.id, deployment: deploymentId });
 }
 
 // POST /v1/tasks
@@ -286,18 +315,39 @@ tasksRouter.post('/:id/cancel', requireAgent, async (req, res, next) => {
       sendError(res, 409, 'conflict', `task is ${task.status}; cannot cancel from a terminal state`);
       return;
     }
+    // Compare-and-swap (§5/§74): the task may have changed state between
+    // the read above and this UPDATE (a worker completing it, another
+    // agent cancelling it). Without the status guard a completed task
+    // could be rewritten to cancelled — terminal states must never move.
+    const fromStatus: string = task.status;
     const { rows } = await pool.query(
-      `UPDATE tasks SET status = 'cancelled', completed_at = now() WHERE id = $1 RETURNING *`,
-      [task.id],
+      `UPDATE tasks SET status = 'cancelled', completed_at = now(), lease_expires_at = NULL
+       WHERE id = $1 AND status = $2 RETURNING *`,
+      [task.id, fromStatus],
     );
+    if (!rows[0]) {
+      sendError(res, 409, 'conflict', 'task changed state concurrently; re-read it and retry');
+      return;
+    }
     await appendEvent(pool, {
       type: 'task.cancelled',
       actor_type: 'agent',
       actor_id: req.auth!.name,
       task_id: task.id,
       host_id: task.assigned_to,
-      payload: { previous_status: task.status },
+      payload: { previous_status: fromStatus },
     });
+    // §50 deployment+task: a deploy task cancelled before it ever ran
+    // leaves its deployment stranded in requested/approved/building with
+    // a leaked port reservation. Compensate: fail the never-built
+    // deployment, release its ports, fail its domains. (Cancelled from
+    // `running` is left alone — the worker may still be finishing the
+    // deploy, and only its final report knows the truth.)
+    if (task.type === 'deploy' && ['queued', 'claimed', 'awaiting_approval'].includes(fromStatus)) {
+      await compensateCancelledDeploy(pool, task).catch((err) => {
+        logger.warn('cancel compensation failed', { task: task.id, err: String(err) });
+      });
+    }
     res.json({ task: rows[0] });
   } catch (err) {
     next(err);
@@ -321,12 +371,27 @@ async function decideApproval(req: Request, res: Response, next: NextFunction, a
       sendError(res, 409, 'conflict', `task is ${task.status}; only awaiting_approval tasks can be ${approve ? 'approved' : 'rejected'}`);
       return;
     }
+    // Compare-and-swap (§5/§74): without the status guard, a concurrent
+    // cancel (awaiting_approval -> cancelled) followed by this approve
+    // would resurrect the terminal task back to queued.
     const { rows } = await pool.query(
-      `UPDATE tasks SET status = $1, completed_at = CASE WHEN $1 = 'cancelled' THEN now() ELSE NULL END
-       WHERE id = $2 RETURNING *`,
+      `UPDATE tasks SET status = $1, completed_at = CASE WHEN $1 = 'cancelled' THEN now() ELSE NULL END,
+                        lease_expires_at = CASE WHEN $1 = 'cancelled' THEN NULL ELSE lease_expires_at END
+       WHERE id = $2 AND status = 'awaiting_approval' RETURNING *`,
       [target, task.id],
     );
+    if (!rows[0]) {
+      sendError(res, 409, 'conflict', 'task changed state concurrently; re-read it and retry');
+      return;
+    }
     const updated = rows[0];
+    // A rejected manual deploy strands its never-built deployment the same
+    // way a cancelled one does — compensate (§50).
+    if (!approve && task.type === 'deploy') {
+      await compensateCancelledDeploy(pool, task).catch((err) => {
+        logger.warn('reject compensation failed', { task: task.id, err: String(err) });
+      });
+    }
     const deploymentId = (task.payload as Record<string, unknown> | null)?.deployment_id;
     if (approve && typeof deploymentId === 'string' && isUuid(deploymentId)) {
       await pool.query(`UPDATE deployments SET status = 'approved' WHERE id = $1`, [deploymentId]);
