@@ -1,7 +1,8 @@
-import { Router } from 'express';
+import { Router, type Response } from 'express';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
+import { decideIdempotency, domainIdempotencyBody, findDomainByIdempotencyKey } from '../lib/idempotency';
 import { logger } from '../lib/log';
 import { requireAgent, requirePermission } from '../middleware/auth';
 import {
@@ -26,16 +27,26 @@ import {
   setRemoteTunnelIngress,
   tunnelApiMissingReason,
   NON_ROUTABLE_DEPLOYMENT_STATUSES,
+  type TunnelIngressRule,
 } from '../lib/cloudflare-tunnel';
 import { isUuid } from './_helpers';
 
 export const domainsRouter = Router();
 
-// Domain lifecycle (migration 007, table `domains`):
+// Domain lifecycle (migrations 007/008, table `domains`):
 //
 //   requested -> configuring -> active -> failed -> removing -> removed
 //                                  \-> failed (deployment died; reprovisionable)
-//   failed -> configuring (retry) is the only way back.
+//                    active -> degraded -> configuring -> active   (reconciled)
+//                                 \-> removing -> removed
+//
+// 'degraded' means: the row was active, but the public route can no longer
+// be verified against the authoritative remote configuration (Cloudflare
+// API unreachable, route missing, or route pointing at the wrong origin).
+// The DB never permanently claims 'active' when the edge cannot confirm
+// it (§51): the domain reconciler retries degraded rows until they
+// converge back to 'active'. 'failed' (provisioning never succeeded, or
+// the deployment died) retries via failed -> configuring instead.
 //
 // The table is the source of truth. `deployments.domains` (JSONB) is kept
 // as a derived summary mirror for GET /v1/services and the dashboard; it
@@ -57,7 +68,14 @@ export const domainsRouter = Router();
 // Removal (DELETE) reverses it: DNS record deleted, tunnel route removed
 // via a full reconcile, both verified gone, then 'removed'.
 
-type DomainStatus = 'requested' | 'configuring' | 'active' | 'failed' | 'removing' | 'removed';
+type DomainStatus =
+  | 'requested'
+  | 'configuring'
+  | 'active'
+  | 'degraded'
+  | 'failed'
+  | 'removing'
+  | 'removed';
 
 interface DomainRow {
   id: string;
@@ -83,9 +101,10 @@ type Pool = ReturnType<typeof getPool>;
 const TERMINAL_DEPLOYMENT = new Set<string>(NON_ROUTABLE_DEPLOYMENT_STATUSES);
 
 const ALLOWED_TRANSITIONS: Record<DomainStatus, DomainStatus[]> = {
-  requested: ['configuring', 'removing'],
+  requested: ['configuring', 'failed', 'removing'],
   configuring: ['active', 'failed', 'removing'],
-  active: ['failed', 'removing', 'configuring'],
+  active: ['failed', 'degraded', 'removing', 'configuring'],
+  degraded: ['configuring', 'active', 'failed', 'removing'],
   failed: ['configuring', 'removing'],
   removing: ['removed'],
   removed: [],
@@ -118,8 +137,7 @@ async function getDomain(pool: Pool, id: string): Promise<DomainRow | undefined>
   return rows[0] as DomainRow | undefined;
 }
 
-async function getLiveDomain(
-  pool: Pool,
+async function getLiveDomain(  pool: Pool,
   deploymentId: string,
   hostname: string,
 ): Promise<DomainRow | undefined> {
@@ -131,7 +149,7 @@ async function getLiveDomain(
   return rows[0] as DomainRow | undefined;
 }
 
-async function setDomainStatus(
+export async function setDomainStatus(
   pool: Pool,
   id: string,
   from: DomainStatus,
@@ -149,10 +167,23 @@ async function setDomainStatus(
   });
   setClauses.unshift('status = $1');
   params.push(id);
+  // Optimistic concurrency: the row must still be in the state the caller
+  // saw. Two concurrent transitions (e.g. two DELETEs racing) cannot both
+  // win — the loser gets a 409 instead of silently double-applying a
+  // teardown against a row that already moved on.
   const { rows } = await pool.query(
-    `UPDATE domains SET ${setClauses.join(', ')} WHERE id = $${params.length} RETURNING *`,
-    params,
+    `UPDATE domains SET ${setClauses.join(', ')} WHERE id = $${params.length} AND status = $${
+      params.length + 1
+    } RETURNING *`,
+    [...params, from],
   );
+  if (rows.length === 0) {
+    throw new HttpError(
+      409,
+      'conflict',
+      `domain changed state concurrently (expected ${from} -> ${to}); re-read and retry`,
+    );
+  }
   const row = rows[0] as DomainRow;
   await syncDeploymentDomainsMirror(pool, row.deployment_id);
   return row;
@@ -226,9 +257,9 @@ export async function probeHttps(hostname: string): Promise<{ reachable: boolean
 }
 
 /**
- * Idempotent provisioning: requested/configuring/failed -> configuring ->
- * active (or failed with a clear error). Every step persists its own
- * state, so a crash mid-provision leaves 'configuring' with partial
+ * Idempotent provisioning: requested/configuring/failed/degraded ->
+ * configuring -> active (or failed with a clear error). Every step persists
+ * its own state, so a crash mid-provision leaves 'configuring' with partial
  * flags and the next attempt resumes. Safe to call repeatedly.
  */
 export async function provisionDomain(pool: Pool, domainId: string): Promise<DomainRow> {
@@ -244,8 +275,18 @@ export async function provisionDomain(pool: Pool, domainId: string): Promise<Dom
     return failDomain(pool, domain, `deployment is ${dep.status}; domain cannot route to it`);
   }
 
-  if (domain.status === 'requested' || domain.status === 'failed') {
-    domain = await setDomainStatus(pool, domain.id, domain.status, 'configuring', { error: null });
+  if (domain.status === 'requested' || domain.status === 'failed' || domain.status === 'degraded') {
+    try {
+      domain = await setDomainStatus(pool, domain.id, domain.status, 'configuring', { error: null });
+    } catch (err) {
+      // §74: a concurrent actor (deployment-death hook, operator DELETE,
+      // reconciler) moved the row first — its outcome wins; re-read and
+      // return instead of throwing.
+      if (err instanceof HttpError && err.status === 409) {
+        return (await getDomain(pool, domain.id)) ?? domain;
+      }
+      throw err;
+    }
   }
 
   const cfCfg = getCloudflareConfig();
@@ -317,7 +358,29 @@ export async function provisionDomain(pool: Pool, domainId: string): Promise<Dom
   }
   patch.verified_at = new Date().toISOString();
 
-  domain = await setDomainStatus(pool, domain.id, domain.status, 'active', patch);
+  // §74: the deployment may have died while the Cloudflare calls above
+  // were in flight (its death hook fails domains concurrently). Re-check
+  // before claiming 'active' — a domain must never go active on a dead
+  // deployment.
+  const depNow = await getDeployment(pool, domain.deployment_id);
+  if (!depNow || TERMINAL_DEPLOYMENT.has(depNow.status)) {
+    return failDomain(
+      pool,
+      domain,
+      !depNow ? 'deployment row is gone' : `deployment is ${depNow.status}; domain cannot route to it`,
+      patch,
+    );
+  }
+  try {
+    domain = await setDomainStatus(pool, domain.id, domain.status, 'active', patch);
+  } catch (err) {
+    // §74: a concurrent transition won (e.g. the death hook failed the
+    // row while we provisioned) — re-read and return its outcome.
+    if (err instanceof HttpError && err.status === 409) {
+      return (await getDomain(pool, domain.id)) ?? domain;
+    }
+    throw err;
+  }
   await appendEvent(pool, {
     type: 'domain.active',
     actor_type: 'system',
@@ -348,10 +411,28 @@ async function failDomain(
   patch: Record<string, unknown> = {},
 ): Promise<DomainRow> {
   const message = error.length > 500 ? `${error.slice(0, 497)}…` : error;
-  const row = await setDomainStatus(pool, domain.id, domain.status, 'failed', {
-    ...patch,
-    error: message,
-  });
+  let row: DomainRow;
+  try {
+    row = await setDomainStatus(pool, domain.id, domain.status, 'failed', {
+      ...patch,
+      error: message,
+    });
+  } catch (err) {
+    // §74: a concurrent transition won the row first. If it already
+    // landed somewhere terminal (or the row is gone), leave it; otherwise
+    // retry the fail once from the row's actual current status so a fail
+    // is never silently dropped.
+    if (!(err instanceof HttpError) || err.status !== 409) throw err;
+    const current = await getDomain(pool, domain.id);
+    if (!current || current.status === 'failed' || current.status === 'removing' || current.status === 'removed') {
+      return current ?? domain;
+    }
+    if (!ALLOWED_TRANSITIONS[current.status].includes('failed')) return current;
+    row = await setDomainStatus(pool, current.id, current.status, 'failed', {
+      ...patch,
+      error: message,
+    });
+  }
   await appendEvent(pool, {
     type: 'domain.failed',
     actor_type: 'system',
@@ -362,6 +443,178 @@ async function failDomain(
   });
   logger.warn('domain failed', { hostname: domain.hostname, error: message });
   return row;
+}
+
+/**
+ * Mark an active row 'degraded' when its public route can no longer be
+ * verified against the authoritative remote configuration (§51). The row
+ * keeps its DNS/tunnel flags; the error explains what the verification
+ * saw. The domain reconciler retries degraded rows until they converge
+ * back to 'active'. Never throws for transition races: a concurrent
+ * transition wins and this pass simply moves on.
+ */
+async function degradeDomain(pool: Pool, domain: DomainRow, error: string): Promise<DomainRow> {
+  const message = error.length > 500 ? `${error.slice(0, 497)}…` : error;
+  try {
+    const row = await setDomainStatus(pool, domain.id, domain.status, 'degraded', {
+      error: message,
+    });
+    await appendEvent(pool, {
+      type: 'domain.degraded',
+      actor_type: 'system',
+      actor_id: 'domain-reconciler',
+      deployment_id: domain.deployment_id,
+      host_id: domain.host_id,
+      payload: { hostname: domain.hostname, ingress: domain.ingress, error: message },
+    });
+    logger.warn('domain degraded', { hostname: domain.hostname, error: message });
+    return row;
+  } catch (err) {
+    // A concurrent transition (e.g. operator DELETE raced the sweep) —
+    // the other transition won; re-read and leave the row alone.
+    logger.info('domain degrade skipped (concurrent transition)', {
+      hostname: domain.hostname,
+      err: errMessage(err),
+    });
+    return (await getDomain(pool, domain.id)) ?? domain;
+  }
+}
+
+export interface VerifyTunnelResult {
+  checked: number;
+  degraded: string[];
+  healed: string[];
+  error?: string;
+}
+
+/**
+ * Verify every 'active'/'degraded' tunnel-mode domain against the
+ * AUTHORITATIVE remote tunnel configuration (§51 reconciliation).
+ *
+ *  - Remote route present with the exact loopback origin service ->
+ *    'degraded' rows heal back to 'active' (verified_at refreshed).
+ *  - Route missing, pointing at the wrong service, deployment no longer
+ *    routable, or no published host port -> row is marked 'degraded'
+ *    with the concrete reason. The DB never keeps claiming 'active' when
+ *    the edge cannot confirm the route.
+ *  - Cloudflare API unreachable (or tunnel API not configured) -> every
+ *    live tunnel row is marked 'degraded' with the error: unverifiable
+ *    is not verified. The next reconciler pass retries until convergence.
+ *
+ * Direct-mode domains are not tunnel-routed and are skipped.
+ */
+export async function verifyTunnelRoutes(pool: Pool): Promise<VerifyTunnelResult> {
+  const result: VerifyTunnelResult = { checked: 0, degraded: [], healed: [] };
+
+  const { rows } = await pool.query(
+    `SELECT d.*, dep.status AS dep_status
+     FROM domains d
+     JOIN deployments dep ON dep.id = d.deployment_id
+     WHERE d.ingress = 'tunnel'
+       AND d.status IN ('active', 'degraded')`,
+  );
+  const live = rows as Array<DomainRow & { dep_status: string }>;
+  result.checked = live.length;
+  if (live.length === 0) return result;
+
+  const markAll = async (error: string) => {
+    for (const row of live) {
+      if (row.status === 'active') {
+        await degradeDomain(pool, row, error);
+        result.degraded.push(row.hostname);
+      } else if (row.error !== error) {
+        await pool.query('UPDATE domains SET error = $2 WHERE id = $1', [row.id, error]);
+      }
+    }
+  };
+
+  const tunnelCfg = getTunnelApiConfig();
+  if (!tunnelCfg) {
+    result.error = 'tunnel API not configured';
+    await markAll(
+      `route unverifiable: ${tunnelApiMissingReason()}`,
+    );
+    return result;
+  }
+
+  let rules: TunnelIngressRule[];
+  try {
+    rules = await getRemoteTunnelIngress(tunnelCfg);
+  } catch (err) {
+    result.error = errMessage(err);
+    await markAll(`route unverifiable: Cloudflare API unreachable (${errMessage(err)})`);
+    return result;
+  }
+  const byName = new Map(
+    rules
+      .filter((r) => typeof r.hostname === 'string')
+      .map((r) => [(r.hostname as string).toLowerCase(), r.service as string]),
+  );
+
+  for (const row of live) {
+    const wantName = row.hostname.toLowerCase();
+    if (TERMINAL_DEPLOYMENT.has(row.dep_status)) {
+      // The deployment-death hook normally fails these first; a row that
+      // slipped through must not keep claiming a route.
+      if (row.status === 'active') {
+        await degradeDomain(pool, row, `deployment is ${row.dep_status}; domain cannot route to it`);
+        result.degraded.push(row.hostname);
+      }
+      continue;
+    }
+    const port = await deploymentHostPort(pool, row.deployment_id);
+    if (port === null) {
+      if (row.status === 'active') {
+        await degradeDomain(pool, row, 'deployment publishes no host port; cannot route');
+        result.degraded.push(row.hostname);
+      }
+      continue;
+    }
+    const wantService = originServiceFor(port);
+    const actual = byName.get(wantName);
+    if (actual === wantService) {
+      if (row.status === 'degraded') {
+        try {
+          await setDomainStatus(pool, row.id, row.status, 'active', {
+            error: null,
+            verified_at: new Date().toISOString(),
+          });
+          await appendEvent(pool, {
+            type: 'domain.recovered',
+            actor_type: 'system',
+            actor_id: 'domain-reconciler',
+            deployment_id: row.deployment_id,
+            host_id: row.host_id,
+            payload: { hostname: row.hostname, ingress: row.ingress },
+          });
+          logger.info('domain recovered', { hostname: row.hostname });
+          result.healed.push(row.hostname);
+        } catch (err) {
+          logger.info('domain heal skipped (concurrent transition)', {
+            hostname: row.hostname,
+            err: errMessage(err),
+          });
+        }
+      } else {
+        await pool.query('UPDATE domains SET verified_at = $2 WHERE id = $1', [
+          row.id,
+          new Date().toISOString(),
+        ]);
+      }
+      continue;
+    }
+    const reason =
+      actual === undefined
+        ? `tunnel route missing in the remote configuration (expected ${wantName} -> ${wantService})`
+        : `tunnel route points at ${actual}, expected ${wantService}`;
+    if (row.status === 'active') {
+      await degradeDomain(pool, row, reason);
+      result.degraded.push(row.hostname);
+    } else if (row.error !== reason) {
+      await pool.query('UPDATE domains SET error = $2 WHERE id = $1', [row.id, reason]);
+    }
+  }
+  return result;
 }
 
 /**
@@ -385,7 +638,17 @@ export async function removeDomain(pool: Pool, domainId: string, actorName: stri
   const errors: string[] = [];
 
   // -- DNS teardown ------------------------------------------------------
-  if (cfCfg && (domain.cf_record_id || domain.dns_configured)) {
+  // Symmetry with the tunnel branch below: when there IS DNS state to
+  // clean but the Cloudflare DNS API is not configured, removal is
+  // refused — marking 'removed' would orphan a live public CNAME while
+  // the DB claims the domain is gone. Restore the config (or delete the
+  // record by hand) and re-issue DELETE.
+  if (!cfCfg && (domain.cf_record_id || domain.dns_configured)) {
+    errors.push(
+      'DNS record cannot be deleted: Cloudflare DNS API is not configured; ' +
+        'delete the CNAME in the Cloudflare dashboard, then re-issue DELETE',
+    );
+  } else if (cfCfg && (domain.cf_record_id || domain.dns_configured)) {
     try {
       if (domain.cf_record_id) await deleteDnsRecord(cfCfg, domain.cf_record_id);
       const stillThere = await findDnsRecord(cfCfg, domain.hostname);
@@ -473,13 +736,23 @@ export async function removeDomain(pool: Pool, domainId: string, actorName: stri
 export async function failDomainsForDeployment(pool: Pool, deploymentId: string, reason: string): Promise<number> {
   const { rows } = await pool.query(
     `SELECT * FROM domains
-     WHERE deployment_id = $1 AND status IN ('requested', 'configuring', 'active')`,
+     WHERE deployment_id = $1 AND status IN ('requested', 'configuring', 'active', 'degraded')`,
     [deploymentId],
   );
   let count = 0;
   for (const row of rows as DomainRow[]) {
-    await failDomain(pool, row, reason);
-    count += 1;
+    // §50: one bad row (or a concurrent transition) must never abort the
+    // batch — every other live domain still has to be failed.
+    try {
+      await failDomain(pool, row, reason);
+      count += 1;
+    } catch (err) {
+      logger.warn('failDomainsForDeployment: skipping domain', {
+        domain: row.id,
+        hostname: row.hostname,
+        err: errMessage(err),
+      });
+    }
   }
   if (count > 0) {
     // Drop the dead routes from the authoritative remote table.
@@ -517,14 +790,24 @@ export async function reprovisionDomainsForDeployment(pool: Pool, deploymentId: 
   return count;
 }
 
-// POST /v1/domains {deployment_id, hostname, ingress?}
+// POST /v1/domains {deployment_id, hostname, ingress?, idempotency_key?}
 // Full flow: validate -> requested -> configuring -> active|failed.
 // `ingress` accepts 'tunnel' | 'direct'; tunnel mode without
 // TUNNEL_INGRESS_HOSTNAME configured is a 422. Attaching to a terminal
 // deployment is a 422 — a domain must never point at a dead deployment.
+//
+// Idempotent via `idempotency_key` (§7): same key + equal body replays the
+// original domain row (200 + idempotent_replay); same key + different body
+// is a 409. Two requests racing with the same key resolve through the
+// unique constraint: exactly one row wins, the loser replays it.
+//
+// Resume (§50): re-posting the same deployment+hostname while the row is
+// stuck in requested/configuring/failed/degraded re-drives the idempotent
+// provisioner (200) instead of 409 — a crashed first attempt must not
+// strand the hostname. An `active` duplicate is still a 409.
 domainsRouter.post('/', requireAgent, requirePermission('manage_domains'), async (req, res, next) => {
   try {
-    const { deployment_id, hostname } = req.body ?? {};
+    const { deployment_id, hostname, idempotency_key } = req.body ?? {};
     if (!isUuid(deployment_id)) {
       sendError(res, 400, 'bad_request', 'deployment_id must be a UUID');
       return;
@@ -538,6 +821,12 @@ domainsRouter.post('/', requireAgent, requirePermission('manage_domains'), async
       );
       return;
     }
+    if (idempotency_key !== undefined && typeof idempotency_key !== 'string') {
+      sendError(res, 400, 'bad_request', 'idempotency_key must be a string');
+      return;
+    }
+    const idemKey =
+      typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null;
     let mode: IngressMode;
     try {
       mode = resolveIngressMode(req.body?.ingress);
@@ -565,8 +854,39 @@ domainsRouter.post('/', requireAgent, requirePermission('manage_domains'), async
       // 422 when the operator asked for tunnel mode without configuring it.
       requireTunnelHostname();
     }
-    if (await getLiveDomain(pool, deployment_id, hostname)) {
-      sendError(res, 409, 'conflict', 'hostname already attached to this deployment');
+    const incomingBody = domainIdempotencyBody({ deployment_id, hostname, ingress: mode });
+
+    // Idempotency fast path.
+    if (idemKey) {
+      const replayed = await replayDomainIdempotency(pool, res, idemKey, incomingBody, mode);
+      if (replayed) return;
+    }
+
+    const live = await getLiveDomain(pool, deployment_id, hostname);
+    if (live) {
+      if (live.status === 'active') {
+        sendError(res, 409, 'conflict', 'hostname already attached to this deployment');
+        return;
+      }
+      // Resume a stuck row: re-drive the idempotent provisioner instead
+      // of 409-ing (§50). provisionDomain is safe to call repeatedly.
+      let resumed = live;
+      try {
+        resumed = await provisionDomain(pool, live.id);
+      } catch (err) {
+        logger.error('domain re-provision threw', { hostname, err: errMessage(err) });
+      }
+      let ingressTaskId: string | null = null;
+      if (mode === 'tunnel') {
+        ingressTaskId = await enqueueIngressSync(pool, dep.host_id, req.auth!.id, {
+          trigger: 'domain.resumed',
+          hostname,
+        });
+      }
+      const tunnelHost = mode === 'tunnel' ? process.env.TUNNEL_INGRESS_HOSTNAME ?? null : null;
+      res
+        .status(200)
+        .json({ domain: publicDomain(resumed, tunnelHost), ingress_task_id: ingressTaskId });
       return;
     }
     // A hostname may only be live on one deployment at a time.
@@ -580,11 +900,27 @@ domainsRouter.post('/', requireAgent, requirePermission('manage_domains'), async
       return;
     }
 
-    const inserted = await pool.query(
-      `INSERT INTO domains (hostname, deployment_id, host_id, ingress, status)
-       VALUES ($1, $2, $3, $4, 'requested') RETURNING *`,
-      [hostname, deployment_id, dep.host_id, mode],
-    );
+    let inserted;
+    try {
+      inserted = await pool.query(
+        `INSERT INTO domains (idempotency_key, hostname, deployment_id, host_id, ingress, status)
+         VALUES ($1, $2, $3, $4, $5, 'requested') RETURNING *`,
+        [idemKey, hostname, deployment_id, dep.host_id, mode],
+      );
+    } catch (err) {
+      // Idempotency race: two requests with the same key passed the
+      // pre-check concurrently — the unique constraint picked the winner.
+      // A hostname-clash 23505 (no idempotency key involved) keeps the
+      // original 409.
+      if ((err as { code?: string }).code === '23505' && idemKey) {
+        if (await replayDomainIdempotency(pool, res, idemKey, incomingBody, mode)) return;
+      }
+      if ((err as { code?: string }).code === '23505') {
+        sendError(res, 409, 'conflict', 'hostname is already attached to another deployment');
+        return;
+      }
+      throw err;
+    }
     let domain = inserted.rows[0] as DomainRow;
     await appendEvent(pool, {
       type: 'domain.requested',
@@ -619,6 +955,46 @@ domainsRouter.post('/', requireAgent, requirePermission('manage_domains'), async
     next(err);
   }
 });
+
+/**
+ * Resolve an idempotency-key hit on POST /v1/domains into the
+ * replay/conflict response. Returns true when it responded (the caller
+ * must return), false when no row exists for the key.
+ */
+async function replayDomainIdempotency(
+  pool: Pool,
+  res: Response,
+  idempotencyKey: string,
+  incomingBody: unknown,
+  mode: IngressMode,
+): Promise<boolean> {
+  const existing = await findDomainByIdempotencyKey(pool, idempotencyKey);
+  if (!existing) return false;
+  const decision = decideIdempotency(
+    {
+      body: domainIdempotencyBody({
+        deployment_id: existing.deployment_id,
+        hostname: existing.hostname,
+        ingress: existing.ingress,
+      }),
+    },
+    incomingBody,
+  );
+  if (decision === 'replay') {
+    const domain = await getDomain(pool, existing.id);
+    const tunnelHost = mode === 'tunnel' ? process.env.TUNNEL_INGRESS_HOSTNAME ?? null : null;
+    res
+      .status(200)
+      .json({
+        domain: domain ? publicDomain(domain, tunnelHost) : null,
+        ingress_task_id: null,
+        idempotent_replay: true,
+      });
+    return true;
+  }
+  sendError(res, 409, 'conflict', 'idempotency key already used with a different payload');
+  return true;
+}
 
 /**
  * Queue an `ingress-sync` task for a host so its worker refreshes its
