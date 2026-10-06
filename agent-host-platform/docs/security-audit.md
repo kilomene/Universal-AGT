@@ -154,6 +154,13 @@ Files: `host-worker/deployments/manifest.py`.
   (hardcoded URL + SHA-256 pinned). `repository` is inert metadata (never
   fetched). Verified with a stubbed-fetch test that domain creation with
   Cloudflare unconfigured makes ZERO outbound calls.
+- **F3 follow-up (2026-10-06):** `probeHttps` was hardened further to
+  close the DNS-rebinding window: it now resolves A **and** AAAA itself,
+  requires **every** resolved address to be public (fail closed on any
+  private/special-use hit), and pins the validated IP into the TLS
+  connection (custom `lookup`; SNI and the `Host` header keep the
+  hostname). The probe remains informational only — it reports
+  reachability and never blocks domain creation.
 - **Secrets.** Re-audited rotation grace, domain lifecycle, port
   settlement, and recovery paths: events carry names/ids/counts only;
   `secret.changed`/`secret.deleted`/`host.token_rotated`/
