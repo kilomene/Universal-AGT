@@ -48,7 +48,8 @@ function setupDb() {
   db.public.none(`
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
-      permissions JSONB, api_key_hash TEXT NOT NULL,
+      permissions JSONB, api_key_hash TEXT,
+      idempotency_key TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TIMESTAMPTZ DEFAULT now()
     );
@@ -56,6 +57,7 @@ function setupDb() {
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'online',
       token_hash TEXT NOT NULL,
+      idempotency_key TEXT,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT now()
     );
@@ -92,6 +94,7 @@ function setupDb() {
     );
     CREATE TABLE domains (
       id TEXT PRIMARY KEY, hostname TEXT NOT NULL,
+      idempotency_key TEXT,
       deployment_id TEXT, host_id TEXT,
       ingress TEXT NOT NULL DEFAULT 'tunnel',
       status TEXT NOT NULL DEFAULT 'requested',
