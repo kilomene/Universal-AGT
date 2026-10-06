@@ -13,8 +13,13 @@ reboots, real network paths.
 **Prerequisites**
 - A Supabase project (or any Postgres 14+) with the migrations in
   `agent-host-platform/database/migrations/` applied in order
-  (`001_initial.sql` … `005_events_truncate_block.sql`; the 005 trigger
-  needs a superuser).
+  (`001_initial.sql` … `007_domains_lifecycle.sql`; only `001`'s
+  `pgcrypto` extension needs an elevated privilege on a fresh database —
+  allowlisted on Supabase, enable via Dashboard → Database → Extensions
+  or the SQL editor. Migrations `002`–`007` need only table ownership,
+  no superuser. Prefer the direct connection (port 5432) or a
+  session-mode pooler for the API — the SSE event bus holds a persistent
+  `LISTEN uag_events`, which transaction-mode poolers do not support.)
 - The control-plane API running with `DATABASE_URL` pointing at it,
   `DATA_ENCRYPTION_KEY` set (64 hex chars), and `UAHT_PROVISIONING_TOKEN`
   set (gates agent registration).
@@ -288,10 +293,10 @@ sudo UAHT_CONTROL_PLANE_URL="http://<control-plane>:3000" \
      UAHT_TUNNEL_TOKEN="<redacted>" \
      ./scripts/install-host.sh
 # Zero Trust dashboard -> Networks -> Tunnels -> <tunnel> -> Public hostnames:
-# add demo.example.com (service type HTTP, URL http://localhost:80 is IGNORED
-# for dashboard tunnels — the worker's config.yml is authoritative only for
-# local `cloudflared tunnel run` with a token created via `cloudflared tunnel create`;
-# follow docs/cloudflare.md for your tunnel type)
+# add demo.example.com (required for dashboard-created token tunnels —
+# Cloudflare reads public-hostname routes from the tunnel's remote
+# configuration, not from the worker's local config.yml mirror;
+# see docs/cloudflare.md "Control authority")
 DEP=$(agent-host deployments list --project demo-app --json | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['id'])")
 agent-host domains add --deployment "$DEP" --hostname demo.example.com --ingress tunnel
 sleep 10
