@@ -188,7 +188,10 @@ jobs:
         working-directory: agent-host-platform/host-worker
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - run: bash agent-host-platform/scripts/test-install.sh
-        working-directory: agent-host-platform
+        # NOTE: no working-directory on this step — the path above is
+        # repo-root relative. (A previous revision set working-directory:
+        # agent-host-platform here, which made the path resolve doubly and
+        # the step failed with "No such file or directory".)
 
   python-sdk:
     name: Python SDK (pytest)
