@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import socket
+import sys
 import tarfile
 import threading
 import time
@@ -47,7 +48,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from deployments.manifest import parse_memory_mb, validate_manifest
+from deployments.manifest import normalize_resources, validate_manifest
 from deployments import compose_validate
 from deployments import gc
 from deployments import rollback as rollback_mod
@@ -73,6 +74,14 @@ QUARANTINE_DIRNAME = "quarantine"
 # file_size (a lying header fails CRC and aborts extraction).
 MAX_EXTRACT_BYTES = 8 * 1024**3  # 8 GiB
 MAX_ARCHIVE_MEMBERS = 100_000
+
+# Symlink/hardlink protection for tar extraction relies on
+# tarfile.data_filter (PEP 706), which exists only on Python 3.12+.
+# The installer enforces python3 >= 3.12; this capability probe turns a
+# stale interpreter into a clear DeployError instead of an unhandled
+# TypeError from extractall(filter=...) — extraction must never run
+# without the link-target protection.
+_HAS_DATA_FILTER = hasattr(tarfile, "data_filter")
 
 # artifact_id values become the path component artifacts/<id>.bin. They are
 # server-minted UUIDs, but the worker builds the path from the task payload
@@ -206,6 +215,18 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
 
     try:
         if tarfile.is_tarfile(archive_path):
+            # Symlink/hardlink protection for tar relies on
+            # tarfile.data_filter (PEP 706, Python 3.12+). The installer
+            # enforces >= 3.12; on a stale interpreter fail closed with a
+            # clear DeployError instead of an unhandled TypeError from
+            # extractall(filter=...) — extraction must never run without
+            # the link-target protection.
+            if not _HAS_DATA_FILTER:
+                raise DeployError(
+                    "refusing tar extraction: this worker runs on Python "
+                    f"{sys.version.split()[0]}, but symlink/hardlink "
+                    "protection requires tarfile.data_filter (Python 3.12+)"
+                )
             # Header scan, incremental: member names are confinement-checked
             # and the running uncompressed total is capped BEFORE tarfile
             # seeks past each member's data — a bomb's payload is never even
@@ -429,6 +450,24 @@ def release_resource_reservation(deployment_id: str) -> None:
     """Release an admission reservation; safe to call when none exists."""
     with _resource_alloc_lock:
         _resource_reservations.pop(deployment_id, None)
+
+
+def persist_state_releasing_reservation(store, state: dict,
+                                        deployment_id: str):
+    """Persist the deployment state row AND drop the in-flight admission
+    reservation atomically under the process-wide resource lock (Part 1H).
+
+    Without this, a thread calling reserve_resources() between store.save()
+    and the section-8 finally's release would observe BOTH the persisted
+    row (via health.collector.allocated_resources) and the still-present
+    in-flight entry — double-counting this deployment and potentially
+    rejecting a deploy that actually fits. The finally's release remains as
+    an idempotent safety net for every other path.
+    """
+    with _resource_alloc_lock:
+        store.save(state)
+        _resource_reservations.pop(deployment_id, None)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -852,10 +891,11 @@ def deploy(ctx, task: dict) -> dict:
     # section-8 finally on any failure path.
     resource_reserved = False
     if resources.get("memory") or resources.get("cpu"):
-        need_mb = (parse_memory_mb(resources["memory"])
-                   if resources.get("memory") else 0.0)
-        need_cpu = (float(resources["cpu"])
-                    if resources.get("cpu") else 0.0)
+        # Part 1B: the single authoritative resource parser — the same rule
+        # the control-plane scheduler applies to project configuration.
+        normalized = normalize_resources(resources)
+        need_mb = normalized["ram_mb"] or 0.0
+        need_cpu = normalized["cpu"] or 0.0
         reserve_resources(deployment_id, need_cpu, need_mb, store, log=log)
         resource_reserved = True
 
@@ -1131,7 +1171,10 @@ def deploy(ctx, task: dict) -> dict:
                 "previous_deployment_id": (previous or {}).get("deployment_id"),
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
-            store.save(state)
+            # Part 1H: persist + release atomically under the resource lock —
+            # a concurrent reserve_resources() must never observe both the
+            # persisted row and the still-present in-flight entry.
+            persist_state_releasing_reservation(store, state, deployment_id)
             log(f"deploy OK: {project_name} {version} healthy on :{host_port}")
             # Garbage-collect superseded generations AFTER the successful
             # deploy — never during. Keeps DEPLOY_KEEP_GENERATIONS (default 2)
@@ -1194,29 +1237,44 @@ def deploy(ctx, task: dict) -> dict:
                     f"{exc}"
                 ) from exc
             rolled_back_to = outcome["rolled_back_to"]
-            target_healthy = outcome["target_health_status"] != "unhealthy"
-            # Port-reservation reconciliation with the control-plane
-            # registry (spec §3): after rollback, Docker/OS state ==
-            # deployment state == the port_allocations registry. A settle
-            # failure never fails the rollback — it is logged and
-            # recorded, not silently claimed. A skipped settle (no
-            # control-plane session — tests/doubles only; production
-            # always has one) is not a failure.
-            settle = rollback_mod.settle_rollback_ports(
-                ctx, log, deployment_id, rolled_back_to)
-            port_settle_record = {"settled": settle["settled"],
-                                  "reason": settle.get("reason")}
-            settle_failed = (not settle["settled"]
-                             and settle.get("reason")
-                             != "no control-plane session")
-            if not settle["settled"]:
-                log(f"rollback port registry settle failed "
-                    f"({settle.get('reason')}); recorded, not fatal")
+            # Spec Part 2 (state machine — same rule as the explicit path in
+            # executor/handlers.py): the target counts as healthy ONLY when
+            # its health check positively verified it ("healthy"). An
+            # "unknown" target (e.g. no health-checkable endpoint) is NOT a
+            # success — unknown health is never reported as "rolled_back".
+            target_healthy = outcome["target_health_status"] == "healthy"
+            # Port settlement runs ONLY after the target is proven healthy
+            # (spec §3): settling the registry for a target whose health is
+            # unverified would bless a broken promotion.
+            if target_healthy:
+                # Port-reservation reconciliation with the control-plane
+                # registry (spec §3): after rollback, Docker/OS state ==
+                # deployment state == the port_allocations registry. A settle
+                # failure never fails the rollback — it is logged and
+                # recorded, not silently claimed. A skipped settle (no
+                # control-plane session — tests/doubles only; production
+                # always has one) is not a failure.
+                settle = rollback_mod.settle_rollback_ports(
+                    ctx, log, deployment_id, rolled_back_to)
+                port_settle_record = {"settled": settle["settled"],
+                                      "reason": settle.get("reason")}
+                settle_failed = (not settle["settled"]
+                                 and settle.get("reason")
+                                 != "no control-plane session")
+                if not settle["settled"]:
+                    log(f"rollback port registry settle failed "
+                        f"({settle.get('reason')}); recorded, not fatal")
+            else:
+                port_settle_record = {
+                    "settled": False,
+                    "reason": "settle skipped: target health not verified",
+                }
+                settle_failed = False
             # Spec §6: a rollback is only "rolled_back" when the target
             # was restored AND verified healthy AND the port registry
-            # settled. An unhealthy target or a failed settle persists
-            # rollback_failed (partially_reconciled when only the settle
-            # failed) — never a false success.
+            # settled. An unhealthy OR unknown target, or a failed settle,
+            # persists rollback_failed (partially_reconciled when only the
+            # settle failed) — never a false success.
             if target_healthy and not settle_failed:
                 rollback_status_value = "succeeded"
             elif target_healthy:
@@ -1224,6 +1282,12 @@ def deploy(ctx, task: dict) -> dict:
                 rollback_error_note = (
                     f"target restored and healthy but port-registry "
                     f"settle failed: {settle.get('reason')}")
+            elif outcome["target_health_status"] == "unknown":
+                rollback_status_value = "failed"
+                rollback_error_note = (
+                    f"target {rolled_back_to} restored but target health "
+                    f"could not be verified "
+                    f"(target_health_status=unknown)")
             else:
                 rollback_status_value = "failed"
                 rollback_error_note = (
@@ -1275,12 +1339,25 @@ def deploy(ctx, task: dict) -> dict:
             "port_settle": port_settle_record,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
+        # The DeployError message names the honest outcome: unknown target
+        # health is "could not be verified", not "UNHEALTHY". (outcome only
+        # exists when a rollback actually ran.)
+        if rolled_back_to and outcome["target_health_status"] == "unknown":
+            rollback_failure_desc = (
+                f"rollback to deployment {rolled_back_to} restored the "
+                f"target but its health could not be verified — "
+                f"rollback FAILED"
+            )
+        else:
+            rollback_failure_desc = (
+                f"rollback to deployment {rolled_back_to} restored "
+                f"the target but it is UNHEALTHY — rollback FAILED"
+            )
         err = (f"healthcheck failed for {project_name} {version} "
                f"(GET :{host_port}{healthcheck_path} never returned 200); "
                + (f"rolled back to deployment {rolled_back_to}"
                   if rolled_back_to and rollback_status_value == "succeeded"
-                  else f"rollback to deployment {rolled_back_to} restored "
-                       f"the target but it is UNHEALTHY — rollback FAILED"
+                  else rollback_failure_desc
                   if rolled_back_to and rollback_status_value == "failed"
                   else f"rolled back to deployment {rolled_back_to} but "
                        f"port registry settle failed "
