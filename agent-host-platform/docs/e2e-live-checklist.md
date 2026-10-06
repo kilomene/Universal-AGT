@@ -13,10 +13,10 @@ reboots, real network paths.
 **Prerequisites**
 - A Supabase project (or any Postgres 14+) with the migrations in
   `agent-host-platform/database/migrations/` applied in order
-  (`001_initial.sql` … `010_registration_idempotency.sql`; only `001`'s
+  (`001_initial.sql` … `012_rollback_failed_status.sql`; only `001`'s
   `pgcrypto` extension needs an elevated privilege on a fresh database —
   allowlisted on Supabase, enable via Dashboard → Database → Extensions
-  or the SQL editor. Migrations `002`–`010` need only table ownership,
+  or the SQL editor. Migrations `002`–`012` need only table ownership,
   no superuser. Prefer the direct connection (port 5432) or a
   session-mode pooler for the API — the SSE event bus holds a persistent
   `LISTEN uag_events`, which transaction-mode poolers do not support.)
