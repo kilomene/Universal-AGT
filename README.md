@@ -43,7 +43,7 @@ LAYER 4: PUBLIC EDGE       Cloudflare: proxied CNAMEs (DNS API) + edge/tunnel.
 ```
 Universal-AGT/
 ├── README.md                        ← this file
-├── .github/workflows/ci.yml         ← 6 jobs: API, JS SDK, worker, Python SDK, CLI smoke, secrets sweep
+├── .github/workflows/ci.yml         ← 12 jobs: control-plane, migration-validation, js-sdk, host-worker, installer, python-sdk, cli, dashboard, security, secrets-sweep, dist-drift-guard, e2e (API against real PostgreSQL 16)
 └── agent-host-platform/
     ├── agent-sdk/
     │   ├── protocol/PROTOCOL.md     ← canonical wire contract (REST + SSE) — authoritative
@@ -54,7 +54,7 @@ Universal-AGT/
     │   ├── api/                     ← Express REST API (Node/TS): routes, sweepers, retry policy
     │   ├── agents/ hosts/ task-queue/ deployments/ artifacts/ events/ authentication/
     │   └── (modules live under api/src; the top-level dirs mirror the design areas)
-    ├── database/migrations/         ← 001_initial … 005_events_truncate_block (apply in order)
+    ├── database/migrations/         ← 001_initial … 007_domains_lifecycle (apply in order)
     ├── host-worker/                 ← outbound-only daemon: claim tasks, docker builds,
     │                                  health checks, reconcile, updater, ingress/
     ├── dashboard/                   ← static ops dashboard served by the API at `/`
@@ -77,7 +77,7 @@ Universal-AGT/
 cd agent-host-platform/control-plane/api
 npm ci
 npm run build
-# apply migrations 001…005 against Postgres first, then:
+# apply migrations 001…007 against Postgres first, then:
 DATABASE_URL="postgresql://user:pass@localhost:5432/uagt" \
 DATA_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
 UAHT_PROVISIONING_TOKEN="<pick-a-strong-value>" \
