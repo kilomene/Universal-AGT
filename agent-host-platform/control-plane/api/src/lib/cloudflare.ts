@@ -181,6 +181,8 @@ interface CfResult {
   id: string;
   name: string;
   type: string;
+  /** Record content (the CNAME target). Present on DNS record reads. */
+  content?: string;
 }
 
 /**
@@ -239,6 +241,12 @@ export async function findDnsRecord(cfg: CfConfig, hostname: string): Promise<Cf
  * identical record already exists, its id is returned without changes.
  * `target` defaults to the direct-mode ingress hostname (backwards
  * compatible); tunnel mode passes the tunnel hostname.
+ *
+ * SECURITY (W16 audit): an existing record is only adopted when its
+ * content matches the desired target (case-insensitive, trailing dot
+ * ignored). Adopting a same-named record that points elsewhere would let
+ * a domain claim TAKE OVER an operator-managed hostname — and the later
+ * DELETE would then delete the operator's record. A mismatch is a 409.
  */
 export async function ensureCnameRecord(
   cfg: CfConfig,
@@ -249,7 +257,16 @@ export async function ensureCnameRecord(
   validateCnameTarget(want);
   const existing = await findDnsRecord(cfg, hostname);
   if (existing && existing.type === 'CNAME') {
-    return existing.id;
+    const current = (existing.content ?? '').toLowerCase().replace(/\.$/, '');
+    if (current === want.toLowerCase().replace(/\.$/, '')) {
+      return existing.id;
+    }
+    throw new HttpError(
+      409,
+      'conflict',
+      `refusing to adopt DNS record for ${hostname}: it already points at ` +
+        `${existing.content || '(unknown target)'}, not the ingress target`,
+    );
   }
   const created = (await cfFetch(cfg, 'POST', `/zones/${cfg.zoneId}/dns_records`, {
     type: 'CNAME',
