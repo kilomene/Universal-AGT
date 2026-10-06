@@ -54,7 +54,7 @@ Universal-AGT/
     │   ├── api/                     ← Express REST API (Node/TS): routes, sweepers, retry policy
     │   ├── agents/ hosts/ task-queue/ deployments/ artifacts/ events/ authentication/
     │   └── (modules live under api/src; the top-level dirs mirror the design areas)
-    ├── database/migrations/         ← 001_initial … 007_domains_lifecycle (apply in order)
+    ├── database/migrations/         ← 001_initial … 012_rollback_failed_status (apply in order)
     ├── host-worker/                 ← outbound-only daemon: claim tasks, docker builds,
     │                                  health checks, reconcile, updater, ingress/
     ├── dashboard/                   ← static ops dashboard served by the API at `/`
@@ -77,7 +77,7 @@ Universal-AGT/
 cd agent-host-platform/control-plane/api
 npm ci
 npm run build
-# apply migrations 001…010 against Postgres first, then:
+# apply migrations 001…012 against Postgres first, then:
 DATABASE_URL="postgresql://user:pass@localhost:5432/uagt" \
 DATA_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
 UAHT_PROVISIONING_TOKEN="<pick-a-strong-value>" \
