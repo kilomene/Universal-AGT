@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { Router, type Request, type Response } from 'express';
 import type { Pool } from 'pg';
 import { getPool } from '../db/pool';
@@ -5,7 +6,7 @@ import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { generateAgentKey, sha256Hex, verifyToken } from '../lib/tokens';
-import { auditAuthFailure, requireAgent } from '../middleware/auth';
+import { auditAuthFailure, requireAgent, requireOperator } from '../middleware/auth';
 import { rotationRateLimit } from '../middleware/rateLimit';
 import { decideIdempotency } from '../lib/idempotency';
 import { publicAgent } from './_helpers';
@@ -223,6 +224,160 @@ agentsRouter.post('/me/rotate', requireAgent, rotationRateLimit, async (req, res
     });
     logger.info('agent key rotated', { agent: req.auth!.name });
     res.json({ api_key: token });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agent lifecycle (§12). Operator authentication only (requireOperator:
+// provisioning token, or an agent with the admin permission). An agent can
+// never suspend/revoke itself through these endpoints.
+//
+//   * suspend: active -> suspended. Takes effect immediately — attachAuth
+//     rejects every non-active agent, so the suspended agent's bearer token
+//     stops authorizing normal operations on its very next request.
+//     Existing tasks are left untouched: they stay durable in the queue
+//     (never silently disappear); an operator may cancel/reassign them.
+//   * resume: suspended -> active.
+//   * revoke: any non-revoked status -> revoked, and the bearer token is
+//     invalidated immediately by replacing the stored hash with an
+//     unmatchable random value — the old token can never authenticate
+//     again, and the new hash is never revealed. Revocation is permanent:
+//     resume from revoked is rejected.
+//   * events agent.suspended / agent.resumed / agent.revoked are recorded
+//     with NO secret/token material in the payload.
+// ---------------------------------------------------------------------------
+
+const AGENT_PUBLIC_COLUMNS = `id, name, type, capabilities, permissions, status,
+  last_seen, metadata, created_at, updated_at`;
+
+async function getAgentRow(pool: Pool, id: string) {
+  const { rows } = await pool.query(
+    `SELECT ${AGENT_PUBLIC_COLUMNS} FROM agents WHERE id = $1`,
+    [id],
+  );
+  return rows[0] ?? null;
+}
+
+function rejectSelfAction(req: Request, res: Response): boolean {
+  if (req.auth?.kind === 'agent' && req.auth.id === req.params.id) {
+    sendError(res, 403, 'forbidden', 'an agent cannot change its own lifecycle state');
+    return true;
+  }
+  return false;
+}
+
+// POST /v1/agents/:id/suspend — operator only; active -> suspended.
+agentsRouter.post('/:id/suspend', requireOperator, async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const agent = await getAgentRow(pool, req.params.id);
+    if (!agent) {
+      next(new HttpError(404, 'not_found', 'agent not found'));
+      return;
+    }
+    if (rejectSelfAction(req, res)) return;
+    if (agent.status !== 'active') {
+      sendError(res, 409, 'conflict', `agent is ${agent.status}; only active agents can be suspended`);
+      return;
+    }
+    const updated = (
+      await pool.query(
+        `UPDATE agents SET status = 'suspended', updated_at = now() WHERE id = $1
+         RETURNING ${AGENT_PUBLIC_COLUMNS}`,
+        [req.params.id],
+      )
+    ).rows[0];
+    await appendEvent(pool, {
+      type: 'agent.suspended',
+      actor_type: req.auth?.kind ?? 'operator',
+      actor_id: req.auth?.name ?? null,
+      payload: { agent_id: agent.id, agent_name: agent.name, previous_status: 'active' },
+    });
+    logger.info('agent suspended', { agent: agent.name });
+    res.json({ agent: publicAgent(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /v1/agents/:id/resume — operator only; suspended -> active.
+agentsRouter.post('/:id/resume', requireOperator, async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const agent = await getAgentRow(pool, req.params.id);
+    if (!agent) {
+      next(new HttpError(404, 'not_found', 'agent not found'));
+      return;
+    }
+    if (rejectSelfAction(req, res)) return;
+    if (agent.status === 'revoked') {
+      sendError(res, 409, 'conflict', 'agent is revoked; revocation is permanent and cannot be resumed');
+      return;
+    }
+    if (agent.status !== 'suspended') {
+      sendError(res, 409, 'conflict', `agent is ${agent.status}; only suspended agents can be resumed`);
+      return;
+    }
+    const updated = (
+      await pool.query(
+        `UPDATE agents SET status = 'active', updated_at = now() WHERE id = $1
+         RETURNING ${AGENT_PUBLIC_COLUMNS}`,
+        [req.params.id],
+      )
+    ).rows[0];
+    await appendEvent(pool, {
+      type: 'agent.resumed',
+      actor_type: req.auth?.kind ?? 'operator',
+      actor_id: req.auth?.name ?? null,
+      payload: { agent_id: agent.id, agent_name: agent.name, previous_status: 'suspended' },
+    });
+    logger.info('agent resumed', { agent: agent.name });
+    res.json({ agent: publicAgent(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /v1/agents/:id/revoke — operator only; permanent. The bearer token is
+// invalidated immediately: the stored hash is replaced with an unmatchable
+// random value, so the old token 401s on its very next request and can never
+// be reused. No credential material is returned or journaled.
+agentsRouter.post('/:id/revoke', requireOperator, async (req, res, next) => {
+  try {
+    const pool = getPool();
+    const agent = await getAgentRow(pool, req.params.id);
+    if (!agent) {
+      next(new HttpError(404, 'not_found', 'agent not found'));
+      return;
+    }
+    if (rejectSelfAction(req, res)) return;
+    if (agent.status === 'revoked') {
+      sendError(res, 409, 'conflict', 'agent is already revoked');
+      return;
+    }
+    const deadHash = sha256Hex(`revoked:${randomUUID()}:${randomUUID()}`);
+    const updated = (
+      await pool.query(
+        `UPDATE agents SET status = 'revoked', api_key_hash = $2, updated_at = now()
+         WHERE id = $1 RETURNING ${AGENT_PUBLIC_COLUMNS}`,
+        [req.params.id, deadHash],
+      )
+    ).rows[0];
+    await appendEvent(pool, {
+      type: 'agent.revoked',
+      actor_type: req.auth?.kind ?? 'operator',
+      actor_id: req.auth?.name ?? null,
+      payload: {
+        agent_id: agent.id,
+        agent_name: agent.name,
+        previous_status: agent.status,
+        token_invalidated: true,
+      },
+    });
+    logger.info('agent revoked', { agent: agent.name });
+    res.json({ agent: publicAgent(updated) });
   } catch (err) {
     next(err);
   }
