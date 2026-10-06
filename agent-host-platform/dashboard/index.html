@@ -170,6 +170,48 @@
       </div>
     </section>
 
+    <section class="panel wide" aria-label="Domains">
+      <div class="panel-head">
+        <h2>Domains</h2>
+        <span class="updated" id="domainsUpdated"></span>
+      </div>
+      <p class="panel-error" id="domainsError" hidden></p>
+      <div class="panel-controls">
+        <label for="domainsDeploy">Deployment</label>
+        <select id="domainsDeploy" class="ctl"></select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Hostname</th><th>Status</th><th>Ingress</th><th>DNS</th>
+              <th>Tunnel</th><th>HTTPS</th><th>Error</th>
+            </tr>
+          </thead>
+          <tbody id="domainsBody">
+            <tr class="empty"><td colspan="7">Select a deployment to list its domains.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Logs: creates a real `logs` task (POST /v1/tasks) for the selected
+         deployment and polls it to terminal, like the CLI `logs` command. -->
+    <section class="panel wide" aria-label="Logs">
+      <div class="panel-head">
+        <h2>Logs</h2>
+        <span class="updated" id="logsUpdated"></span>
+      </div>
+      <p class="panel-error" id="logsError" hidden></p>
+      <div class="panel-controls">
+        <label for="logsDeploy">Deployment</label>
+        <select id="logsDeploy" class="ctl"></select>
+        <button id="logsFetch" class="btn small" type="button">Fetch logs</button>
+        <button id="logsStop" class="btn small" type="button" hidden>Stop</button>
+      </div>
+      <pre id="logsOut" class="logs" aria-live="polite"></pre>
+    </section>
+
     <section class="panel wide" aria-label="Live events">
       <div class="panel-head">
         <h2>Live events</h2>
