@@ -50,7 +50,8 @@ function setupDb() {
   db.public.none(`
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
-      permissions JSONB, api_key_hash TEXT NOT NULL,
+      permissions JSONB, api_key_hash TEXT,
+      idempotency_key TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       last_seen TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT now()
@@ -59,6 +60,7 @@ function setupDb() {
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'online',
       token_hash TEXT NOT NULL,
+      idempotency_key TEXT,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT now()
     );
@@ -191,7 +193,9 @@ describe('§45 database failures (real API)', () => {
       });
       expect(r1.status).toBe(500);
       expect(r1.body).toEqual({
-        error: { code: 'internal', message: 'internal server error' },
+        // §70: the error shape carries the request id for correlation with
+        // the server's request log line.
+        error: { code: 'internal', message: 'internal server error', request_id: expect.any(String) },
       });
 
       const r2 = await req('POST', '/v1/deployments', agentToken, {
