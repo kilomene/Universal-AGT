@@ -208,9 +208,12 @@ def test_healthcheck_failure_restores_previous_version(tmp_path, monkeypatch):
     assert "uaht-my-api-1.0.0" in docker.start_calls
     assert docker.containers["uaht-my-api-1.0.0"]["running"] is True
 
-    # state recorded
+    # state recorded. The healthcheck fake fails for the restored
+    # previous version too, so per spec §6 the failed deployment persists
+    # rollback_failed (never a false "rolled_back").
     new_state = ctx.deployment_store.load("dep-v2")
-    assert new_state["status"] == "rolled_back"
+    assert new_state["status"] == "rollback_failed"
+    assert new_state["rollback_status"] == "failed"
     assert new_state["rollback_of"] == "dep-v1"
     prev_state = ctx.deployment_store.load("dep-v1")
     assert prev_state["status"] == "running"
