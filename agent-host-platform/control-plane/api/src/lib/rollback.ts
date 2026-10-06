@@ -27,8 +27,12 @@ export interface RollbackCurrent {
 
 /**
  * Pick the rollback target: the newest deployment of the same
- * project+host (excluding the current one) that is `running` and
- * `healthy`. Returns null when there is nothing safe to roll back to.
+ * project+host (excluding the current one) that is `running` or
+ * `superseded` and `healthy`. `superseded` rows are the normal case:
+ * when a newer deployment became healthy, the previous one was moved
+ * there (migration 015) precisely so it stays available as a rollback
+ * target without holding a resource reservation. Returns null when there
+ * is nothing safe to roll back to.
  */
 export function selectRollbackTarget(
   current: RollbackCurrent,
@@ -39,7 +43,7 @@ export function selectRollbackTarget(
       c.id !== current.id &&
       c.project_id === current.project_id &&
       c.host_id === current.host_id &&
-      c.status === 'running' &&
+      (c.status === 'running' || c.status === 'superseded') &&
       c.health_status === 'healthy',
   );
   eligible.sort(
