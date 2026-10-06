@@ -332,3 +332,19 @@ def test_empty_version_rejected_as_missing(tmp_path, work):
 @pytest.mark.parametrize("good_version", ["1.2.3", "2.0.0-rc1", "v1_2", "2026.10.06"])
 def test_sane_versions_still_accepted_as_paths(work, good_version):
     assert self_update._validate_version(good_version) == good_version
+
+
+def test_update_refused_without_data_filter(tmp_path, monkeypatch, work):
+    """Tarball extraction needs tarfile.data_filter (Python 3.12+). On a
+    stale interpreter the update must abort with a clear UpdateError —
+    never an unhandled TypeError, and never an unprotected extraction."""
+    monkeypatch.setattr(self_update, "_HAS_DATA_FILTER", False)
+    blob = _make_tarball({"pkg/__init__.py": b"x = 1\n"})
+    with pytest.raises(self_update.UpdateError, match="3.12"):
+        self_update.apply_update(
+            _info("1.1.0", blob), str(work), "1.0.0",
+            download_fn=_download_of(blob))
+    # Tarball downloaded + checksummed, but never extracted: no release
+    # dir, symlink still on the old release.
+    assert not (work / "releases" / "1.1.0").exists()
+    assert (work / "current").resolve() == (work / "releases" / "1.0.0").resolve()
