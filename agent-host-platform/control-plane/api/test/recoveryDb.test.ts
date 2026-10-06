@@ -62,9 +62,23 @@ function setupDb() {
       token_hash TEXT NOT NULL,
       idempotency_key TEXT,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
+      capabilities JSONB NOT NULL DEFAULT '[]',
+      total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION,
+      total_disk_gb DOUBLE PRECISION,
+      cpu_pct DOUBLE PRECISION, ram_pct DOUBLE PRECISION, disk_pct DOUBLE PRECISION,
       created_at TIMESTAMPTZ DEFAULT now()
     );
-    CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+    CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      owner TEXT, owner_agent_id TEXT, runtime TEXT, configuration JSONB);
+    CREATE TABLE project_members (
+      project_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+      PRIMARY KEY (project_id, agent_id)
+    );
+    CREATE TABLE agent_host_access (
+      agent_id TEXT NOT NULL, host_id TEXT NOT NULL,
+      permissions JSONB NOT NULL DEFAULT '{}',
+      PRIMARY KEY (agent_id, host_id)
+    );
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY DEFAULT gen_random_uuid(), type TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'queued',
@@ -167,7 +181,10 @@ beforeAll(async () => {
   projectId = randomUUID();
   await state.pool.query(`INSERT INTO projects (id, name) VALUES ($1, 'web')`, [projectId]);
   hostId = randomUUID();
-  await state.pool.query(`INSERT INTO hosts (id, name, token_hash, status) VALUES ($1, 'h', 'x', 'online')`, [hostId]);
+  await state.pool.query(
+    `INSERT INTO hosts (id, name, token_hash, status, capabilities) VALUES ($1, 'h', 'x', 'online', '["docker"]')`,
+    [hostId],
+  );
 
   const app = createApp();
   server = app.listen(0);
