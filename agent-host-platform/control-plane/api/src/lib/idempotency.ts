@@ -64,3 +64,36 @@ export async function findTaskByIdempotencyKey(
   );
   return rows[0] ?? null;
 }
+
+// The "body" compared for domain idempotency: the requested attachment
+// (deployment + hostname + ingress). Hostnames compare case-insensitively,
+// matching the lower(hostname) uniqueness semantics.
+export function domainIdempotencyBody(input: {
+  deployment_id: string;
+  hostname: string;
+  ingress: string;
+}): unknown {
+  return {
+    deployment_id: input.deployment_id,
+    hostname: input.hostname.toLowerCase(),
+    ingress: input.ingress,
+  };
+}
+
+export interface DomainIdempotencyRow {
+  id: string;
+  deployment_id: string;
+  hostname: string;
+  ingress: string;
+}
+
+export async function findDomainByIdempotencyKey(
+  pool: Pool,
+  key: string,
+): Promise<DomainIdempotencyRow | null> {
+  const { rows } = await pool.query(
+    'SELECT id, deployment_id, hostname, ingress FROM domains WHERE idempotency_key = $1',
+    [key],
+  );
+  return rows[0] ?? null;
+}
