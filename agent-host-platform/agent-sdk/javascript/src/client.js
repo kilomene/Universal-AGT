@@ -322,20 +322,25 @@ export class UahtClient {
    * register the artifact, and return the server-allocated upload URL.
    * @returns {{artifact: object, upload_url: string}}
    */
-  async initArtifact({ project_id, filePath, version, filename }) {
+  async initArtifact({ project_id, filePath, version, filename, manifest }) {
     const st = await stat(filePath);
     // Split on both separators so Windows-style paths resolve correctly.
     const name = filename || filePath.split(/[\\/]/).pop();
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(filePath)) hash.update(chunk);
     const checksum = `sha256:${hash.digest("hex")}`;
-    return this._post("/artifacts/init", {
+    const body = {
       project_id,
       filename: name,
       size: st.size,
       checksum,
       version,
-    });
+    };
+    // Optional agent.deploy.json: when supplied, the control plane validates
+    // it (same grammar the worker enforces) and the scheduler reserves
+    // resources from it instead of the project configuration (Fix #1).
+    if (manifest !== undefined) body.manifest = manifest;
+    return this._post("/artifacts/init", body);
   }
 
   /**
