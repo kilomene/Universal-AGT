@@ -1,1 +1,1 @@
-export { UahtClient, UahtError } from "./client.js";
+export { UahtClient, UahtError, SDK_VERSION } from "./client.js";
