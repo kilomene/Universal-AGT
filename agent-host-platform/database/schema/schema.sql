@@ -237,6 +237,14 @@ create table deployments (
                    check (health_status is null or
                           health_status in ('healthy','unhealthy','unknown')),
     rollback_of    uuid references deployments(id) on delete set null,
+    reserved_cpu   double precision,                          -- normalized CPU cores
+                                                             -- reserved by this deployment
+                                                             -- (migration 013); NULL = no
+                                                             -- requirement
+    reserved_ram_mb double precision,                         -- normalized RAM megabytes
+                                                             -- reserved by this deployment
+                                                             -- (migration 013); NULL = no
+                                                             -- requirement
     created_at     timestamptz not null default now(),
     updated_at     timestamptz not null default now(),
     unique (project_id, host_id, version)
