@@ -76,7 +76,17 @@ function setupDb() {
     );
     CREATE TABLE projects (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      owner TEXT, owner_agent_id TEXT,
       created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE TABLE project_members (
+      project_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+      PRIMARY KEY (project_id, agent_id)
+    );
+    CREATE TABLE agent_host_access (
+      agent_id TEXT NOT NULL, host_id TEXT NOT NULL,
+      permissions JSONB NOT NULL DEFAULT '{}',
+      PRIMARY KEY (agent_id, host_id)
     );
     CREATE TABLE secrets (
       id TEXT PRIMARY KEY DEFAULT gen_uuid(),
