@@ -43,7 +43,8 @@
     hostsById: {},      // host id -> host row (for name lookups in other panels)
     approvalDetail: {}, // task id -> Promise<dossier> (fetched once per task)
     expanded: {},       // task id -> true while its dossier row is open
-    pendingApprove: null // task id currently staged in the approve modal
+    pendingApprove: null, // task id currently staged in the approve modal
+    logsTimer: null     // pending setTimeout id for the logs panel poll
   };
 
   function el(id) { return document.getElementById(id); }
@@ -161,9 +162,15 @@
 
   // Mutating call (POST/PUT/DELETE). Bearer <redacted> header, never a query
   // param. 401 re-arms the auth gate; 403 surfaces as `forbidden` so the
-  // caller can show "not permitted" next to the action.
-  function apiWrite(method, path) {
-    return fetch(API + path, { method: method, headers: authHeaders() }).then(function (res) {
+  // caller can show "not permitted" next to the action. `body`, when given,
+  // is sent as JSON (e.g. creating a logs task).
+  function apiWrite(method, path, body) {
+    var opts = { method: method, headers: authHeaders() };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(API + path, opts).then(function (res) {
       if (res.status === 401) {
         requireAuth('That API key was rejected (HTTP 401).');
         throw new Error('unauthorized');
@@ -360,6 +367,129 @@
         '<td>' + esc(timeAgo(p.updated_at || p.created_at)) + '</td>' +
         '</tr>';
     }).join('');
+  }
+
+  /* ---------------- domains panel ---------------- */
+
+  // GET /v1/domains requires ?deployment_id= — the panel follows the
+  // deployment picker, refreshed on the same 10s cadence as the rest.
+  function domainsPath() {
+    var sel = el('domainsDeploy');
+    var id = sel && sel.value;
+    return id ? '/domains?deployment_id=' + encodeURIComponent(id) : null;
+  }
+
+  function syncDeploySelects() {
+    var deps = rowsOf(state.cache.deployments, ['deployments', 'items', 'data']);
+    ['domainsDeploy', 'logsDeploy'].forEach(function (selId) {
+      var sel = el(selId);
+      if (!sel) return;
+      var prev = sel.value;
+      sel.innerHTML = deps.length
+        ? deps.map(function (d) {
+            var label = (d.project_name || d.project_id || 'project') + ' \u00b7 ' +
+              (d.version || '?') + ' \u00b7 ' + String(d.id).slice(0, 8);
+            return '<option value="' + esc(d.id) + '"' +
+              (String(d.id) === String(prev) ? ' selected' : '') + '>' +
+              esc(label) + '</option>';
+          }).join('')
+        : '<option value="">No deployments</option>';
+    });
+  }
+
+  function renderDomains(body) {
+    var domains = rowsOf(body, ['domains', 'items', 'data']);
+    if (!domains.length) {
+      el('domainsBody').innerHTML = emptyRow(7, 'No domains attached to this deployment.');
+      return;
+    }
+    el('domainsBody').innerHTML = domains.map(function (d) {
+      function flag(v) { return badge(v ? 'passing' : 'unknown'); }
+      var https = d.https_reachable ? badge('passing')
+        : (d.https_checked_at ? badge('failing') : badge('unknown'));
+      return '<tr>' +
+        '<td class="mono">' + esc(d.hostname || '\u2014') + '</td>' +
+        '<td>' + badge(d.status) + '</td>' +
+        '<td class="mono">' + esc(d.ingress || '\u2014') + '</td>' +
+        '<td>' + flag(d.dns_configured) + '</td>' +
+        '<td>' + flag(d.tunnel_configured) + '</td>' +
+        '<td>' + https + '</td>' +
+        '<td class="mono">' + esc(d.error || '\u2014') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  /* ---------------- logs panel ---------------- */
+
+  // Creates a real `logs` task for the selected deployment (POST /v1/tasks,
+  // type=logs — read-only, needs read_status) and polls it to a terminal
+  // state, mirroring the CLI `logs` command. User-triggered, not part of
+  // the 10s auto-refresh: each fetch mints exactly one task.
+  function logsTextOf(task) {
+    var result = task && task.result;
+    if (typeof result === 'string') return result;
+    if (result && typeof result.logs === 'string') return result.logs;
+    return '';
+  }
+
+  function logsUiError(msg) {
+    var p = el('logsError');
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  function logsReset() {
+    if (state.logsTimer) { clearTimeout(state.logsTimer); state.logsTimer = null; }
+    el('logsFetch').disabled = false;
+    el('logsStop').hidden = true;
+  }
+
+  function fetchLogs() {
+    var depId = el('logsDeploy').value;
+    if (!depId) { logsUiError('Select a deployment first.'); return; }
+    logsReset();
+    el('logsError').hidden = true;
+    el('logsOut').textContent = '';
+    el('logsUpdated').textContent = 'starting logs task\u2026';
+    el('logsFetch').disabled = true;
+    el('logsStop').hidden = false;
+    apiWrite('POST', '/tasks', { type: 'logs', payload: { deployment_id: depId } }).then(function (res) {
+      var task = (res && res.task) || {};
+      if (!task.id) throw new Error('control plane returned no task id');
+      pollLogsTask(task.id);
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') return; // requireAuth already ran
+      logsUiError(err && err.code === 'forbidden'
+        ? 'not permitted \u2014 this key lacks the read_status permission.'
+        : 'failed to start logs task: ' + (err && err.message ? err.message : err));
+      logsReset();
+    });
+  }
+
+  function pollLogsTask(taskId) {
+    var lastLen = 0;
+    var terminal = { completed: 1, failed: 1, cancelled: 1 };
+    function tick() {
+      state.logsTimer = null;
+      api('/tasks/' + taskId).then(function (res) {
+        var task = (res && res.task) || {};
+        var logs = logsTextOf(task);
+        if (logs.length > lastLen) {
+          var out = el('logsOut');
+          out.textContent += logs.slice(lastLen);
+          lastLen = logs.length;
+          out.scrollTop = out.scrollHeight;
+        }
+        el('logsUpdated').textContent = 'task ' + String(taskId).slice(0, 8) + '\u2026 \u00b7 ' + (task.status || '?');
+        if (terminal[task.status]) { logsReset(); return; }
+        state.logsTimer = setTimeout(tick, 2000);
+      }).catch(function (err) {
+        if (err && err.message === 'unauthorized') { logsReset(); return; }
+        logsUiError('log poll failed: ' + (err && err.message ? err.message : err));
+        logsReset();
+      });
+    }
+    tick();
   }
 
   /* ---------------- approvals ---------------- */
@@ -730,16 +860,23 @@
     { id: 'services',    path: '/services',         render: renderServices },
     { id: 'deployments', path: '/deployments?limit=200', render: renderDeployments },
     { id: 'tasks',       path: '/tasks?limit=20',   render: renderTasks },
-    { id: 'projects',    path: '/projects',         render: renderProjects }
+    { id: 'projects',    path: '/projects',         render: renderProjects },
+    // pathFor: computed per refresh — domains needs the picker's deployment.
+    { id: 'domains',     pathFor: domainsPath,      render: renderDomains }
+    // Logs is deliberately NOT auto-polled: fetching mints a real logs
+    // task, so it is user-triggered via the Fetch button above.
   ];
 
   function refreshAll() {
     if (!state.key) return;
     var anyOk = false;
     var jobs = PANELS.map(function (p) {
-      return api(p.path).then(function (body) {
+      var path = typeof p.pathFor === 'function' ? p.pathFor() : p.path;
+      if (!path) return Promise.resolve(); // e.g. domains with no deployment picked yet
+      return api(path).then(function (body) {
         state.cache[p.id] = body;
         p.render(body);
+        if (p.id === 'deployments') syncDeploySelects();
         panelOk(p.id);
         anyOk = true;
       }).catch(function (err) {
@@ -851,7 +988,24 @@
 
   // Approve confirmation modal.
   el('approveModalCancel').addEventListener('click', closeApproveModal);
-  el('approveModal').addEventListener('click', function (e) {
+
+  // Logs panel: user-triggered fetch (mints one real logs task per click).
+  el('logsFetch').addEventListener('click', fetchLogs);
+  el('logsStop').addEventListener('click', logsReset);
+  // Switching the domains deployment re-fetches on the next 10s tick;
+  // fetch immediately so the panel doesn't sit stale.
+  el('domainsDeploy').addEventListener('change', function () {
+    var path = domainsPath();
+    if (!path || !state.key) return;
+    api(path).then(function (body) {
+      state.cache.domains = body;
+      renderDomains(body);
+      panelOk('domains');
+    }).catch(function (err) {
+      if (err && err.message === 'unauthorized') return;
+      panelError('domains', err);
+    });
+  });  el('approveModal').addEventListener('click', function (e) {
     if (e.target === el('approveModal')) closeApproveModal(); // backdrop click
   });
   el('approveModalConfirm').addEventListener('click', function () {
