@@ -26,11 +26,11 @@ curl -s -X POST $UAGT_CP/v1/agents/register \
   -d '{"name": "my-builder-agent", "type": "ci",
        "capabilities": ["docker"],
        "permissions": {"deploy": true, "read_status": true,
-                       "read_logs": true, "restart": true,
+                       "restart": true,
                        "approve_deployments": false}}' | tee agent.json
 # → 201 {"agent": {...}, "api_key": "<show once>"}
 
-export UAGT_API_KEY="<paste from agent.json>"
+export UAHT_API_KEY="<paste from agent.json>"
 ```
 
 Request only the permissions you need. If you only ever deploy and read
@@ -40,7 +40,7 @@ status, don't ask for `manage_secrets` or `manage_domains`.
 
 ```bash
 curl -s -X POST $UAGT_CP/v1/projects \
-  -H "Authorization: Bearer $UAGT_API_KEY" \
+  -H "Authorization: Bearer $UAHT_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"name": "url-shortener", "runtime": "docker"}' | tee project.json
 # → {"project": {"id": "<uuid>", ...}}
@@ -59,7 +59,7 @@ tar -czf build.tar.gz -C my-app .
 SHA=$(sha256sum build.tar.gz | cut -d' ' -f1)
 
 INIT=$(curl -s -X POST $UAGT_CP/v1/artifacts/init \
-  -H "Authorization: Bearer $UAGT_API_KEY" \
+  -H "Authorization: Bearer $UAHT_API_KEY" \
   -H 'Content-Type: application/json' \
   -d "{\"project_id\": \"$UAGT_PROJECT_ID\", \"filename\": \"build.tar.gz\",
        \"size\": $(stat -c%s build.tar.gz),
@@ -68,7 +68,7 @@ ARTIFACT_ID=$(echo "$INIT" | python3 -c 'import sys,json; print(json.load(sys.st
 UPLOAD_URL=$(echo "$INIT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["upload_url"])')
 
 curl -s -X PUT "$UAGT_CP$UPLOAD_URL" \
-  -H "Authorization: Bearer $UAGT_API_KEY" \
+  -H "Authorization: Bearer $UAHT_API_KEY" \
   -H 'Content-Type: application/octet-stream' \
   --data-binary @build.tar.gz
 # → 200/201 on success; 422 if checksum/size mismatch
@@ -85,7 +85,7 @@ manifest fails the task fast with no partial state. See
 IDEMPOTENCY_KEY=$(python3 -c 'import uuid; print(uuid.uuid4())')
 
 curl -s -X POST $UAGT_CP/v1/deployments \
-  -H "Authorization: Bearer $UAGT_API_KEY" \
+  -H "Authorization: Bearer $UAHT_API_KEY" \
   -H 'Content-Type: application/json' \
   -d "{
     \"project_id\": \"$UAGT_PROJECT_ID\",
@@ -128,7 +128,7 @@ emits `task.awaiting_approval`.
 DEPLOYMENT_ID=$(python3 -c 'import json; print(json.load(open("deployment.json"))["deployment"]["id"])')
 
 curl -s $UAGT_CP/v1/deployments/$DEPLOYMENT_ID \
-  -H "Authorization: Bearer $UAGT_API_KEY" | python3 -m json.tool
+  -H "Authorization: Bearer $UAHT_API_KEY" | python3 -m json.tool
 # deployment.status: requested|building|starting|healthcheck|running|...
 # deployment.health_status: healthy|...
 # deployment.ports / .domains tell you where it is reachable
@@ -138,7 +138,7 @@ Task-level detail (logs included) lives on the task row:
 
 ```bash
 TASK_ID=$(python3 -c 'import json; print(json.load(open("deployment.json"))["task"]["id"])')
-curl -s "$UAGT_CP/v1/tasks/$TASK_ID" -H "Authorization: Bearer $UAGT_API_KEY"
+curl -s "$UAGT_CP/v1/tasks/$TASK_ID" -H "Authorization: Bearer $UAHT_API_KEY"
 # {"task": {"status": "completed", "result": {...}, "error": null, ...}}
 ```
 
@@ -146,26 +146,26 @@ Or watch everything live: open the dashboard (served at `/` by the control
 plane) or tail the SSE stream:
 
 ```bash
-curl -N -H "Authorization: Bearer $UAGT_API_KEY" $UAGT_CP/v1/events/stream
+curl -N -H "Authorization: Bearer $UAHT_API_KEY" $UAGT_CP/v1/events/stream
 ```
 
 ## 6. Day-two operations
 
 ```bash
 # service id == deployment id in the friendly services view
-curl -s $UAGT_CP/v1/services -H "Authorization: Bearer $UAGT_API_KEY"
+curl -s $UAGT_CP/v1/services -H "Authorization: Bearer $UAHT_API_KEY"
 
-curl -s -X POST $UAGT_CP/v1/services/<id>/restart -H "Authorization: Bearer $UAGT_API_KEY"
-curl -s -X POST $UAGT_CP/v1/services/<id>/stop    -H "Authorization: Bearer $UAGT_API_KEY"
-curl -s -X POST $UAGT_CP/v1/services/<id>/start   -H "Authorization: Bearer $UAGT_API_KEY"
+curl -s -X POST $UAGT_CP/v1/services/<id>/restart -H "Authorization: Bearer $UAHT_API_KEY"
+curl -s -X POST $UAGT_CP/v1/services/<id>/stop    -H "Authorization: Bearer $UAHT_API_KEY"
+curl -s -X POST $UAGT_CP/v1/services/<id>/start   -H "Authorization: Bearer $UAHT_API_KEY"
 
 # roll back to the previous healthy version
 curl -s -X POST $UAGT_CP/v1/deployments/<id>/rollback \
-  -H "Authorization: Bearer $UAGT_API_KEY"
+  -H "Authorization: Bearer $UAHT_API_KEY"
 
 # fetch logs of a deployment (task type=logs under the hood)
 curl -s -X POST $UAGT_CP/v1/tasks \
-  -H "Authorization: Bearer $UAGT_API_KEY" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $UAHT_API_KEY" -H 'Content-Type: application/json' \
   -d '{"type": "logs", "payload": {"deployment_id": "<id>"}}'
 ```
 
