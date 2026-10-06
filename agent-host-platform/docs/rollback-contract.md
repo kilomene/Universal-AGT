@@ -79,6 +79,30 @@ rolled_back
   (`POST /v1/deployments/:id/rollback`) rollbacks execute the single
   shared implementation (`host-worker/deployments/rollback.py`).
 
+## Rollback targets and the `superseded` state
+
+The rollback target is the newest deployment of the same project+host
+(excluding the current one) that is `running` **or `superseded`** and
+`healthy` (`selectRollbackTarget`). `superseded` is the normal case:
+when V2 became healthy, V1 was moved there (migration 015) precisely so
+it stays available as a rollback target without holding a resource
+reservation.
+
+On a successful rollback (the triple-check above), the control plane
+does two writes in one transaction:
+
+```
+V2 (the rolled-back deployment)  → rolled_back   (terminal; reservation released)
+V1 (the restored target)         → running       (reservation re-acquired)
+```
+
+The restored id is the control plane's own choice from task creation
+(`payload.target_deployment_id`), falling back to the worker's
+`rolled_back_to` for hand-built tasks; either way it is guarded to the
+same project+host and only a `superseded` row is eligible, so a
+confused worker report cannot flip an arbitrary deployment. After the
+restore, worker and control plane agree again: V1 is `running` in both.
+
 ## What `unknown` means
 
 `target_health_status = 'unknown'` means the system restored the target
