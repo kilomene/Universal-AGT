@@ -34,7 +34,8 @@ fails loudly with a precise error at the first step that cannot be met):
 1. **Preconditions.** Must run as root. Fails unless the OS is Linux
    (`uname -s`), `UAHT_CONTROL_PLANE_URL` and `UAHT_HOST_NAME` are set, and
    `UAHT_HOST_TOKEN`/`UAHT_HOST_ID` are supplied as a pair or not at all.
-2. **Dependencies.** Requires `python3 >= 3.10`. Installs `python3`,
+2. **Dependencies.** Requires `python3 >= 3.12` (tarball extraction uses
+   `tarfile.data_filter`). Installs `python3`,
    `python3-requests` and `docker.io` via apt (skip with
    `UAHT_SKIP_APT=1`); if the `requests` module is still not importable
    afterwards, falls back to `pip install -r host-worker/requirements.txt`.
