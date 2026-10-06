@@ -1,46 +1,37 @@
 -- 005_events_truncate_block.sql
 --
--- migrate: no-transaction
+-- Append-only hardening for the events journal against TRUNCATE.
 --
--- (CREATE EVENT TRIGGER is forbidden inside a transaction block, so this
--- migration runs outside one. Every statement below is idempotent:
--- CREATE OR REPLACE FUNCTION, DROP EVENT TRIGGER IF EXISTS, then CREATE,
--- so a retry after a partial failure is safe.)
+-- Background: the row-level trigger from 001 blocks UPDATE/DELETE, but
+-- TRUNCATE bypasses row triggers entirely. PostgreSQL event triggers
+-- CANNOT close this hole: TRUNCATE fires no DDL event, and
+-- CREATE EVENT TRIGGER ... WHEN TAG IN ('TRUNCATE TABLE') is rejected by
+-- the server (verified on PostgreSQL 16:
+-- "event triggers are not supported for TRUNCATE TABLE"). An earlier
+-- revision of this migration tried exactly that and could never apply.
 --
--- The events table is append-only (001: trg_events_no_update_delete blocks
--- UPDATE/DELETE), but a row-level trigger CANNOT block TRUNCATE — TRUNCATE
--- bypasses row triggers entirely. This migration closes that hole with an
--- EVENT TRIGGER that aborts any TRUNCATE touching public.events.
+-- What this migration does (defense in depth):
+--   REVOKE TRUNCATE ON public.events FROM PUBLIC;
+-- This stops every non-owner role from truncating the journal.
 --
--- Chosen approach: event trigger (not REVOKE) because the application role
--- is normally also the table owner (it ran the migrations), and owners can
--- always TRUNCATE their own tables regardless of REVOKE. The event trigger
--- fires on ddl_command_end with tag 'TRUNCATE TABLE'; raising there aborts
--- the whole transaction, so the truncate never takes effect.
+-- Known limitation (documented, not hidden): the table OWNER can always
+-- TRUNCATE regardless of REVOKE. In the standard deployment the migration
+-- runner owns the tables, so this REVOKE alone does not stop the owner.
+-- Complete protection requires the events table to be owned by a dedicated
+-- role distinct from the application role:
 --
--- OPERATIONAL NOTE: CREATE EVENT TRIGGER requires superuser. If migrations
--- run as a non-superuser role this file fails — have the DBA run it once
--- manually as superuser, then mark it applied in schema_migrations.
--- (Event triggers are database-global, not schema objects: they are not
--- captured by pg_dump's schema-only dumps; keep this file as the source
--- of truth and re-apply after a restore.)
+--   -- as superuser (e.g. Supabase SQL editor):
+--   CREATE ROLE uagt_events_owner NOLOGIN;
+--   ALTER TABLE public.events OWNER TO uagt_events_owner;
+--   REVOKE ALL ON public.events FROM PUBLIC, <app_role>;
+--   GRANT INSERT, SELECT ON public.events TO <app_role>;
+--   GRANT USAGE, SELECT ON SEQUENCE public.events_id_seq TO <app_role>;
+--
+-- (Adjust the sequence name to the real one.) After that, the application
+-- role physically cannot TRUNCATE/UPDATE/DELETE the journal even with a
+-- compromised credential. See docs/security.md "events table ownership".
+--
+-- This migration runs fine inside a transaction and needs no superuser:
+-- REVOKE only requires being the table owner (or superuser).
 
-create or replace function forbid_events_truncate() returns event_trigger as $$
-declare
-    obj record;
-begin
-    for obj in select * from pg_event_trigger_ddl_commands() loop
-        if obj.command_tag = 'TRUNCATE TABLE'
-           and obj.object_identity ilike 'public.events%' then
-            raise exception 'events table is append-only: TRUNCATE not allowed';
-        end if;
-    end loop;
-end;
-$$ language plpgsql;
-
-drop event trigger if exists trg_no_truncate_events;
-
-create event trigger trg_no_truncate_events
-    on ddl_command_end
-    when tag in ('TRUNCATE TABLE')
-    execute function forbid_events_truncate();
+REVOKE TRUNCATE ON public.events FROM PUBLIC;
