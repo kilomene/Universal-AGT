@@ -60,12 +60,14 @@ The files: `agent-host-platform/database/migrations/`:
 | 008 | `008_task_queue_hardening.sql` | `domains.status` CHECK recreated to allow `'degraded'` (007's constraint omitted it while the reconciler transitions to it — real PostgreSQL would 500; pg-mem doesn't enforce CHECKs so suites stayed green); `domains.idempotency_key` unique; `tasks.type` 18-type CHECK + `attempts >= 0` + `max_attempts >= 1`; `deployments.health_status` CHECK; three hot-path indexes (`idx_tasks_claimable`, `idx_tasks_claimed_by`, `idx_tasks_payload_deployment_id`) |
 | 009 | `009_heartbeat_enrichment.sql` | `worker_draining`, `worker_status`, `ingress` (jsonb), `reported_host_name` columns for the enriched heartbeat (2026-10-06: `capabilities` already existed) |
 | 010 | `010_registration_idempotency.sql` | Nullable `idempotency_key` on `hosts`/`agents` + partial unique indexes (registration replay) |
+| 011 | `011_project_ownership_acls.sql` | Resource-level authorization: `projects.owner_agent_id` (backfilled from the legacy `owner` name; unresolvable owners recorded in `migration_reports`, never silently assigned), plus `project_members` and `agent_host_access` tables (no privilege issues) |
+| 012 | `012_rollback_failed_status.sql` | Widens the `deployments.status` CHECK to admit `'rollback_failed'` (drop + re-add, safe no-op on re-run; no privilege issues) |
 
 Verify:
 
 ```sql
 -- in the Supabase SQL editor
-select * from schema_migrations order by name;  -- 001…010 present
+select * from schema_migrations order by name;  -- 001…012 present
 ```
 
 ### Privileged migrations — the safe path
@@ -88,7 +90,7 @@ dumps do not capture it, so re-apply it after any database restore.
 
 ### Migration runner notes
 
-- Migrations are numbered `001`…`007`, no gaps (CI enforces this).
+- Migrations are numbered `001`…`012`, no gaps (CI enforces this).
 - A migration file may opt out of the runner's transaction wrapper with
   a marker line `-- migrate: no-transaction` (parsed by
   `src/db/migrate.ts` `requiresNoTransaction`) — for statements that
@@ -109,7 +111,7 @@ dumps do not capture it, so re-apply it after any database restore.
    `checkMigrationPrivileges` fails fast with this exact path instead
    of a cryptic error when it cannot.)
 2. **Role ownership.** Run the migrations as the `postgres` role (SQL
-   editor). All other migrations (`002`–`007`) are plain DDL/DML that
+   editor). All other migrations (`002`–`012`) are plain DDL/DML that
    need only *table ownership*, not superuser — they run fine as any
    role that owns the tables, which is why the chain also works against
    a local Postgres when run as a non-superuser owner role. Keep the
@@ -325,11 +327,13 @@ anywhere — authorization flows from `permissions` only):
 CP="https://control-plane.example.com"
 H="X-Provisioning-Token: <your-UAHT_PROVISIONING_TOKEN>"
 
-# muse: full operator — deploy, restart/stop services, approve manual deploys
+# muse: full operator — deploy, restart/stop services, approve manual deploys,
+# suspend/resume/revoke agents, assign project owners
 curl -s -X POST $CP/v1/agents/register -H 'Content-Type: application/json' -H "$H" \
   -d '{"name": "muse", "type": "ci", "capabilities": ["docker", "compose"],
        "permissions": {"deploy": true, "read_status": true,
-                       "restart": true, "stop": true, "approve_deployments": true}}'
+                       "restart": true, "stop": true, "approve_deployments": true,
+                       "admin": true}}'
 # → 201 {"agent": {...}, "api_key": "<show once>"}
 
 # instinct: deploy-only builder — cannot restart/stop/approve or touch secrets
@@ -412,7 +416,7 @@ Validated against the code paths (each step maps to a real mechanism;
 the full drill needs a live Postgres — run it there before you need it):
 
 1. Restore the database (`pg_restore` / Supabase restore). Verify
-   `select * from schema_migrations order by name;` shows `001`…`007`.
+   `select * from schema_migrations order by name;` shows `001`…`012`.
 2. **Re-apply migration `005`** (`REVOKE TRUNCATE ON public.events FROM
    PUBLIC`) — it is database-global and `pg_dump` schema-only dumps do
    not capture it.
@@ -423,7 +427,7 @@ the full drill needs a live Postgres — run it there before you need it):
 4. Put the **original** `DATA_ENCRYPTION_KEY` and
    `UAHT_PROVISIONING_TOKEN` back in the control-plane env; start the
    API — startup runs `runMigrations`, which is a no-op when
-   `schema_migrations` already lists `001`…`007`.
+   `schema_migrations` already lists `001`…`012`.
 5. Reinstall/repair the host worker (`scripts/install-host.sh` with a
    fresh host token); the worker's local `state.json` rebuilds from
    Docker reality on first boot (`reconcile()`), and the control plane
@@ -457,7 +461,7 @@ agent-host hosts   # status online, last_seen fresh
 
 ## 11. Production checklist
 
-- [ ] Postgres (Supabase) with migrations 001–010 applied; 001 (pgcrypto)
+- [ ] Postgres (Supabase) with migrations 001–012 applied; 001 (pgcrypto)
       applied as superuser on a fresh database.
 - [ ] `NODE_ENV=production`, `UAHT_PROVISIONING_TOKEN` set (API refuses to
       boot without it), `DATA_ENCRYPTION_KEY` backed up (64 hex chars).
