@@ -61,7 +61,17 @@ function setupDb() {
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT now()
     );
-    CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+    CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      owner TEXT, owner_agent_id TEXT, runtime TEXT, configuration JSONB);
+    CREATE TABLE project_members (
+      project_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+      PRIMARY KEY (project_id, agent_id)
+    );
+    CREATE TABLE agent_host_access (
+      agent_id TEXT NOT NULL, host_id TEXT NOT NULL,
+      permissions JSONB NOT NULL DEFAULT '{}',
+      PRIMARY KEY (agent_id, host_id)
+    );
     CREATE TABLE artifacts (
       id TEXT PRIMARY KEY, project_id TEXT, filename TEXT,
       storage_path TEXT, checksum TEXT, size BIGINT,
@@ -489,9 +499,21 @@ describe('POST /v1/tasks/:id/cancel', () => {
   });
 
   it('403s cancel by a non-owner without deploy', async () => {
-    const { task } = await autoTask();
+    // §10: the project is OWNED here (not legacy-open), so the stranger has
+    // no project access and cannot cancel the owner's task.
+    const agent = await seedAgent('deployer', { deploy: true, approve_deployments: true });
+    const host = await seedHost('h1');
+    const project = await seedProject('demo-app');
+    await state.pool.query(`UPDATE projects SET owner_agent_id = $1 WHERE id = $2`, [
+      agent.id,
+      project,
+    ]);
+    const { body } = await req('POST', '/v1/deployments', agent.token, {
+      project_id: project, host_id: host.id, version: '1.0.0', mode: 'automatic',
+    });
+    expect(body.deployment).toBeDefined();
     const stranger = await seedAgent('stranger', { read_status: true });
-    const { status } = await req('POST', `/v1/tasks/${task.id}/cancel`, stranger.token);
+    const { status } = await req('POST', `/v1/tasks/${body.task.id}/cancel`, stranger.token);
     expect(status).toBe(403);
   });
 
