@@ -709,7 +709,7 @@ validates it before any build; invalid → task fails fast, no partial state.
   "runtime": "docker",
   "build": { "dockerfile": "Dockerfile", "context": "." },
   "service": { "port": 3000, "healthcheck": "/health" },
-  "resources": { "memory": "1g", "cpu": "1" },
+  "resources": { "memory": "1Gi", "cpu": 1 },
   "restart": "unless-stopped",
   "env": { "NODE_ENV": "production" }
 }
@@ -717,8 +717,20 @@ validates it before any build; invalid → task fails fast, no partial state.
 
 Validation rules: `name` required (must match project name); `runtime` in
 `docker|docker-compose|static`; `service.port` 1–65535; `resources.memory`
-like `256m|1g`; `resources.cpu` positive number; `restart` in
-`no|always|unless-stopped|on-failure`.
+like `256m|512Mi|1g|2Gi` (one grammar everywhere — see
+`docs/resource-contract.md`); `resources.cpu` positive number;
+`restart` in `no|always|unless-stopped|on-failure`.
+
+**Resource source of truth (Fix #1):** the artifact's validated manifest
+is what the scheduler reserves from and what the worker deploys. Submit
+the manifest with `POST /v1/artifacts/init` (`manifest` field — the SDKs'
+`initArtifact`/`init_artifact` accept it, and the CLI extracts
+`agent.deploy.json` from the tarball automatically). The reservation is
+`{cpu, ram_mb}` normalized from `resources`, persisted on the deployment
+row (`reserved_cpu`/`reserved_ram_mb`) inside the same transaction that
+selects the host, and carried on the task payload (`reserved_cpu`,
+`reserved_ram_mb`) so the worker can refuse a tarball that demands more
+than was reserved.
 
 `volumes` is **rejected** in `agent.deploy.json` (spec §6 — no partial
 support): the `docker` runtime never mounts host paths, so a manifest-level
@@ -736,9 +748,11 @@ deployment workspace are denied).
 
 - `deploy`: `{project_id, project_name, host_id, version, artifact_id?,
   artifact_checksum?, artifact_size?, requested_host_port?, deployment_id,
-  manifest?}` — the control plane injects `project_name` (from the project
+  reserved_cpu?, reserved_ram_mb?, manifest?}` — the control plane injects `project_name` (from the project
   row) and `artifact_checksum`/`artifact_size` (from the verified artifact
-  row) on `POST /v1/deployments` (2026-10-05); the worker refuses artifact
+  row) on `POST /v1/deployments` (2026-10-05); `reserved_cpu`/`reserved_ram_mb`
+  carry the canonical reserved contract from the artifact's validated manifest
+  (Fix #1 — the worker refuses a tarball that demands more); the worker refuses artifact
   deploys without `artifact_checksum` (+ secrets injected server-side)
 - `rollback`: `{deployment_id, target_deployment_id?}` — the control plane
   sets `target_deployment_id` to the last healthy deployment of the same
@@ -757,6 +771,13 @@ deployment workspace are denied).
   deployment store, then reconciles the provider's route table)
 
 Task `result` for `deploy`: `{deployment_id, status, health_status, ports}`.
+Task `result` for `rollback` (Fix #2 — the control plane records
+`rolled_back` ONLY when the report proves all three; anything else
+persists `rollback_failed` — see `docs/rollback-contract.md`):
+`{deployment_id, status: 'rolled_back'|'rollback_failed',
+rollback_status: 'succeeded'|'failed'|'partially_reconciled',
+rolled_back_to?, target_health_status: 'healthy'|'unhealthy'|'unknown',
+ports_settled?}`.
 For `logs`: `{logs: "..."}`. For `system-info`: `{cpu, ram, disk, docker, ...}`.
 For `ingress-sync`:
 `{status: "ok"|"disabled", provider, changed, routes: [{hostname,
