@@ -256,9 +256,12 @@ class IngressProvider(ABC):
 def _check_route(hostname, target_host, target_port) -> None:
     if not is_valid_hostname(hostname):
         raise IngressError(f"refusing route for invalid hostname: {hostname!r}")
-    if target_host not in ("127.0.0.1", "localhost"):
-        # Ingress routes always terminate on this host's loopback: the
-        # provider must never be steered at an arbitrary network target.
+    # §27: ingress routes terminate ONLY at 127.0.0.1 — the literal
+    # loopback address, never a name that could resolve elsewhere.
+    # "localhost" is deliberately NOT accepted: it is a localhost variant
+    # that can resolve to the IPv6 loopback (::1) or be shadowed by a
+    # resolver, and the spec requires the exact 127.0.0.1 origin.
+    if target_host != "127.0.0.1":
         raise IngressError(
             f"refusing route for {hostname!r}: target_host must be "
             f"127.0.0.1 (got {target_host!r})"
