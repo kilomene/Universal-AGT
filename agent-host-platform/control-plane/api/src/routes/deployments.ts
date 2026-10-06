@@ -20,7 +20,7 @@ import {
   inList,
   listAccessibleProjectIds,
 } from '../lib/authz';
-import { deploymentConstraintsForProject, selectHostForDeployment } from '../lib/scheduler';
+import { checkHostCapacity, deploymentConstraintsForProject, isHostSchedulable, selectHostForDeployment } from '../lib/scheduler';
 import { requireAgent, requireHost, requirePermission } from '../middleware/auth';
 import { isUuid, parseLimit } from './_helpers';
 
@@ -245,19 +245,54 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
       } else {
         // §9: lock the explicitly requested host row too, so the check and
         // the deployment-row reservation are atomic for targeted deploys.
-        const h = await client.query('SELECT id FROM hosts WHERE id = $1 FOR UPDATE', [
-          selectedHostId,
-        ]);
+        const h = await client.query(
+          'SELECT id, status, worker_draining, total_cpu, total_ram_mb FROM hosts WHERE id = $1 FOR UPDATE',
+          [selectedHostId],
+        );
         if (!h.rows[0]) {
           await client.query('ROLLBACK');
           sendError(res, 404, 'not_found', 'host not found');
           return;
         }
+        // Part 1F/1G: a draining host takes no new deployments — the same
+        // rule as auto-select. A deploy task pinned to a draining host
+        // could never be claimed (§37), so creating it would only mint a
+        // dead deployment. Draining never destroys existing apps or tasks.
+        if (!isHostSchedulable(h.rows[0])) {
+          await client.query('ROLLBACK');
+          sendError(res, 503, 'no_capacity', 'host is draining; it cannot take new deployments');
+          return;
+        }
+        // Part 1D: the reservation is atomic for targeted deploys too —
+        // verify capacity against persistent reservations while the host
+        // row is locked, in this same transaction.
+        if (
+          !(await checkHostCapacity(
+            client,
+            {
+              id: selectedHostId,
+              total_cpu: h.rows[0].total_cpu,
+              total_ram_mb: h.rows[0].total_ram_mb,
+            },
+            constraints.requiredCpuCores,
+            constraints.requiredRamMb,
+          ))
+        ) {
+          await client.query('ROLLBACK');
+          sendError(
+            res,
+            503,
+            'no_capacity',
+            'host does not have enough reservable CPU/RAM for this deployment',
+          );
+          return;
+        }
       }
       taskPayload.host_id = selectedHostId;
       const depRows = await client.query(
-        `INSERT INTO deployments (id, idempotency_key, project_id, host_id, version, artifact_id, mode, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'requested') RETURNING *`,
+        `INSERT INTO deployments (id, idempotency_key, project_id, host_id, version, artifact_id, mode, status,
+                                  reserved_cpu, reserved_ram_mb)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'requested',$8,$9) RETURNING *`,
         [
           deploymentId,
           typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null,
@@ -266,6 +301,10 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
           version,
           artifact_id ?? null,
           deployMode,
+          // Part 1D: the persistent reservation — snapshotted here, inside
+          // the same transaction that selected and locked the host.
+          constraints.requiredCpuCores,
+          constraints.requiredRamMb,
         ],
       );
       deployment = depRows.rows[0];
