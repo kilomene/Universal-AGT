@@ -335,23 +335,29 @@ class UahtClient:
     def get_artifact(self, artifact_id):
         return self._get(f"/artifacts/{artifact_id}")
 
-    def init_artifact(self, project_id, file_path, version, filename=None):
-        """Register an artifact (§3.5 step 1), computing sha256 client-side."""
+    def init_artifact(self, project_id, file_path, version, filename=None, manifest=None):
+        """Register an artifact (§3.5 step 1), computing sha256 client-side.
+
+        `manifest` is the optional agent.deploy.json object: when supplied,
+        the control plane validates it (same grammar the worker enforces)
+        and the scheduler reserves resources from it instead of the project
+        configuration (Fix #1).
+        """
         size = os.path.getsize(file_path)
         digest = hashlib.sha256()
         with open(file_path, "rb") as fh:
             for chunk in iter(lambda: fh.read(65536), b""):
                 digest.update(chunk)
-        return self._post(
-            "/artifacts/init",
-            {
-                "project_id": project_id,
-                "filename": filename or os.path.basename(file_path),
-                "size": size,
-                "checksum": f"sha256:{digest.hexdigest()}",
-                "version": version,
-            },
-        )
+        body = {
+            "project_id": project_id,
+            "filename": filename or os.path.basename(file_path),
+            "size": size,
+            "checksum": f"sha256:{digest.hexdigest()}",
+            "version": version,
+        }
+        if manifest is not None:
+            body["manifest"] = manifest
+        return self._post("/artifacts/init", body)
 
     def upload_artifact(self, upload_url, file_path):
         """Stream raw bytes to the upload URL (§3.5 step 2, octet-stream)."""
