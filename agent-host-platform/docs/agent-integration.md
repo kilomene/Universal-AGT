@@ -45,9 +45,13 @@ POST /v1/agents/register
   get it from whoever runs the control plane). With the env var unset, only
   the very first registration is open (bootstrap mode); afterwards it 403s.
   In production (`NODE_ENV=production`) the server refuses to boot without it.
-- `permissions` is an object of booleans. Valid keys:
-  `deploy`, `read_status`, `read_logs`, `restart`, `stop`, `remove`,
-  `manage_domains`, `approve_deployments`, `manage_secrets`.
+- `permissions` is an object of booleans. Valid keys (the enforced
+  registry — `src/middleware/auth.ts` `PERMISSIONS`):
+  `deploy`, `approve_deployments`, `read_status`, `restart`, `stop`,
+  `manage_secrets`, `manage_domains`.
+  Only these seven names are ever checked — anything else (e.g.
+  `read_logs`) grants nothing. The `logs` task type needs `read_status`;
+  `remove` is a task type that needs `deploy`, not a permission.
 - Permissions are fixed at registration (no update endpoint). Need more
   later → register a new agent or ask a human operator.
 - Verify your own row any time: `GET /v1/agents/me → {"agent": {...}}`
@@ -62,14 +66,14 @@ agent-type special-casing exists in the control plane, SDKs, CLI, or worker):
 curl -s -X POST $CP/v1/agents/register -H 'Content-Type: application/json' \
   -d '{"name": "muse", "type": "ci",
        "capabilities": ["docker", "compose"],
-       "permissions": {"deploy": true, "read_status": true, "read_logs": true,
+       "permissions": {"deploy": true, "read_status": true,
                        "restart": true, "stop": true, "approve_deployments": true}}'
 # → 201 {"agent": {...}, "api_key": "<muse-key>"}
 
 # instinct: deploy-only builder — cannot restart/stop/approve
 curl -s -X POST $CP/v1/agents/register -H 'Content-Type: application/json' \
   -d '{"name": "instinct", "type": "ci", "capabilities": ["docker"],
-       "permissions": {"deploy": true, "read_status": true, "read_logs": true}}'
+       "permissions": {"deploy": true, "read_status": true}}'
 # → 201 {"agent": {...}, "api_key": "<instinct-key>"}
 ```
 
@@ -87,7 +91,7 @@ POST /v1/projects
  "configuration": {...}}
 → 201 {"project": {"id": "<uuid>", ...}}
 
-GET  /v1/projects?limit=&cursor=   → {"projects": [...]}
+GET  /v1/projects                     → {"projects": [...]}
 GET  /v1/projects/:id             → {"project": {...}}
 PUT  /v1/projects/:id             → 200 {"project": {...}}   # update configuration
 → 422 on invalid configuration
@@ -207,21 +211,38 @@ GET /v1/events/stream                        # SSE: "data: {event}\n\n" per even
                                              # then live-pushes; ": ping" keep-alive every 15s
 ```
 
-Canonical event types (PROTOCOL §3.8): `agent.connected`, `agent.disconnected`,
-`task.created`, `task.claimed`, `task.started`, `task.awaiting_approval`,
-`task.approved`, `task.rejected`, `task.completed`, `task.failed`,
-`task.cancelled`, `artifact.created`, `artifact.upload_failed`,
-`deployment.requested`, `deployment.approved`, `deployment.started`,
-`deployment.building`, `deployment.healthcheck`, `deployment.completed`,
-`deployment.failed`, `deployment.rolled_back`, `service.started`,
-`service.stopped`, `service.restarted`, `host.registered`, `host.online`,
-`host.offline`, `healthcheck.passed`, `healthcheck.failed`,
-`worker.updated`, `secret.changed`, `secret.deleted`.
-The server additionally emits (beyond the canonical list):
-`task.retrying`, `task.requeued`, `deployment.rollback_requested`,
-`deployment.rollback_failed`, `domain.requested`, `domain.added`,
-`domain.removed`, `host.degraded`, `service.removed`, `service.crash_loop`.
-Treat unknown types as opaque: match on the ones you need, ignore the rest.
+Canonical event types — the 46 types the server actually emits
+(verified against `control-plane/api/src/routes/` + `lib/` +
+`middleware/` 2026-10-06; PROTOCOL §3.8 is the canonical list):
+
+- Agents: `agent.connected`, `agent.key_rotated`
+- Auth: `auth.failed` (bad provisioning token at a registration gate)
+- Tasks: `task.created`, `task.claimed`, `task.started`, `task.retrying`,
+  `task.awaiting_approval`, `task.approved`, `task.rejected`,
+  `task.completed`, `task.failed`, `task.cancelled`, `task.requeued`
+- Artifacts: `artifact.created`, `artifact.upload_failed`
+- Deployments: `deployment.requested`, `deployment.approved`,
+  `deployment.started`, `deployment.completed`, `deployment.failed`,
+  `deployment.rolled_back`, `deployment.rollback_requested`,
+  `deployment.rollback_failed`, `deployment.ports_settled`
+- Services: `service.started`, `service.stopped`, `service.restarted`,
+  `service.removed`, `service.crash_loop`
+- Hosts: `host.registered`, `host.online`, `host.offline`,
+  `host.degraded`, `host.token_rotated`, `host.worker_outdated`
+  (heartbeat from a worker below the minimum supported version)
+- Secrets: `secret.changed`, `secret.deleted`
+- Domains: `domain.requested`, `domain.active`, `domain.degraded`
+  (route no longer verifies — reconciler retries), `domain.recovered`
+  (degraded route verifies again), `domain.failed`,
+  `domain.removed`, `domain.remove_failed`, `domain.reconcile`
+  (periodic reconciler pass summary)
+
+Notably absent (they look plausible but are never emitted):
+`agent.disconnected`, `deployment.building`, `deployment.healthcheck`,
+`healthcheck.passed`/`healthcheck.failed` (worker log strings, not
+events), `worker.updated` (worker log string, not an event).
+Treat unknown types as opaque: match on the ones you need, ignore the
+rest.
 Note: `since` on the **stream** is accepted by the SDKs but the server
 currently replays by `limit` only — use `GET /v1/events?since=` for
 time-filtered history.
@@ -254,7 +275,7 @@ as an iterator.
 ## 7. Services — query, restart, stop, start
 
 ```
-GET  /v1/services?host_id=            → running deployments (friendly view;
+GET  /v1/services?host_id=&limit=     → running deployments (friendly view;
                                         service id == deployment id)
 POST /v1/services/:id/restart        # needs restart
 POST /v1/services/:id/stop           # needs stop
@@ -401,7 +422,7 @@ export CP="https://control-plane.example.com"   # no trailing /v1
 # 1. register
 R=$(curl -s -X POST $CP/v1/agents/register -H 'Content-Type: application/json' \
   -d '{"name": "builder-01", "type": "ci", "capabilities": ["docker"],
-       "permissions": {"deploy": true, "read_status": true, "read_logs": true,
+       "permissions": {"deploy": true, "read_status": true,
                        "restart": true, "stop": true}}')
 export KEY=$(echo "$R" | python3 -c 'import sys,json; print(json.load(sys.stdin)["api_key"])')
 A() { curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' "$@"; }
@@ -458,7 +479,7 @@ A -X POST $CP/v1/deployments/$DID/rollback   # against previous healthy version
 Same flow via CLI (needs `UAHT_BASE_URL`, `UAHT_API_KEY`):
 
 ```bash
-agent-host agents register --name builder-01 --permissions deploy,read_status,read_logs,restart,stop
+agent-host agents register --name builder-01 --permissions deploy,read_status,restart,stop
 agent-host projects create --name url-shortener --runtime docker
 agent-host deploy --project url-shortener --version 1.0.0 --artifact /tmp/url-shortener.tar.gz
 agent-host status --deployment <id>
@@ -471,9 +492,13 @@ Same flow via SDKs:
 
 ```python
 from uaht_sdk import UahtClient
-c = UahtClient("https://control-plane.example.com", "<api-key>")
-c.register_agent("builder-01", type="ci",
-                 permissions={"deploy": True, "read_status": True, "restart": True})
+# Registration is gated on the provisioning token (X-Provisioning-Token
+# header) — no agent key needed yet, so the constructor's api_key is omitted.
+bootstrap = UahtClient("https://control-plane.example.com")
+reg = bootstrap.register_agent("builder-01", type="ci",
+                 permissions={"deploy": True, "read_status": True, "restart": True},
+                 provisioning_token="<provisioning-token>")
+c = UahtClient("https://control-plane.example.com", reg["api_key"])
 p = c.create_project("url-shortener", runtime="docker")["project"]
 info = c.init_artifact(p["id"], "/tmp/url-shortener.tar.gz", version="1.0.0")
 c.upload_artifact(info["upload_url"], "/tmp/url-shortener.tar.gz")
@@ -485,9 +510,13 @@ print(c.get_logs(deployment_id=deployment["id"]))
 
 ```js
 import { UahtClient } from "uaht-sdk";
-const c = new UahtClient({ baseUrl: "https://control-plane.example.com", apiKey: "<api-key>" });
-await c.registerAgent({ name: "builder-01", type: "ci",
-  permissions: { deploy: true, read_status: true, restart: true } });
+// Registration is gated on the provisioning token (X-Provisioning-Token
+// header) — no agent key needed yet, so the constructor's apiKey is omitted.
+const bootstrap = new UahtClient({ baseUrl: "https://control-plane.example.com" });
+const reg = await bootstrap.registerAgent({ name: "builder-01", type: "ci",
+  permissions: { deploy: true, read_status: true, restart: true },
+  provisioningToken: "<provisioning-token>" });
+const c = new UahtClient({ baseUrl: "https://control-plane.example.com", apiKey: reg.api_key });
 const { project } = await c.createProject({ name: "url-shortener", runtime: "docker" });
 const info = await c.initArtifact({ project_id: project.id, filePath: "/tmp/url-shortener.tar.gz", version: "1.0.0" });
 await c.uploadArtifact(info.upload_url, "/tmp/url-shortener.tar.gz");
