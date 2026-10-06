@@ -172,12 +172,12 @@ deleted, each **verified gone by re-reading** before the domain is marked
 
 **A domain never points at a dead deployment without the control plane
 knowing.** When a deployment reaches a terminal state (`stopped`, `failed`,
-`rolled_back`), its tunnel domains are marked `failed` (with an event on
-the deployment's event stream), their tunnel routes are dropped from the
-remote configuration, and DNS records are removed; `deployments.domains`
-(the old JSONB column) is kept as a derived summary mirror only. When the
-deployment recovers (a new live deployment supersedes it), its tunnel
-domains are re-provisioned.
+`rolled_back`, `rollback_failed`), its tunnel domains are marked `failed`
+(with an event on the deployment's event stream), their tunnel routes are
+dropped from the remote configuration, and DNS records are removed;
+`deployments.domains` (the old JSONB column) is kept as a derived summary
+mirror only. When the deployment recovers (a new live deployment
+supersedes it), its tunnel domains are re-provisioned.
 
 Request a domain:
 
@@ -225,6 +225,13 @@ Cloudflare edge → (outbound tunnel) → `cloudflared` on the host →
 - Hostname validation rejects wildcards, localhost, internal-only names,
   and IP literals — on the API and again on the worker before anything is
   written to the remote tunnel configuration.
+- The domain HTTPS probe's IP classifier fails closed: every resolved
+  A/AAAA address must be public, or the probe refuses to dial. The denied
+  IPv6 set includes `2002::/16` (6to4 — embeds an arbitrary IPv4 address in
+  bits 16–47, the same SSRF class as the NAT64 ranges), alongside loopback,
+  link-local, unique-local, multicast, documentation, NAT64, and Teredo;
+  IPv4-mapped `::ffff:0:0/96` addresses are classified by their embedded
+  IPv4 address (the earlier IPv4-mapped check was verified correct).
 - Ingress targets are always `http://127.0.0.1:<deployment port>` — the
   deployment's own local endpoint. Arbitrary URLs are never accepted.
 - `cloudflared` is only ever executed from a SHA-256-pinned official
