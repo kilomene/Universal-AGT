@@ -393,3 +393,84 @@ def test_build_failure_after_admission_releases_reservation(
     task2 = _deploy_task("ok-app", "dep-ok-1", 1, "4g")
     result = pipeline.deploy(ctx, task2)
     assert result["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# Part 1J: reservations survive a worker restart (they live in the state
+# store on disk, never in process memory).
+# ---------------------------------------------------------------------------
+def test_reservations_survive_worker_restart(tmp_path, monkeypatch, host_4cpu_16gb):
+    """Deploy a 12GB app to success, then simulate a worker process death:
+    wipe the in-memory _resource_reservations dict and build a brand-new
+    DeploymentStore on the same work dir. The reservation must still be
+    accounted for — a second 12GB deploy is rejected from the persisted
+    state row alone."""
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    result = pipeline.deploy(ctx, _deploy_task("big-app", "dep-big-1", 1, "12g"))
+    assert result["status"] == "running"
+
+    # Simulate process death: in-memory reservations are gone, the store is
+    # re-opened fresh on the same directory (as after a worker restart).
+    pipeline._resource_reservations.clear()
+    assert pipeline.reserved_resources_snapshot() == {}
+    restarted_store = DeploymentStore(str(tmp_path))
+    allocated = collector.allocated_resources(restarted_store)
+    assert allocated == {"cpu": 1.0, "ram_mb": 12288.0}
+
+    # A second 12GB deploy does not fit in the remaining 4GB — rejected
+    # from the PERSISTED reservation, with no in-memory state at all.
+    ctx2 = FakeCtx(tmp_path, docker)
+    ctx2.deployment_store = restarted_store
+    with pytest.raises(pipeline.DeployError,
+                       match="insufficient reservable memory"):
+        pipeline.deploy(ctx2, _deploy_task("big-app-2", "dep-big-2", 1, "12g"))
+    assert pipeline.reserved_resources_snapshot() == {}
+
+
+# ---------------------------------------------------------------------------
+# Part 1H: the in-flight worker guard can never double-count a deployment
+# whose reservation is already persisted.
+# ---------------------------------------------------------------------------
+def test_no_double_count_after_state_persist(tmp_path, monkeypatch, host_4cpu_16gb):
+    """After a successful deploy the in-flight reservation is gone AND the
+    persisted row accounts for exactly one reservation: allocated is 12GB,
+    not 24GB. A follow-up 4GB deploy then fits exactly (16-12=4)."""
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    result = pipeline.deploy(ctx, _deploy_task("big-app", "dep-big-1", 1, "12g"))
+    assert result["status"] == "running"
+
+    # In-flight guard released at persist time (Part 1H atomic
+    # persist_state_releasing_reservation): nothing in-flight remains.
+    assert pipeline.reserved_resources_snapshot() == {}
+    # Persisted accounting counts the deployment exactly once.
+    allocated = collector.allocated_resources(ctx.deployment_store)
+    assert allocated == {"cpu": 1.0, "ram_mb": 12288.0}
+
+    # Exactly 4GB remains: a 4GB deploy is admitted, a 5GB one is not.
+    result2 = pipeline.deploy(ctx, _deploy_task("small-app", "dep-small-1", 0.5, "4g"))
+    assert result2["status"] == "running"
+    assert collector.allocated_resources(ctx.deployment_store)["ram_mb"] == 16384.0
+    with pytest.raises(pipeline.DeployError,
+                       match="insufficient reservable memory"):
+        pipeline.deploy(ctx, _deploy_task("too-big", "dep-too-big-1", 0.5, "5g"))
+
+
+def test_normalize_resources_single_parsing_rule():
+    """Part 1B: the worker's authoritative parser — the exact contract the
+    control-plane scheduler's normalizeResources mirrors."""
+    from deployments.manifest import normalize_resources
+    assert normalize_resources({"cpu": 1.5, "memory": "512Mi"}) == {
+        "cpu": 1.5, "ram_mb": 512}
+    assert normalize_resources({"cpu": 2, "memory": "1Gi"}) == {
+        "cpu": 2.0, "ram_mb": 1024}
+    assert normalize_resources({"memory": "256m"}) == {
+        "cpu": None, "ram_mb": 256}
+    assert normalize_resources({"cpu": "x", "memory": "512MB"}) == {
+        "cpu": None, "ram_mb": None}
+    assert normalize_resources(None) == {"cpu": None, "ram_mb": None}
