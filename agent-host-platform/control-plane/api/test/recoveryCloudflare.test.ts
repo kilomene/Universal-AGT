@@ -19,6 +19,35 @@ vi.mock('../src/db/pool', () => ({
   closePool: async () => {},
 }));
 
+// §5 SSRF hardening: the HTTPS probe resolves DNS itself and dials via
+// node:https with a pinned lookup — mock both (no real DNS/network).
+const dnsMock = vi.hoisted(() => {
+  let v4: string[] = ['93.184.216.34'];
+  let v6: string[] = [];
+  return {
+    resolve4: vi.fn(async (): Promise<string[]> => v4),
+    resolve6: vi.fn(async (): Promise<string[]> => v6),
+    set: (a: string[], aaaa: string[]) => {
+      v4 = a;
+      v6 = aaaa;
+    },
+  };
+});
+vi.mock('node:dns/promises', () => ({
+  resolve4: dnsMock.resolve4,
+  resolve6: dnsMock.resolve6,
+}));
+
+vi.mock('node:https', () => ({
+  default: {
+    get: vi.fn((_url: string, _opts: any, cb: (res: any) => void) => {
+      const req = { on: () => req, destroy: () => {} };
+      queueMicrotask(() => cb({ statusCode: 200, resume: () => {} }));
+      return req;
+    }),
+  },
+}));
+
 import { createApp } from '../src/index';
 import { generateAgentKey, generateHostToken } from '../src/lib/tokens';
 import { startFakeCloudflare, type FakeCloudflare } from './fakeCloudflare';
