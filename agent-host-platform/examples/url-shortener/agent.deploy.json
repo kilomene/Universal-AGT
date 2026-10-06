@@ -1,1 +1,1 @@
-{"build":{"context":".","dockerfile":"Dockerfile"},"env":{"NODE_ENV":"production","PORT":"3000"},"name":"url-shortener","resources":{"cpu":"0.5","memory":"256m"},"restart":"unless-stopped","runtime":"docker","service":{"healthcheck":"/health","port":3000}}
+{"build": {"context": ".", "dockerfile": "Dockerfile"}, "env": {"NODE_ENV": "production", "PORT": "3000"}, "name": "url-shortener", "resources": {"cpu": 0.5, "memory": "256m"}, "restart": "unless-stopped", "runtime": "docker", "service": {"healthcheck": "/health", "port": 3000}}
