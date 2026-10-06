@@ -82,6 +82,12 @@ UAHT_HOST_TOKEN="${UAHT_HOST_TOKEN:-}"
 UAHT_HOST_ID="${UAHT_HOST_ID:-}"
 UAHT_WORKER_VERSION="${UAHT_WORKER_VERSION:-0.1.0}"
 UAHT_SKIP_APT="${UAHT_SKIP_APT:-0}"
+# Both are optional inputs; they MUST have defaults here because the script
+# runs under `set -u` and references them unconditionally below (an unset
+# UAHT_TUNNEL_TOKEN used to abort the install with "unbound variable" on
+# the plain documented path with ingress disabled).
+UAHT_INGRESS_ENABLED="${UAHT_INGRESS_ENABLED:-0}"
+UAHT_TUNNEL_TOKEN="${UAHT_TUNNEL_TOKEN:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -193,13 +199,74 @@ chown -R "$WORKER_USER:$WORKER_USER" /opt/agent-host "$APPS_DIR"
 chmod 0750 /opt/agent-host "$APPS_DIR"
 
 # ---- provisioning -------------------------------------------------------------
+# Reuse provisioned credentials from a previous install on THIS machine.
+#
+# Re-running the installer must be idempotent: without this, every
+# re-install mints a brand-new host row at the control plane (the old
+# host_id goes stale, duplicate host entries accumulate, and any
+# operator-set state such as `draining` is silently lost) and a stored
+# WORKER_TUNNEL_TOKEN is blanked whenever the operator does not re-pass
+# UAHT_TUNNEL_TOKEN. Explicit UAHT_HOST_TOKEN/UAHT_HOST_ID always win;
+# this function only fills in what the caller did not supply.
+#
+# Self-contained on purpose (plain echo, no log()/fail()): test-install.sh
+# extracts and unit-tests this function standalone.
+# Sets UAHT_HOST_ID / UAHT_HOST_TOKEN from the file. Returns 0 when usable
+# credentials were found, 1 otherwise.
+reuse_existing_credentials() { # $1 = existing worker.env path
+  local env_file="$1"
+  local existing_id existing_token existing_url
+  existing_id="$(sed -n 's/^WORKER_HOST_ID=//p' "$env_file" | tail -n 1)"
+  existing_token="$(sed -n 's/^WORKER_HOST_TOKEN=//p' "$env_file" | tail -n 1)"
+  existing_url="$(sed -n 's/^WORKER_CONTROL_PLANE_URL=//p' "$env_file" | tail -n 1)"
+  if [ -n "$existing_id" ] && [ -n "$existing_token" ]; then
+    if [ -n "$existing_url" ] && [ -n "${UAHT_CONTROL_PLANE_URL:-}" ] \
+       && [ "$existing_url" != "$UAHT_CONTROL_PLANE_URL" ]; then
+      echo "[install-host] WARNING: existing credentials in $env_file were provisioned for $existing_url, not ${UAHT_CONTROL_PLANE_URL}; reusing anyway (override: pass UAHT_HOST_TOKEN/UAHT_HOST_ID explicitly)" >&2
+    fi
+    UAHT_HOST_ID="$existing_id"
+    UAHT_HOST_TOKEN="$existing_token"
+    echo "[install-host] reusing provisioned credentials from $env_file (host_id=$existing_id)" >&2
+    return 0
+  fi
+  return 1
+}
+
+if [ -z "$UAHT_HOST_TOKEN" ] && [ -f "$ENV_FILE" ]; then
+  # Idempotent reinstall: keep this machine's identity instead of
+  # registering a duplicate host.
+  reuse_existing_credentials "$ENV_FILE" || true
+fi
+
+# Never blank a stored tunnel token just because the operator did not
+# re-pass UAHT_TUNNEL_TOKEN. Runs on every install (reinstall with
+# explicit credentials included); reuse_existing_credentials() above only
+# covers the no-explicit-credentials path. Self-contained like its
+# sibling so test-install.sh can exercise it standalone.
+preserve_tunnel_token() { # $1 = existing worker.env path
+  local env_file="$1"
+  local preserved
+  if [ -z "${UAHT_TUNNEL_TOKEN:-}" ] && [ -f "$env_file" ]; then
+    preserved="$(sed -n 's/^WORKER_TUNNEL_TOKEN=//p' "$env_file" | tail -n 1)"
+    if [ -n "$preserved" ]; then
+      UAHT_TUNNEL_TOKEN="$preserved"
+      echo "[install-host] preserved existing WORKER_TUNNEL_TOKEN from $env_file" >&2
+    fi
+  fi
+}
+preserve_tunnel_token "$ENV_FILE"
+
 if [ -z "$UAHT_HOST_TOKEN" ]; then
   log "provisioning host at $UAHT_CONTROL_PLANE_URL (POST /v1/hosts/register)"
-  PROVISION_JSON="$(python3 - "$UAHT_CONTROL_PLANE_URL" "$UAHT_HOST_NAME" "$UAHT_WORKER_VERSION" <<'EOF'
+  PROVISION_JSON="$(python3 - "$UAHT_CONTROL_PLANE_URL" "$UAHT_HOST_NAME" "$UAHT_WORKER_VERSION" "$UAHT_INGRESS_ENABLED" <<'EOF' \
+    || fail "host provisioning failed (POST $UAHT_CONTROL_PLANE_URL/v1/hosts/register)"
 import json, sys, urllib.request
-base, name, version = sys.argv[1], sys.argv[2], sys.argv[3]
+base, name, version, ingress_on = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+capabilities = ["docker", "docker-compose"]
+if ingress_on == "1":
+    capabilities.append("ingress")
 body = json.dumps({"name": name, "host_type": "persistent-linux-host",
-                   "capabilities": ["docker", "docker-compose"],
+                   "capabilities": capabilities,
                    "worker_version": version}).encode()
 req = urllib.request.Request(base.rstrip("/") + "/v1/hosts/register",
                              data=body,
@@ -233,6 +300,10 @@ WORKER_HEARTBEAT_INTERVAL=30
 WORKER_WORK_DIR=/opt/agent-host
 WORKER_APPS_DIR=/srv/agent-apps
 WORKER_WORKER_VERSION=$UAHT_WORKER_VERSION
+# Draining (§37): set to true before replacing/migrating this host — the
+# worker finishes in-flight work but stops claiming new tasks. The control
+# plane can also set draining on the host row; either source takes effect.
+WORKER_DRAINING=false
 # --- optional public ingress (Phase 7; disabled by default) -----------------
 # Set UAHT_INGRESS_ENABLED=1 + UAHT_TUNNEL_TOKEN in the installer environment
 # to enable the worker-managed cloudflared tunnel (outbound-only).
