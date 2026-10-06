@@ -16,8 +16,12 @@ is the actual state. For every deployment marked ``running`` locally:
     or an ``environment-update`` task does.
   * ``docker-compose`` runtime           -> containers are matched by compose
     project name in ``docker ps -a``; stopped ones are started. A project
-    with no containers at all cannot be recreated without its compose file,
-    so it is reported as missing and left for the operator.
+    with no containers at all is recreated with ``compose up`` from the
+    compose file recorded at deploy time (it lives under the deployment's
+    own state dir, so it survives a reboot) — the compose analogue of
+    container recreation, and the same call the rollback path uses. Only a
+    stack whose compose file is ALSO gone is reported as missing and left
+    for the operator (redeploy required).
 
 After the desired-state pass, containers Docker knows that NO deployment
 state claims are reported as ``unexpected`` — never destroyed. Reconcile
@@ -31,9 +35,10 @@ heartbeat payload so the control plane sees what the reboot recovered.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
-from deployments.pipeline import run_spec_from_state
+from deployments.pipeline import run_spec_from_state, verify_compose_ports_free
 
 LOG = logging.getLogger("agent-host-worker.reconcile")
 
@@ -203,10 +208,7 @@ def _reconcile_compose(ctx, state: dict, ps_all: dict, summary: dict, note) -> N
     docker = ctx.docker
     matched = [n for n in ps_all if _compose_name_matches(compose_project, n)]
     if not matched:
-        summary["missing"] += 1
-        note(f"{project} ({deployment_id}): compose project {compose_project} "
-             f"has no containers; cannot recreate without its compose file "
-             f"(redeploy required)")
+        _recreate_compose_stack(ctx, state, summary, note)
         return
     started = 0
     for cname in matched:
@@ -226,3 +228,73 @@ def _reconcile_compose(ctx, state: dict, ps_all: dict, summary: dict, note) -> N
         summary["already_running"] += 1
         note(f"{project} ({deployment_id}): compose project {compose_project} "
              f"already running")
+
+
+def _recreate_compose_stack(ctx, state: dict, summary: dict, note) -> None:
+    """Recreate a compose deployment whose containers are all gone.
+
+    The compose file is extracted under the deployment's own state dir at
+    deploy time, so it survives a worker restart — this is the compose
+    analogue of _recreate_container, and the same ``compose up`` call the
+    rollback path uses. The stack's recorded host ports are verified free
+    first (the same check the deploy pipeline runs before `compose up`),
+    excluding nothing: there are no containers of this project left, so a
+    port held by anything else is a genuine collision.
+
+    A stack with no containers AND no compose file cannot be rebuilt —
+    that one is reported as missing, honestly, for the operator.
+    """
+    deployment_id = state.get("deployment_id", "?")
+    project = state.get("project_name", "?")
+    compose_project = state.get("compose_project")
+    compose_file = state.get("compose_file")
+    docker = ctx.docker
+    if not compose_file or not os.path.isfile(compose_file):
+        summary["missing"] += 1
+        note(f"{project} ({deployment_id}): compose project {compose_project} "
+             f"has no containers and its compose file {compose_file!r} is "
+             f"missing (redeploy required)")
+        return
+    wanted: list[int] = []
+    for p in state.get("compose_ports") or []:
+        try:
+            wanted.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    try:
+        verify_compose_ports_free(docker, compose_project, wanted,
+                                  registry_used=_registry_ports(ctx, state))
+    except Exception as exc:
+        summary["missing"] += 1
+        note(f"{project} ({deployment_id}): cannot recreate compose "
+             f"project {compose_project}: {exc}")
+        return
+    try:
+        docker.compose_up(compose_file, project_name=compose_project,
+                          build=True)
+    except Exception as exc:
+        summary["missing"] += 1
+        note(f"{project} ({deployment_id}): failed to recreate compose "
+             f"project {compose_project} from {compose_file}: {exc}")
+        return
+    summary["reconciled"] += 1
+    note(f"{project} ({deployment_id}): compose project {compose_project} "
+         f"had no containers; recreated via compose up {compose_file}")
+
+
+def _registry_ports(ctx, state: dict) -> set:
+    """Host ports reserved by OTHER live deployments (persisted contract).
+
+    This deployment's own recorded ports are excluded: its containers are
+    gone, so its own record must not read as a collision against itself.
+    """
+    try:
+        ports = set(ctx.deployment_store.used_host_ports())
+    except Exception:
+        return set()
+    for p in [state.get("host_port")] + list(state.get("compose_ports") or []):
+        try:
+            ports.discard(int(p))
+        except (TypeError, ValueError):
+            continue
+    return ports
