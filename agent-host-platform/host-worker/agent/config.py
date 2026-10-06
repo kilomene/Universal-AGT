@@ -88,6 +88,13 @@ class WorkerConfig:
     ingress_enabled: bool = False
     ingress_provider: str = ""
     tunnel_token: str = ""
+    # Draining (§37): when True, the worker finishes in-flight dispatches
+    # but never claims NEW tasks. Operator-set at the control plane
+    # (advertised on the heartbeat response, latched in
+    # WorkerContext.draining) or locally via WORKER_DRAINING=true — e.g.
+    # before replacing/migrating the host. Heartbeats continue while
+    # draining so the operator can watch running_apps drain to zero.
+    draining: bool = False
 
     @classmethod
     def load(cls, config_path: str | None = None, **overrides) -> "WorkerConfig":
@@ -123,6 +130,7 @@ class WorkerConfig:
             "crash_loop_window_s": ENV_PREFIX + "CRASH_LOOP_WINDOW_S",
             "ingress_enabled": ENV_PREFIX + "INGRESS_ENABLED",
             "ingress_provider": ENV_PREFIX + "INGRESS_PROVIDER",
+            "draining": ENV_PREFIX + "DRAINING",
             # Runtime name is WORKER_TUNNEL_TOKEN (see the UAHT_TUNNEL_TOKEN ->
             # WORKER_TUNNEL_TOKEN installer mapping in docs/CONFIG.md). The
             # worker.env file key is WORKER_TUNNEL_TOKEN, normalized to
@@ -157,6 +165,7 @@ class WorkerConfig:
                 values.get("ingress_enabled", False), "ingress_enabled"),
             ingress_provider=str(values.get("ingress_provider", "") or ""),
             tunnel_token=str(values.get("tunnel_token", "") or ""),
+            draining=_as_bool(values.get("draining", False), "draining"),
         )
         caps = values.get("capabilities", "")
         if isinstance(caps, str) and caps.strip():
@@ -220,5 +229,6 @@ class WorkerConfig:
             "crash_loop_window_s": self.crash_loop_window_s,
             "ingress_enabled": self.ingress_enabled,
             "ingress_provider": self.ingress_provider,
+            "draining": self.draining,
             "tunnel_token": "***" if self.tunnel_token else "",
         }
