@@ -50,7 +50,8 @@ function setupDb() {
   db.public.none(`
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
-      permissions JSONB, api_key_hash TEXT NOT NULL,
+      permissions JSONB, api_key_hash TEXT,
+      idempotency_key TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TIMESTAMPTZ DEFAULT now()
     );
@@ -60,6 +61,7 @@ function setupDb() {
       status TEXT NOT NULL DEFAULT 'online',
       capabilities JSONB,
       token_hash TEXT NOT NULL,
+      idempotency_key TEXT,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
       cpu_pct DOUBLE PRECISION, ram_pct DOUBLE PRECISION,
       disk_pct DOUBLE PRECISION, docker_status TEXT,
@@ -67,6 +69,10 @@ function setupDb() {
       total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION,
       total_disk_gb DOUBLE PRECISION,
       last_seen TIMESTAMPTZ, metadata JSONB,
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      worker_status TEXT,
+      ingress JSONB NOT NULL DEFAULT '{}',
+      reported_host_name TEXT,
       created_at TIMESTAMPTZ DEFAULT now(),
       updated_at TIMESTAMPTZ DEFAULT now()
     );
@@ -106,6 +112,7 @@ function setupDb() {
     );
     CREATE TABLE domains (
       id TEXT PRIMARY KEY DEFAULT gen_random_uuid(), hostname TEXT NOT NULL,
+      idempotency_key TEXT,
       deployment_id TEXT NOT NULL, host_id TEXT NOT NULL,
       ingress TEXT NOT NULL DEFAULT 'tunnel',
       status TEXT NOT NULL DEFAULT 'requested',
