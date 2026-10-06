@@ -618,3 +618,51 @@ Real Docker daemon behavior; real systemd install/start/reboot; non-superuser mi
 - Approval notification path (awaiting_approval tasks have no push/notify channel).
 - Code-signing for worker updates (checksum-pinned today).
 - The 50-step live acceptance run (§66) and live Cloudflare test (§67) — blocked on §10 prerequisites, not on code.
+
+---
+
+# Addendum — Final Resource Scheduling, Rollback Health, and Live Integration Completion (2026-10-06)
+
+This pass implemented the user's 30-section "Final Remaining Fixes" prompt to the letter, plus the follow-up "Final Resource Scheduling, Rollback Health, and Live Integration Completion" prompt (Parts 1–9). Audit-first: verify-only sections with no defect were left untouched; nothing was added beyond the prompts.
+
+## A. Persistent / atomic resource reservation (Part 1)
+- **New migration `013_reserved_resources.sql`**: `deployments.reserved_cpu` / `deployments.reserved_ram_mb` — the deployment row itself owns its reservation (PostgreSQL, never process memory).
+- **New `lib/scheduler.ts`**: `selectHostForDeployment` runs inside the deployment-creation transaction — candidate host rows locked `FOR UPDATE`, reservations summed over deployments in resource-consuming states, capacity verified, deployment + reservation committed atomically. Two concurrent 3 CPU/8 GB requests on a 4 CPU/16 GB host → exactly one succeeds (tested).
+- **Single authoritative `normalizeResources`**: `{"cpu": 1.5, "memory": "512Mi"}` → `{cpu, ram_mb}`; one parsing rule shared by scheduler and worker.
+- **`isHostSchedulable(host)`**: one draining definition used consistently — `status='draining'` or `worker_draining=true` hosts are never selected; existing apps and owned tasks are untouched.
+- **Worker `_resource_reservations` kept as a local in-worker concurrency guard only**; audited against double-counting with the persistent reservation.
+- Reservations release on terminal states (`failed`/`removed`/`rolled_back`/`rollback_failed`) and survive worker + control-plane restarts (verified by test).
+- All 17 Part-1L tests added (`test/resourceScheduling.test.ts`).
+
+## B. Rollback health semantics (Part 2)
+- **Bug fixed**: `target_healthy = outcome["target_health_status"] != "unhealthy"` treated `unknown` as success — in `executor/handlers.py:327`, `deployments/rollback.py` commit phase, and `deployments/pipeline.py` automatic-rollback path. Now: success **only** when `target_health_status == "healthy"`; `unhealthy`/`unknown` → `rollback_failed` with reason `"target health could not be verified"`.
+- **Port settlement runs only after the target is proven healthy**; settle failure → durable `rollback_failed`/`partially_reconciled`, never reported as success.
+- Same-port rollback preserved (teardown-before-restore, registry converges); third-party port collision → durable failure, unrelated app never overwritten.
+- All 15 Part-2H regression tests added (`test_rollback_health_semantics.py`, `rollbackFailure.test.ts`).
+
+## C. Event visibility (Part 3) — verdict: GLOBAL BY DESIGN
+The event journal is intentionally globally readable (documented audit contract: `docs/security.md`, `PROTOCOL.md` §3.8, `docs/api.md`). Filtering would silently break the contract, so no filtering was added; the contract is now documented explicitly and all 49 event types were audited — **zero secret material** in any payload.
+
+## D. ACL non-regression (Part 4)
+One demonstrated IDOR bypass found and fixed: `PUT /v1/artifacts/:id/content` performed no project ACL check — any agent with `deploy` could overwrite another project's artifact bytes. Now gated by central `authorizeArtifactAccess`. All other routes verified on the central `lib/authz.ts` helpers.
+
+## E. Agent lifecycle (Part 5) — verified
+active → works; suspended → 403 immediately; resumed → works; revoked → 401 permanently (hash replaced with unmatchable random; no TTL window). **No credential cache exists**: `attachAuth` does a fresh DB lookup on every request.
+
+## F. Security audit (Part 7)
+One genuine issue fixed: `tarfile` `data_filter` (PEP 706, Python 3.12+) vs installer blessing Python ≥ 3.10 — on 3.10/3.11 the symlink/hardlink control raised `TypeError` instead of enforcing. Installer floor raised to 3.12 (CI already pins 3.12) + fail-closed capability probe in `pipeline.py`/`self_update.py`. Full pattern sweep otherwise clean (zero `shell=True`/`os.system`/`eval`/`--privileged`/socket mounts/SQL interpolation in production code).
+
+## G. Live integration docs (Part 6)
+`docs/live-acceptance.md` extended with the Part 6 architecture diagram, verified env-var/migration/endpoint/service-name references (all checked against code), and the kill-worker / Cloudflare external-network procedures — all marked **NOT YET EXECUTED**.
+
+## H. Test results (Part 8 gate, run by coordinator)
+- Control plane: `tsc` clean, **555/555 vitest** (41 files)
+- Host worker: **721 passed, 2 skipped**
+- JS SDK 44/44, Python SDK 43/43, CLI 20 helps + 37 JSON commands OK, installer 42/42, dashboard static checks pass, secrets sweep clean, migrations 6/6
+- CI: 12/12 green (run to be recorded on push)
+
+## I. Three-way split — updated
+**IMPLEMENTED AND TESTED** (additions this pass): persistent atomic resource reservations (migration 013); `isHostSchedulable` draining rule; rollback `== "healthy"`-only success with `rollback_failed` on unknown; settle-after-healthy port ordering; artifact content-upload ACL fix; Python 3.12 floor for tar security control.
+**Correction to the previous addendum's "GENUINELY REMAINING WORK"**: agent suspend/resume/revoke API and per-resource (project/deployment) ACLs are now **implemented and tested** (they were delivered in the two preceding passes) — they are removed from remaining work.
+**IMPLEMENTED BUT REQUIRES LIVE INFRASTRUCTURE VALIDATION** (unchanged): real Docker daemon, real systemd install/reboot, non-superuser Supabase migration chain, live Cloudflare route/DNS/HTTPS, live `cloudflared`, VM-reboot recovery.
+**GENUINELY REMAINING WORK**: non-HTTP health-check protocols; approval push-notification channel; code-signing for worker updates (checksum-pinned today); the live acceptance run — blocked on operator prerequisites (Supabase role, Ubuntu host + Docker, Cloudflare token/zone/domain), not on code.
