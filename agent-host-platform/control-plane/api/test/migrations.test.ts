@@ -15,16 +15,19 @@ vi.mock('fs', () => ({
 import { readdirSync, readFileSync } from 'fs';
 import { runMigrations, requiresNoTransaction } from '../src/db/migrate';
 
-const NO_TX_SQL = `-- 005_events_truncate_block.sql
+const NO_TX_SQL = `-- 009_example.sql
 --
 -- migrate: no-transaction
 --
-create or replace function forbid_events_truncate() returns event_trigger as $$
-begin end; $$ language plpgsql;
-drop event trigger if exists trg_no_truncate_events;
-create event trigger trg_no_truncate_events on ddl_command_end
-  when tag in ('TRUNCATE TABLE') execute function forbid_events_truncate();
+-- Synthetic example: PostgreSQL forbids some statements (e.g. CREATE EVENT
+-- TRIGGER) inside a transaction block, so the runner supports a
+-- no-transaction marker. (Migration 005 previously used this for an event
+-- trigger; that approach was removed when PG 16 proved event triggers do
+-- not support TRUNCATE at all.)
+create index concurrently if not exists idx_example on events(type);
 `;
+
+const NO_TX_FILES = { '009_example.sql': NO_TX_SQL };
 
 const NORMAL_SQL = `-- 006_token_rotation_grace.sql
 alter table agents add column if not exists foo text;
@@ -91,16 +94,16 @@ describe('requiresNoTransaction', () => {
 
 describe('runMigrations no-transaction path', () => {
   it('runs a marked migration WITHOUT BEGIN/COMMIT/ROLLBACK', async () => {
-    mockFs({ '005_events_truncate_block.sql': NO_TX_SQL });
+    mockFs(NO_TX_FILES);
     const { pool, queries } = mockPool();
     const applied = await runMigrations(pool as never);
-    expect(applied).toEqual(['005_events_truncate_block.sql']);
+    expect(applied).toEqual(['009_example.sql']);
     const kinds = queries.join('|');
     expect(kinds).not.toMatch(/(^|\|)BEGIN(\||$)/);
     expect(kinds).not.toMatch(/(^|\|)COMMIT(\||$)/);
     expect(kinds).not.toMatch(/(^|\|)ROLLBACK(\||$)/);
     // the migration SQL itself ran, and it was recorded as applied
-    expect(queries.some((q) => q.includes('005_events_truncate_block.sql'))).toBe(true);
+    expect(queries.some((q) => q.includes('009_example.sql'))).toBe(true);
     expect(queries.some((q) => q.includes('INSERT INTO schema_migrations'))).toBe(true);
   });
 
