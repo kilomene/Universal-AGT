@@ -141,9 +141,12 @@
 - **D7 (§9) — Heartbeat payload missing §9 fields.** New `enrich_heartbeat_payload()`: `host_name`, `worker_version`, `worker_status`, `draining`, `capabilities`, `ingress` (no tokens; test asserts no secrets). `WORKER_DRAINING` added to generated `worker.env` and `.env.example`.
 
 ### Deployment pipeline, resources, ports (WS-E)
-- **D1 (§11) — Resource admission was check-then-act.** New transactional `reserve_resources()`: a process-wide lock combines persisted reservations (from deployments in reserving states) with in-flight reservations from concurrent deploys; raises `DeployError` when the request doesn't fit; reservations released on persist or any failure path. Two simultaneous deployments can no longer consume the same capacity.
-- **§34 — Task logs unbounded.** `logs/store.py`: bounded retention for `LOG_DIR/<task_id>.log` (rotation/cleanup for terminal tasks).
-
+- **D1 (§11) — Resource admission was check-then-act.** New transactional `reserve_resources()`: a process-wide lock combines persisted reservations with in-flight reservations from concurrent deploys; raises `DeployError` when the request doesn't fit; released on persist or any failure path. **D1b:** reservations leaked on §4–§5 failures (docker-build/compose) — try/except now releases both resource and port reservations and re-raises.
+- **D2 (§13) — `artifact_id` not persisted** in deployment state. Now stored on both state saves in `deploy()`.
+- **D3 (§20) — Reconcile never reported unexpected containers.** New `_report_unexpected()`: containers claimed by no deployment state are reported, never destroyed.
+- **D4 (§21) — Rollback gaps.** Target ports verified free *before* teardown (refuses when squatted); restored target is health-checked post-restore with honest `health_status`; `verify_host_port_free` fixed for TIME_WAIT false-positives (SO_REUSEADDR).
+- **D5 (§22) — Self-update failure handling.** Download/corrupt-archive errors now wrapped in `UpdateError` (release dir cleaned); rollback-restart returncode checked.
+- **D6 (§34) — No log retention.** `LogStore.prune()` + `WORKER_LOG_RETENTION_DAYS` (default 30): task logs older than the window deleted; deployment logs only when the deployment is gone from the store (fail-closed). Wired into the heartbeat loop (every 20th heartbeat, ~10 min).
 ### Artifact & Docker security (WS-F)
 - **D1 (§16) — No decompression-bomb protection.** `extract_archive()` now enforces `MAX_EXTRACT_BYTES = 8 GiB` (absolute, not ratio — a ratio cap was verified to break legitimate artifacts) and `MAX_ARCHIVE_MEMBERS = 100_000`, with an incremental tar header scan so a bomb's payload is never even streamed.
 - **D2 (§16) — `artifact_id` used unvalidated as a filesystem path** (agent-controlled; `makedirs()` ran before the server's UUID check → arbitrary directory creation). New `validate_artifact_id()` (`^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$`) enforced at all 4 construction sites.
