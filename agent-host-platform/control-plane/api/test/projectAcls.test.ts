@@ -73,7 +73,8 @@ function setupDb() {
     CREATE TABLE artifacts (
       id TEXT PRIMARY KEY, project_id TEXT, filename TEXT,
       storage_path TEXT, checksum TEXT, size BIGINT,
-      version TEXT, status TEXT NOT NULL DEFAULT 'pending'
+      version TEXT, status TEXT NOT NULL DEFAULT 'pending',
+      manifest JSONB
     );
     CREATE TABLE secrets (
       id TEXT PRIMARY KEY DEFAULT 's', project_id TEXT NOT NULL,
