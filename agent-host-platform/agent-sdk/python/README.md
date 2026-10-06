@@ -68,12 +68,50 @@ text = client.get_logs(deployment_id="dep-uuid")
 # Or poll an existing logs task by id, and stream chunks as they arrive:
 for chunk in client.get_logs(task_id="task-uuid", follow=True):
     print(chunk, end="")
+
+# Iterator of chunks, no final text:
+for chunk in client.tail_logs(deployment_id="dep-uuid"):
+    print(chunk, end="")
+```
+
+## Domains & key rotation
+
+```python
+client.add_domain(deployment_id, "api.example.com", ingress="tunnel")  # 'tunnel'|'direct', omit for server default
+client.list_domains(deployment_id)
+client.remove_domain(deployment_id, "api.example.com")
+new = client.rotate_agent_key()  # new key shown once, client adopts it
 ```
 
 ## Error shape
 
 Every failure raises `UahtError` with `.code`, `.message`, `.status`, `.body`,
 mirroring the protocol error shape `{"error": {"code": ..., "message": ...}}`.
+
+## Registration & token rotation
+
+```python
+# Register a new agent: the control plane gates this on the provisioning
+# token (X-Provisioning-Token header) — no agent key needed yet.
+bootstrap = UahtClient(base_url=os.environ["UAHT_BASE_URL"])
+reg = bootstrap.register_agent(
+    name="ci-bot", type="ci",
+    permissions={"deploy": True, "read_status": True},
+    provisioning_token=os.environ["UAHT_PROVISIONING_TOKEN"],
+)
+api_key = reg["api_key"]  # shown once — store it, it is never returned again
+
+# Rotate your own agent key (the client adopts the new key automatically).
+client.rotate_agent_key()
+
+# Register a host (provisioning token, or a deploy-permission agent key).
+host = client.register_host(name="edge-01", provisioning_token=os.environ["UAHT_PROVISIONING_TOKEN"])
+host_token = host["host_token"]  # shown once
+
+# Rotate a host's token (auth is the host token itself; the client adopts it).
+host_client = UahtClient(base_url=os.environ["UAHT_BASE_URL"], api_key=host_token)
+host_client.rotate_host_token(host["host"]["id"], grace_seconds=300)
+```
 
 ## Tests
 
