@@ -42,7 +42,9 @@ function setupDb() {
     CREATE TABLE hosts (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
       token_hash TEXT, previous_token_hash TEXT,
-      previous_token_expires_at TIMESTAMPTZ
+      previous_token_expires_at TIMESTAMPTZ,
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION
     );
   `);
   const pg = db.adapters.createPg();
