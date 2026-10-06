@@ -441,7 +441,10 @@ def test_compose_rollback_tears_down_new_and_restores_previous(
     assert docker.compose_up_calls[-1] == (v1_file, "uaht-capp-projcapp", True)
 
     v2_state = ctx.deployment_store.load("cdep-v2")
-    assert v2_state["status"] == "rolled_back"
+    # The healthcheck fake fails for the restored stack too: per spec §6
+    # the rollback persists rollback_failed, never a false "rolled_back".
+    assert v2_state["status"] == "rollback_failed"
+    assert v2_state["rollback_status"] == "failed"
     assert v2_state["rollback_of"] == "cdep-v1"
     assert ctx.deployment_store.load("cdep-v1")["status"] == "running"
     # the restored stack is live in the fake
