@@ -206,6 +206,7 @@ create table artifacts (
     version      text not null,
     created_at   timestamptz not null default now(),
     manifest     jsonb,                                       -- validated agent.deploy.json (migration 014); NULL for legacy artifacts
+    updated_at   timestamptz not null default now(),          -- migration 016: the touch_updated_at() trigger (001) requires this column
     unique (project_id, version)
 );
 create index idx_artifacts_project on artifacts(project_id);
