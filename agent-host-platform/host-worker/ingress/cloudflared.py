@@ -18,7 +18,8 @@ ingress disabled — the worker keeps running its deployment duties.
 The tunnel token comes from worker config / the ``WORKER_TUNNEL_TOKEN``
 environment variable (the installer accepts ``UAHT_TUNNEL_TOKEN`` and maps
 it into ``worker.env``). It is never logged, never appears in status output,
-and never lives in the repo.
+never appears on a process command line (it is handed to cloudflared through
+the ``TUNNEL_TOKEN`` environment variable), and never lives in the repo.
 
 Route application: the provider rewrites ``config.yml`` on route changes —
 and that is ALL it does. Be clear about what that file IS: for token-based
@@ -85,6 +86,50 @@ _ARCH_MAP = {
 
 _DOWNLOAD_TIMEOUT_S = 120
 _RESTART_GRACE_S = 10
+
+#: cloudflared.log retention (§34): the tunnel subprocess appends to this
+#: log for the life of the host. Each generation is capped at 10 MiB and
+#: one rotated copy is kept — worst case 20 MiB on disk, never unbounded.
+#: Rotation happens in _spawn(), before the new process opens the log: the
+#: previous tunnel process has exited by then, so no writer holds the file.
+CLOUDFLARED_LOG_MAX_BYTES = 10 * 1024 * 1024
+CLOUDFLARED_LOG_ROTATIONS = 1
+
+
+def _rotate_log_if_needed(log_path: str,
+                          max_bytes: int = CLOUDFLARED_LOG_MAX_BYTES,
+                          rotations: int = CLOUDFLARED_LOG_ROTATIONS) -> None:
+    """Rotate ``log_path`` -> ``log_path.1`` (dropping older generations)
+    when it exceeds ``max_bytes``. Same policy as logs.store.LogStore
+    (cap + rotate to .1); a standalone helper because the writer here is
+    the cloudflared subprocess itself, not the LogStore. Never raises:
+    rotation must not break tunnel (re)spawn. Pure filesystem helper —
+    unit tested.
+    """
+    try:
+        if not os.path.isfile(log_path):
+            return
+        if os.path.getsize(log_path) <= max_bytes:
+            return
+    except OSError:
+        return
+    oldest = f"{log_path}.{rotations}"
+    try:
+        if os.path.exists(oldest):
+            os.remove(oldest)
+    except OSError:
+        pass
+    for i in range(rotations - 1, 0, -1):
+        src, dst = f"{log_path}.{i}", f"{log_path}.{i + 1}"
+        try:
+            if os.path.exists(src):
+                os.replace(src, dst)
+        except OSError:
+            pass
+    try:
+        os.replace(log_path, f"{log_path}.1")
+    except OSError:
+        pass
 
 
 def _host_arch() -> str:
@@ -275,13 +320,26 @@ class CloudflaredTunnelProvider(IngressProvider):
 
     # -- supervision ---------------------------------------------------
     def _spawn(self) -> subprocess.Popen:
+        # §34 log retention: rotate the tunnel log before each (re)spawn so
+        # cloudflared.log can never grow unbounded on a persistent host.
+        # The previous process has exited by this point (the supervisor
+        # only respawns after proc.wait()), so no writer holds the file.
+        _rotate_log_if_needed(self._log_path)
         log_fh = open(self._log_path, "ab")
-        argv = [self._binary, "tunnel", "--token", self._token, "run"]
-        LOG.info("starting cloudflared tunnel (token redacted)")
+        # SECURITY (§25): the tunnel token is passed through the TUNNEL_TOKEN
+        # environment variable, NEVER on the command line. A --token argv
+        # would expose the secret to every local user via `ps` /
+        # /proc/<pid>/cmdline (world-readable); the child process
+        # environment is only readable by the same UID. cloudflared's
+        # `tunnel run` reads TUNNEL_TOKEN natively.
+        argv = [self._binary, "tunnel", "run"]
+        env = dict(os.environ)
+        env["TUNNEL_TOKEN"] = self._token
+        LOG.info("starting cloudflared tunnel (token via TUNNEL_TOKEN env)")
         # start_new_session: the tunnel dies with its own process group on
         # shutdown instead of taking the worker's group with it.
         return subprocess.Popen(argv, stdout=log_fh, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, env=env,
                                 start_new_session=True, shell=False)
 
     def _supervise(self) -> None:
