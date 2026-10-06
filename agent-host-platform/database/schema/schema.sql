@@ -31,12 +31,14 @@ create table agents (
     status        text not null default 'active'
                   check (status in ('active','suspended','revoked')),
     api_key_hash  text not null,                              -- SHA-256 hex of the bearer token
+    idempotency_key text,                                     -- §7: registration idempotency (migration 010)
     last_seen     timestamptz,
     metadata      jsonb not null default '{}'::jsonb,
     created_at    timestamptz not null default now(),
     updated_at    timestamptz not null default now()
 );
 create index idx_agents_status on agents(status);
+create unique index idx_agents_idempotency_key on agents (idempotency_key) where idempotency_key is not null;
 
 -- ----------------------------------------------------------------------------
 -- hosts: persistent compute nodes. The name is abstract on purpose
@@ -48,8 +50,9 @@ create table hosts (
     host_type      text not null default 'persistent-linux-host',
     status         text not null default 'offline'
                    check (status in ('online','offline','degraded','draining')),
-    capabilities   jsonb not null default '[]'::jsonb,        -- e.g. ["docker","docker-compose","gpu"]
-    worker_version text,
+    capabilities   jsonb not null default '[]'::jsonb,        -- e.g. ["docker","docker-compose","gpu"];
+                                                             -- refreshed from the heartbeat payload
+    worker_version text,                                      -- reported by the heartbeat
     token_hash     text not null,                             -- SHA-256 hex of the host bearer token
     previous_token_hash text,                            -- SHA-256 hex of the pre-rotation host token
                                                         -- (valid only while previous_token_expires_at
@@ -63,12 +66,19 @@ create table hosts (
     total_cpu      double precision,                          -- cores available
     total_ram_mb   double precision,
     total_disk_gb  double precision,
+    worker_draining boolean not null default false,           -- worker's self-reported drain flag
+    worker_status  text,                                      -- 'running' | 'draining', as reported
+    ingress        jsonb not null default '{}'::jsonb,        -- {enabled, provider} descriptor
+    reported_host_name text,                                  -- worker's configured host name
+                                                             -- (hosts.name stays the identity)
+    idempotency_key text,                                     -- §7: registration idempotency (migration 010)
     last_seen      timestamptz,
     metadata       jsonb not null default '{}'::jsonb,
     created_at     timestamptz not null default now(),
     updated_at     timestamptz not null default now()
 );
 create index idx_hosts_status on hosts(status);
+create unique index idx_hosts_idempotency_key on hosts (idempotency_key) where idempotency_key is not null;
 
 -- ----------------------------------------------------------------------------
 -- tasks: the durable work queue. This is what survives agents disappearing.
@@ -85,10 +95,12 @@ create table tasks (
     idempotency_key text unique,                              -- client-supplied; repeat => same task
     created_by      uuid references agents(id) on delete set null,
     assigned_to     uuid references hosts(id) on delete set null,
-    type            text not null,                            -- deploy|restart|stop|start|remove|rollback|
-                                                             -- logs|status|healthcheck|build|docker-build|
-                                                             -- docker-run|docker-compose|environment-update|
-                                                             -- artifact-download|artifact-upload|system-info
+    type            text not null
+                    check (type in ('deploy','restart','stop','start','remove','rollback',
+                                    'logs','status','healthcheck','build','docker-build',
+                                    'docker-run','docker-compose','environment-update',
+                                    'artifact-download','artifact-upload','system-info',
+                                    'ingress-sync')),         -- PROTOCOL §3.2: the 18 task types
     status          text not null default 'queued'
                     check (status in ('queued','claimed','running','awaiting_approval',
                                       'completed','failed','cancelled','retrying')),
@@ -96,8 +108,8 @@ create table tasks (
     payload         jsonb not null default '{}'::jsonb,       -- task-type-specific input
     result          jsonb,                                    -- task-type-specific output
     error           text,
-    attempts        integer not null default 0,
-    max_attempts    integer not null default 3,
+    attempts        integer not null default 0 check (attempts >= 0),
+    max_attempts    integer not null default 3 check (max_attempts >= 1),
     claimed_by      uuid references hosts(id) on delete set null,
     lease_expires_at timestamptz,                             -- claim lease; the sweeper requeues
                                                              -- claimed/running tasks past their lease
@@ -108,6 +120,9 @@ create table tasks (
     updated_at      timestamptz not null default now()
 );
 create index idx_tasks_status_priority on tasks(status, priority desc, created_at);
+create index idx_tasks_claimable on tasks(priority desc, created_at asc) where status = 'queued';
+create index idx_tasks_claimed_by on tasks(claimed_by) where claimed_by is not null;
+create index idx_tasks_payload_deployment_id on tasks((payload ->> 'deployment_id'));
 create index idx_tasks_assigned_to on tasks(assigned_to);
 create index idx_tasks_created_by on tasks(created_by);
 create index idx_tasks_type on tasks(type);
@@ -170,7 +185,9 @@ create table deployments (
     domains        jsonb not null default '[]'::jsonb,        -- DERIVED summary mirror of the
                                                              -- domains table (migration 007);
                                                              -- the domains table is authoritative
-    health_status  text,                                      -- 'healthy' | 'unhealthy' | 'unknown'
+    health_status  text                                  -- 'healthy' | 'unhealthy' | 'unknown'
+                   check (health_status is null or
+                          health_status in ('healthy','unhealthy','unknown')),
     rollback_of    uuid references deployments(id) on delete set null,
     created_at     timestamptz not null default now(),
     updated_at     timestamptz not null default now(),
@@ -202,11 +219,14 @@ create index idx_port_allocations_deployment on port_allocations(deployment_id);
 -- The SOURCE OF TRUTH for the domain lifecycle; deployments.domains (jsonb)
 -- is a derived summary mirror rebuilt from this table on every transition.
 -- Lifecycle: requested -> configuring -> active -> failed -> removing ->
--- removed. One live row per hostname (partial unique index) so a hostname
--- can never be attached to two live deployments at once.
+-- removed. `active` can also go through `degraded` (the route became
+-- unverifiable; the reconciler retries degraded rows back to configuring
+-- or failed). One live row per hostname (partial unique index) so a
+-- hostname can never be attached to two live deployments at once.
 -- ----------------------------------------------------------------------------
 create table domains (
     id                uuid primary key default gen_random_uuid(),
+    idempotency_key   text unique,                           -- client-supplied; repeat => same domain
     hostname          text not null,
     deployment_id     uuid not null references deployments(id) on delete cascade,
     host_id           uuid not null references hosts(id) on delete cascade,
@@ -214,7 +234,8 @@ create table domains (
                       check (ingress in ('tunnel', 'direct')),
     status            text not null default 'requested'
                       check (status in ('requested', 'configuring', 'active',
-                                        'failed', 'removing', 'removed')),
+                                        'degraded', 'failed', 'removing',
+                                        'removed')),
     cf_record_id      text,                                  -- Cloudflare DNS record id, when DNS is managed
     dns_configured    boolean not null default false,        -- CNAME hostname -> ingress target exists
     tunnel_configured boolean not null default false,        -- remote tunnel ingress rule exists (tunnel mode)
