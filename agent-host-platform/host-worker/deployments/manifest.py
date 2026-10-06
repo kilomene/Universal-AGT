@@ -12,6 +12,12 @@ Rules enforced:
   * restart: optional, one of no | always | unless-stopped | on-failure
   * build.dockerfile / build.context: optional non-empty strings
   * env: optional mapping of string keys to scalar values
+  * volumes: REJECTED (spec §6 — no partial support). The docker runtime
+    never mounts host paths (DockerClient.run has no -v flag, deliberately),
+    so a manifest-level `volumes` field would be persisted-but-inert and
+    silently misleading. Persistent storage is available via
+    runtime=docker-compose with named volumes or workspace-relative bind
+    mounts (validated by compose_validate.py).
 Unknown top-level keys are ignored (forward compatibility); unknown keys
 inside known sections are ignored as well.
 """
@@ -146,6 +152,21 @@ def validate_manifest(data: Any,
                         f"env.{key}: value must be a string/number/boolean, "
                         f"got {value!r}"
                     )
+
+    # -- volumes -------------------------------------------------------
+    # Spec §6: no partial volume support. Manifest-level `volumes` would be
+    # persisted to the deployment state but never applied — docker.run
+    # accepts no -v flag (W5 deny list) and compose deployments carry their
+    # own volumes in the compose file. Reject outright instead of silently
+    # ignoring; agents needing persistent storage use
+    # runtime=docker-compose with named volumes or workspace-relative bind
+    # mounts.
+    if data.get("volumes") is not None:
+        errors.append(
+            "volumes: not supported in agent.deploy.json; the docker "
+            "runtime never mounts host paths. Use runtime=docker-compose "
+            "with named volumes or workspace-relative bind mounts instead"
+        )
 
     return (len(errors) == 0), errors
 
