@@ -123,9 +123,9 @@ npm start
 curl -sk https://control-plane.example.com/v1/health
 ```
 
-**Pass:** `{"ok":true,...}`; the log shows migrations `001`–`010`
+**Pass:** `{"ok":true,...}`; the log shows migrations `001`–`012`
 already applied (or applied on boot); no superuser error. Then verify
-against the DB: `select * from schema_migrations;` shows all ten.
+against the DB: `select * from schema_migrations;` shows all twelve.
 
 ### Step 2 — Registration gate + first agent key
 
@@ -389,7 +389,7 @@ accepted. Record the date, the Supabase project, the host
 fingerprint, and the Cloudflare zone with the results.
 
 ### Control plane
-- [ ] Boots against real Postgres; migrations `001`–`010` applied; `001`'s
+- [ ] Boots against real Postgres; migrations `001`–`012` applied; `001`'s
       pgcrypto installed as superuser once (non-superuser chain run
       validated — see limitation 2 below)
 - [ ] Agent registration gated on `UAHT_PROVISIONING_TOKEN`; wrong token
@@ -411,7 +411,7 @@ fingerprint, and the Cloudflare zone with the results.
       on both rollback paths
 - [ ] Manual approval: tasks park in `awaiting_approval`; approve/reject
       gated on `approve_deployments`
-- [ ] Events: 46 types journaled append-only; SSE stream live
+- [ ] Events: 49 types journaled append-only; SSE stream live
 - [ ] Secrets: AES-256-GCM at rest; names-only reads; injected as
       container env; absent from disk, logs, and task payloads
 - [ ] Rate limits enforced (120/min agent, 600/min host, 10/min
