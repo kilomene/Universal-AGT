@@ -164,6 +164,152 @@ the coordinator pushes once at the end.
    configuration, public HTTPS, DNS lifecycle. **The operator supplies
    these; the coordinator has no token.**
 
+## Final Remaining Fixes pass (2026-10-06 — spec §§26/§28, workstream 5)
+
+Audit-and-fix only, smallest changes: nothing added beyond the spec
+sections, nothing redesigned. Code workstreams implemented §§2/4–13/17;
+this addendum records what changed, where it is proven, and what the
+docs now say.
+
+### What changed (code — other workstreams)
+
+- **§2 SSRF IP classification** — verified correct; ADDED `2002::/16`
+  (6to4) to the denied ranges in
+  `control-plane/api/src/routes/domains.ts`.
+- **§§4–7 Rollback durability** — single
+  `host-worker/deployments/rollback.py` used by both paths; same-port
+  explicit rollback fixed (verify tolerates the current deployment's
+  own bind, teardown-before-restore); rollback failures persist
+  `rollback_failed` / `partially_reconciled` durably (never false
+  success); port registry settled via settle-rollback-ports on both
+  paths; reconcile pre-pass handles interrupted rollbacks;
+  `rollback_failed` added to `GCABLE_STATUSES`, the worker ingress
+  `TERMINAL_DEPLOYMENT_STATUSES`, the control-plane
+  `failDomainsForDeployment` triggers, `NON_ROUTABLE_DEPLOYMENT_STATUSES`,
+  and the `deployments.status` CHECK (migration
+  `012_rollback_failed_status.sql`).
+- **§8 Host scheduler** — `POST /v1/deployments` accepts
+  `host_id: null`; new `src/lib/scheduler.ts` selects an eligible host
+  (online, not draining, capabilities, CPU/RAM headroom, host targeting
+  ACL); the deployment row always gets a concrete `host_id`; no eligible
+  host → 503 `no_capacity`.
+- **§9 Atomic check+reserve** — host rows locked `SELECT … FOR UPDATE`
+  inside the request transaction (documented in `scheduler.ts`).
+- **§10 Central authorization** — `src/lib/authz.ts`
+  (`authorizeProjectAccess/Deployment/Artifact/Task/HostAccess`,
+  `listAccessibleProjectIds`) wired into the projects, deployments,
+  tasks, artifacts, secrets, services, and domains routes. Legacy-open
+  rule: `owner_agent_id IS NULL` projects and hosts with zero
+  `agent_host_access` rows stay accessible to all agents.
+- **§11 Ownership migration** —
+  `011_project_ownership_acls.sql`: `projects.owner_agent_id` (backfilled
+  from the legacy `owner` name; unresolvable owners recorded in
+  `migration_reports`, never silently assigned), `project_members`,
+  `agent_host_access`.
+- **§12 Agent lifecycle** —
+  `POST /v1/agents/:id/suspend|resume|revoke` behind `requireOperator`
+  (provisioning token or an agent with the new `admin` permission); self
+  suspend/revoke → 403; revoke replaces `api_key_hash` with an
+  unmatchable random value; events `agent.suspended` / `agent.resumed` /
+  `agent.revoked` carry no secrets; tasks remain durable.
+- **§13 Claim pin fix** — `tryClaim` no longer stamps `assigned_to`
+  (now exclusively the agent-requested pin); requeued tasks after a host
+  death are claimable by other hosts.
+- **§17** — volumes remain explicitly rejected in `agent.deploy.json`
+  (no change).
+- **Everything else in §§13–19, §§22–24** — verified already-fixed, no
+  changes.
+
+### Status of this pass's items
+
+**IMPLEMENTED + TESTED** (local suites, no new infra needed):
+scheduler selection + 503 `no_capacity` (`hostSelection.test.ts`,
+`concurrentDeploy.test.ts`); agent suspend/resume/revoke + `admin`
+permission (`agentLifecycle.test.ts`); project ownership/ACL
+(`projectAcls.test.ts`, `ownerMigration.test.ts`); rollback failure
+durability + migration 012 (`rollbackFailure.test.ts`,
+`rollbackFailedMigration.test.ts`); claim `assigned_to` fix
+(`recoveryLeases.test.ts` structural claim-SQL test); 6to4 denied
+range (`domainsProbeSsrf.test.ts`).
+
+**IMPLEMENTED + REQUIRES LIVE VALIDATION**: host scheduler contention
+between real concurrent deploys (`FOR UPDATE` semantics under real
+multi-host load — Category B2 class); migration `011`/`012` executed as
+a non-superuser owner role on a real PostgreSQL (Category B1 class);
+`rollback_failed` CHECK enforcement on real PG (pg-mem does not enforce
+CHECKs — Category B9 class); end-to-end agent suspend → running tasks
+keep their hosts' results readable (needs a live host).
+
+**NOT IMPLEMENTED** (still): finer per-deployment scoping beyond the
+project/host ACLs that now exist; push/notification channel for
+`awaiting_approval`; HMAC request signing / replay protection;
+code-signing for worker self-updates; non-HTTP health-check protocols.
+
+### Statements this pass corrects (supersede earlier sections)
+
+- The §16 "GENUINELY REMAINING WORK" item **"Agent suspend/revoke API
+  endpoint" is now IMPLEMENTED** (operator endpoints + `admin`
+  permission, §12 above).
+- **"Per-resource (per-project/per-deployment) ACLs" is now partially
+  implemented**: projects have `owner_agent_id` + `project_members`,
+  hosts have `agent_host_access` targeting ACLs (§§10–11). Only
+  finer-than-project scoping remains future work.
+- The event journal count in §16 and elsewhere is **49**, not 46
+  (`agent.suspended`/`agent.resumed`/`agent.revoked` added).
+
+### Docs changed (this addendum's author, §26)
+
+- `agent-sdk/protocol/PROTOCOL.md` — new changelog entry; §1
+  permissions now 8 (`admin`); §3.1 agent lifecycle endpoints; §3.5
+  owner/members endpoints; §3.6 scheduler + `no_capacity` +
+  `rollback_failed`; §3.8 events 46 → 49; `assigned_to` semantics note.
+- `docs/api.md` — agent lifecycle rows; project members/owner rows;
+  scheduler + `no_capacity` on `POST /v1/deployments`; `rollback_failed`
+  status; events 49; `no_capacity` error code.
+- `docs/security.md` — `admin` permission; agent lifecycle section;
+  project ownership/ACL section; event journal trio.
+- `docs/deployment.md` — migration table `011`/`012`; all
+  `001…010`/`002–007` claims corrected to `001…012`/`002–012`; muse
+  operator example gains `"admin": true`.
+- `docs/cloudflare.md` — `rollback_failed` in the domain-failover
+  terminal list; 6to4 in the probe's denied IPv6 set.
+- `docs/architecture.md` — scheduler paragraph; `assigned_to` claim
+  note; `rollback_failed` terminal branch.
+- `docs/agent-integration.md` — events 46 → 49 + lifecycle trio.
+- `docs/implementation-status.md` — A3 (8 permissions), A8
+  (`assigned_to`), A16 (rollback durability), A18 (49 events), A29
+  (domains ACL + 6to4), A30 (migrations `001–012`), new A37 (scheduler),
+  A38 (agent lifecycle), A39 (project/host ACL), B1 (`002–012`), C6
+  (per-resource ACL now partial), duplicate C2 row removed.
+- `docs/live-acceptance.md` — migrations `001–012`; events 49.
+- `README.md` — migrations `001…012`; layout `001_initial …
+  012_rollback_failed_status`.
+- `control-plane/api/README.md` — endpoint map (lifecycle, members,
+  owner, scheduler); bootstrap example fixed to real permissions
+  (was `read_logs`/`remove`, which do not exist).
+
+### Code fixes from the §28 quality sweep (this pass)
+
+- `host-worker/agent/config.py` — removed dead `import shlex`
+  (verified unused; module imports cleanly).
+- `host-worker/agent/context.py`, `host-worker/health/collector.py` —
+  removed unused `Optional` from the `typing` imports.
+- `agent-host-platform/database/schema/schema.sql` — added the three
+  tables migration `011` creates (`project_members`,
+  `agent_host_access`, `migration_reports`) plus their indexes,
+  `projects.owner_agent_id`, and the `rollback_failed` CHECK value
+  (migration `012`). The schema previously missed them, which fails
+  CI's migration-validation superset check; re-ran that exact check
+  locally — schema.sql now covers all 13 tables created by the chain.
+- Marker sweep (`TODO`/`FIXME`/`HACK`/`XXX`/`not implemented`): clean —
+  all hits are legitimate test doubles (`vi.stubGlobal`, harness stubs)
+  or genuine error paths; no `throw new Error("not implemented")`
+  anywhere. No duplicate rollback code (single `rollback.py`), no
+  duplicate authorization code (single `authz.ts`), no `grok`
+  hard-coding, no secrets in new event payloads or error messages,
+  status codes consistent (503 `no_capacity`, 403 self-action, 409
+  conflicts, 404 not-found).
+
 ---
 
 ## 1. Every file changed (111 files this pass)
