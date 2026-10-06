@@ -214,6 +214,12 @@ class DockerClient:
         validate_run_args(ports=ports, memory=memory, cpus=cpus,
                           restart=restart)
         name = sanitize_ident(name)
+        # §17: the image is the last positional in the argv. A value
+        # starting with "-" would be parsed by the docker CLI as a FLAG
+        # (pflag), not as the image — an untrusted payload must never be
+        # able to reach that parsing ambiguity. Reject it outright.
+        if not image or not isinstance(image, str) or image.startswith("-"):
+            raise ValueError(f"invalid image {image!r}; must not start with '-'")
         argv = ["run", "-d", "--name", name]
         for host_port, container_port in (ports or {}).items():
             argv += ["-p", f"{int(host_port)}:{int(container_port)}"]
