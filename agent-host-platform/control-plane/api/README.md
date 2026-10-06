@@ -58,9 +58,9 @@ inside its own transaction. The canonical schema is
 curl -s -X POST localhost:3000/v1/agents/register \
   -H 'Content-Type: application/json' \
   -d '{"name":"ops","type":"cli","permissions":{
-    "deploy":true,"read_status":true,"read_logs":true,"restart":true,
-    "stop":true,"remove":true,"manage_domains":true,
-    "approve_deployments":true,"manage_secrets":true}}'
+    "deploy":true,"read_status":true,"restart":true,
+    "stop":true,"manage_domains":true,
+    "approve_deployments":true,"manage_secrets":true,"admin":true}}'
 # -> { agent: {...}, api_key: "uag_..." }   # save the key; it is never shown again
 export AGENT_KEY=uag_...
 ```
@@ -103,6 +103,10 @@ is 403. All failures use the PROTOCOL error shape:
 | GET | /health | none | `{ok, version, time}` |
 | POST | /agents/register | none | 201 `{agent, api_key}` (once); 409 dup name |
 | GET | /agents/me | agent | own row, no secret fields |
+| POST | /agents/me/rotate | agent | 200 `{api_key}` (once); old key dies immediately |
+| POST | /agents/:id/suspend | **operator** (`admin` permission or provisioning token) | `active → suspended`; self-suspend → 403 |
+| POST | /agents/:id/resume | **operator** | `suspended → active`; revoked agents cannot be resumed |
+| POST | /agents/:id/revoke | **operator** | `→ revoked`; key hash replaced — permanent; self-revoke → 403 |
 | POST | /tasks | agent | `deploy` perm required for type=deploy, else `read_status`; idempotency key supported; `mode=manual` → `awaiting_approval` |
 | GET | /tasks?status=&type=&host_id=&limit=&cursor= | agent+read_status | keyset pagination, `next_cursor` |
 | GET | /tasks/:id | agent+read_status | |
@@ -114,13 +118,17 @@ is 403. All failures use the PROTOCOL error shape:
 | POST | /hosts/:id/heartbeat | host (own id) | updates stats, sets online; `{host, pending_tasks}`; emits `host.online` on offline→online |
 | POST | /worker/tasks/claim?wait=N | host | atomic `FOR UPDATE SKIP LOCKED` claim; 204 if none; long-polls up to 30s |
 | POST | /worker/tasks/:id/progress | host (claiming host) | `{status, log_chunk?, result?, error?}`; state-machine validated; logs → `LOG_DIR/<id>.log` |
-| POST/GET | /projects, /projects/:id | agent | POST/PUT need `deploy`; PUT validates `configuration.name` vs project name (PROTOCOL §4) |
+| POST/GET | /projects, /projects/:id | agent | POST/PUT need `deploy`; PUT validates `configuration.name` vs project name (PROTOCOL §4); creating agent becomes `owner_agent_id` |
+| GET | /projects/:id/members | agent+read_status | project ACL membership |
+| POST | /projects/:id/members | agent+deploy | grant `{agent_id}` access |
+| DELETE | /projects/:id/members/:agent_id | agent+deploy | revoke access |
+| POST | /projects/:id/owner | **operator** | assign/reassign `owner_agent_id` (`{agent_id}`) |
 | PUT | /projects/:id | agent+deploy | manifest validation |
 | POST | /artifacts/init | agent+deploy | 201 `{artifact, upload_url}` |
 | PUT | /artifacts/:id/content | agent+deploy | octet-stream; verifies size + sha256 → 422 + `failed` on mismatch |
 | GET | /artifacts/:id, /artifacts?project_id= | agent+read_status | |
 | GET | /artifacts/:id/download | agent+read_status OR host | streams bytes |
-| POST | /deployments | agent+deploy | creates deployment + deploy task atomically; idempotency key dedupes both |
+| POST | /deployments | agent+deploy | creates deployment + deploy task atomically; idempotency key dedupes both; `host_id: null` = control plane selects the host (online, not draining, capabilities, CPU/RAM headroom, host ACL) — 503 `no_capacity` when no host is eligible; the row always carries a concrete `host_id` |
 | GET | /deployments?project_id=&host_id=&status= | agent+read_status | |
 | GET | /deployments/:id | agent+read_status | includes latest task |
 | POST | /deployments/:id/rollback | agent+deploy | new deployment of previous healthy version; `deployment.rolled_back` emitted on worker completion |
