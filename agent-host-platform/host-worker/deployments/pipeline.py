@@ -50,6 +50,7 @@ from typing import Optional
 from deployments.manifest import parse_memory_mb, validate_manifest
 from deployments import compose_validate
 from deployments import gc
+from deployments import rollback as rollback_mod
 from health import checker as health_checker
 from health import collector as health_collector
 
@@ -1091,7 +1092,6 @@ def deploy(ctx, task: dict) -> dict:
                     "cpu": resources.get("cpu"),
                     "memory": resources.get("memory"),
                 },
-                "volumes": manifest_data.get("volumes"),
                 "healthcheck": manifest_data.get("healthcheck"),
                 "domains": manifest_data.get("domains"),
                 "manifest": manifest_data,
@@ -1145,29 +1145,36 @@ def deploy(ctx, task: dict) -> dict:
             docker.stop(container_name)
             docker.rm(container_name, force=True)
         rolled_back_to = None
+        port_settle_record = None
         if action == "rollback_to_previous" and previous:
-            prev_name = previous.get("container_name")
-            prev_compose = previous.get("compose_project")
-            if prev_name:
-                log(f"restarting previous container {prev_name}")
-                docker.start(prev_name)
-            elif prev_compose:
-                prev_file = previous.get("compose_file")
-                if not prev_file or not os.path.isfile(prev_file):
-                    raise DeployError(
-                        f"healthcheck failed for {project_name} {version} and "
-                        f"the previous compose stack {prev_compose} cannot be "
-                        f"restored: its compose file "
-                        f"{prev_file!r} is missing (redeploy required)"
-                    )
-                log(f"restoring previous compose stack {prev_compose} "
-                    f"from {prev_file}")
-                docker.compose_up(prev_file, project_name=prev_compose, build=True)
-            prev_state = store.load(previous["deployment_id"]) or dict(previous)
-            prev_state["status"] = "running"
-            prev_state["health_status"] = "healthy"
-            store.save(prev_state)
-            rolled_back_to = previous["deployment_id"]
+            # Unified rollback (deployments.rollback): verify-target ->
+            # restore -> REAL health check -> commit state. The previous
+            # deployment's health_status comes from the health check —
+            # never assumed healthy just because its container restarted.
+            try:
+                outcome = rollback_mod.perform_rollback(
+                    ctx, docker, log=log, target=previous,
+                    healthcheck_timeout=int(
+                        payload.get("healthcheck_timeout", 120)))
+            except rollback_mod.RollbackError as exc:
+                raise DeployError(
+                    f"healthcheck failed for {project_name} {version} and "
+                    f"rollback to {previous.get('deployment_id')} failed: "
+                    f"{exc}"
+                ) from exc
+            rolled_back_to = outcome["rolled_back_to"]
+            # Port-reservation reconciliation with the control-plane
+            # registry (spec §3): after rollback, Docker/OS state ==
+            # deployment state == the port_allocations registry. A settle
+            # failure never fails the rollback — it is logged and
+            # recorded, not silently claimed.
+            settle = rollback_mod.settle_rollback_ports(
+                ctx, log, deployment_id, rolled_back_to)
+            port_settle_record = {"settled": settle["settled"],
+                                  "reason": settle.get("reason")}
+            if not settle["settled"]:
+                log(f"rollback port registry settle failed "
+                    f"({settle.get('reason')}); recorded, not fatal")
         store.save({
             "deployment_id": deployment_id,
             "task_id": task_id,
@@ -1190,7 +1197,6 @@ def deploy(ctx, task: dict) -> dict:
                 "cpu": resources.get("cpu"),
                 "memory": resources.get("memory"),
             },
-            "volumes": manifest_data.get("volumes"),
             "healthcheck": manifest_data.get("healthcheck"),
             "domains": manifest_data.get("domains"),
             "manifest": manifest_data,
@@ -1199,14 +1205,21 @@ def deploy(ctx, task: dict) -> dict:
             "status": "rolled_back" if rolled_back_to else "failed",
             "health_status": "unhealthy",
             "rollback_of": rolled_back_to,
+            # §3: port-registry settle outcome (None when no rollback ran);
+            # a failed settle is recorded here, never silently claimed.
+            "port_settle": port_settle_record,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
-        raise DeployError(
-            f"healthcheck failed for {project_name} {version} "
-            f"(GET :{host_port}{healthcheck_path} never returned 200); "
-            + (f"rolled back to deployment {rolled_back_to}"
-               if rolled_back_to else "no previous healthy deployment to roll back to")
-        )
+        err = (f"healthcheck failed for {project_name} {version} "
+               f"(GET :{host_port}{healthcheck_path} never returned 200); "
+               + (f"rolled back to deployment {rolled_back_to}"
+                  if rolled_back_to else "no previous healthy deployment "
+                  "to roll back to"))
+        if (rolled_back_to and port_settle_record
+                and not port_settle_record["settled"]):
+            err += (f"; port registry settle failed "
+                    f"({port_settle_record['reason']})")
+        raise DeployError(err)
     finally:
         release_port_reservations(reserved_ports)
         if resource_reserved:
