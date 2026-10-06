@@ -255,3 +255,41 @@ td .mono { color: var(--blue); }
 .modal-result { font-size: 13px; margin: 10px 0 0; }
 .modal-result.ok { color: var(--green); }
 .modal-result.err { color: var(--red); }
+
+/* ---------- panel controls (domains / logs pickers) ---------- */
+.panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 4px 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+select.ctl {
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  max-width: 420px;
+}
+select.ctl:focus { border-color: var(--accent); outline: none; }
+
+/* ---------- logs output ---------- */
+pre.logs {
+  background: #0a0d12;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 8px 0 4px;
+  max-height: 420px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+pre.logs:empty { display: none; }
