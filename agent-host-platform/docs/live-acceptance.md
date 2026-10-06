@@ -79,7 +79,7 @@ in parentheses.
 
 Full contract: `docs/CONFIG.md` and `control-plane/api/.env.example`.
 
-### 2b. Host worker (written to `/opt/agent-host/worker.env`, mode `0600`, by `install-host.sh`)
+### 2b. Host worker (written to `/opt/agent-host/config/worker.env`, mode `0600`, by `install-host.sh` — `DEFAULT_CONFIG_PATH` in `host-worker/agent/config.py`; override via `$WORKER_CONFIG`)
 
 | Variable | Required | Notes |
 |---|---|---|
@@ -549,3 +549,322 @@ When the smoke test and checklist are complete, record:
 
 File the record next to this doc (e.g.
 `docs/live-acceptance-YYYY-MM-DD.md`) so later runs can diff against it.
+
+---
+
+## 7. Part 6 — Live integration (NOT YET EXECUTED)
+
+> **Status: NOT YET EXECUTED.** None of the live-infrastructure steps
+> below has been run. Everything in §§1–6 above is the *code-complete*
+> procedure to run; this section is the Part 6 live-integration
+> execution plan and verification checklist, to be run once the
+> operator's real infrastructure exists. Until it is executed, the
+> system is **CODE COMPLETE only** — see §7.7.
+
+### 7.1 Part 6 architecture diagram (live path)
+
+```
+                ┌──────────────┐
+                │   Internet   │
+                └──────┬───────┘
+                       │  public HTTPS (tunnel mode only)
+                       ▼
+                ┌──────────────┐
+                │  Cloudflare  │  (zone + tunnel remote configuration)
+                └──────┬───────┘
+                       │  outbound tunnel connection
+                       ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │  Persistent Ubuntu host (behind NAT/firewall)              │
+ │                                                            │
+ │   cloudflared (supervised, outbound to Cloudflare)        │
+ │        │                                                   │
+ │        ▼                                                   │
+ │   Host worker (agent-host-worker.service)                  │
+ │   ── listens on NOTHING; all traffic is outbound ──        │
+ │        │  outbound HTTPS polling: heartbeat / claim /      │
+ │        │  progress / artifact download                     │
+ │        ▼                                                   │
+ │   Docker daemon ──► application containers                 │
+ └────────────────────────────────────────────────────────────┘
+                       │
+                       ▼  outbound HTTPS only
+                ┌──────────────┐
+                │ Control Plane│  HTTPS API
+                └──────┬───────┘
+                       │
+                       ▼
+                ┌──────────────┐
+                │ PostgreSQL / │  (Supabase, direct/session connection
+                │   Supabase   │   port 5432; migrations 001–012)
+                └──────────────┘
+```
+
+**Outbound-only fact (verified in code, NOT YET verified live):**
+`host-worker/agent/main.py` states the worker is outbound-only and
+"never listens on any port"; `host-worker/agent/api.py` states "never
+listens on a port; every method below opens an outbound HTTPS"
+connection. **The host worker does NOT require inbound SSH from the
+control plane and does NOT accept inbound connections from it; it
+operates entirely behind NAT/firewalls**, opening only outbound HTTPS
+to the control plane and (in tunnel mode) outbound tunnel traffic to
+Cloudflare. Migration `001_initial.sql` documents the same rule at the
+data layer: "no host IP addresses are stored anywhere — hosts are
+reached only through their own outbound connection to the control
+plane". The live proof (Step 3's `ss -tlnp | grep -c agent-host`
+expecting `0`) is NOT YET EXECUTED — see §7.7.
+
+### 7.2 Part 6A — Supabase / PostgreSQL (NOT YET EXECUTED)
+
+**Exact variable (verified):** `DATABASE_URL` — read by
+`control-plane/api/src/db/pool.ts:8` (`process.env.DATABASE_URL`) and
+required by `control-plane/api/src/lib/config.ts:64` (boot fails
+without it). It is also the connection string for the migration CLI
+(`control-plane/api/src/db/migrate-cli.ts:8`).
+
+**Migrations (verified by listing `database/migrations/`):** exactly
+twelve files, applied in order —
+
+`001_initial.sql`, `002_artifact_status.sql`,
+`003_events_notify.sql`, `004_phase3_reliability.sql`,
+`005_events_truncate_block.sql`, `006_token_rotation_grace.sql`,
+`007_domains_lifecycle.sql`, `008_task_queue_hardening.sql`,
+`009_heartbeat_enrichment.sql`, `010_registration_idempotency.sql`,
+`011_project_ownership_acls.sql`, `012_rollback_failed_status.sql`.
+
+No `013` exists. (Re-check `database/migrations/` at execution time
+and include any newer migration if one lands before you run.)
+
+**Tables to verify (verified via `CREATE TABLE` in the migration
+files):** `agents`, `hosts`, `tasks`, `projects`, `artifacts`,
+`deployments`, `events`, `secrets` (all in `001_initial.sql`);
+`port_allocations` (added by `004_phase3_reliability.sql`);
+`domains` (added by `007_domains_lifecycle.sql`);
+`project_members`, `agent_host_access`, `migration_reports` (added by
+`011_project_ownership_acls.sql`). Verify live with:
+
+```sql
+select count(*) from schema_migrations;            -- expect 12
+select table_name from information_schema.tables
+ where table_schema = 'public'
+   and table_name in ('projects','project_members','agent_host_access',
+                      'deployments','tasks','artifacts','domains',
+                      'secrets','events','hosts','port_allocations');
+```
+
+Only `001`'s `CREATE EXTENSION pgcrypto` needs elevation — apply it
+once as superuser (Supabase SQL editor). The remaining eleven
+migrations must be executed **as the actual non-superuser production
+role**. **Do NOT claim Supabase production readiness until the full
+001–012 chain has been executed successfully under that
+non-superuser role** — limitation 2 in §5 stands until then.
+(Connection shape: direct/session connection, port 5432 — the SSE
+event bus holds a persistent `LISTEN uag_events`, unsupported by
+transaction-mode poolers.)
+
+### 7.3 Part 6B — Control plane deploy (NOT YET EXECUTED)
+
+Requirements: Node.js, a PostgreSQL reachable via `DATABASE_URL`
+(Supabase direct/session), the §2a env vars (`DATABASE_URL`,
+`DATA_ENCRYPTION_KEY`, `UAHT_PROVISIONING_TOKEN` — boot refuses
+production without the last two), and HTTPS termination.
+
+**Health check (verified in code):** `GET /v1/health` is mounted at
+`control-plane/api/src/index.ts:80` with no auth required
+(`control-plane/api/src/routes/health.ts:6`). The handler returns
+HTTP 200 JSON:
+
+```json
+{"ok": true, "version": "<redacted>", "min_worker_version": "<redacted>", "time": "<redacted>"}
+```
+
+Verify `ok` is `true` and the version matches the deployed package
+before any worker is installed. (Same check as Step 1; the DB row
+count check belongs to §7.2.)
+
+### 7.4 Part 6C — Host worker on the persistent Ubuntu host (NOT YET EXECUTED)
+
+**Config variable names (verified against
+`host-worker/agent/config.py`, env prefix `WORKER_` stripped from the
+`/opt/agent-host/config/worker.env` file keys):**
+
+| Runtime name (worker.env) | Installer input | Notes |
+|---|---|---|
+| `WORKER_CONTROL_PLANE_URL` | `UAHT_CONTROL_PLANE_URL` | required; `https://…` |
+| `WORKER_HOST_NAME` | `UAHT_HOST_NAME` | required |
+| `WORKER_HOST_TOKEN` | provisioned by `POST /v1/hosts/register` | required; stored, never printed |
+| `WORKER_HOST_ID` | provisioned alongside the token | required |
+| `WORKER_TUNNEL_TOKEN` | `UAHT_TUNNEL_TOKEN` | tunnel ingress; passed to `cloudflared` via env, never argv |
+| `WORKER_INGRESS_ENABLED` | (`UAHT_INGRESS_ENABLED` install flag) | `1` enables tunnel supervision |
+| `WORKER_CAPABILITIES` | — | comma-separated, e.g. `docker,docker-compose,ingress` |
+| `WORKER_WORKER_VERSION` | — | reported in heartbeats (`main.py:220`) |
+| `WORKER_POLL_WAIT`, `WORKER_HEARTBEAT_INTERVAL` | — | claim long-poll + heartbeat cadence |
+| `WORKER_WORK_DIR`, `WORKER_APPS_DIR` | — | deployment state + app dirs |
+| `WORKER_DRAINING`, `WORKER_CRASH_LOOP_THRESHOLD`, `WORKER_CRASH_LOOP_WINDOW_S` | — | drain / crash-loop |
+
+**Install via the existing installer/systemd unit — no manual unit
+files.** The unit is `agent-host-worker.service`
+(`host-worker/agent/agent-host-worker.service`, `SERVICE_NAME="agent-host-worker"`
+in `scripts/install-host.sh:101`); the installer copies it to
+`/etc/systemd/system/agent-host-worker.service` and runs
+`systemctl enable --now agent-host-worker`.
+
+**Heartbeat verification (field names verified in code).** The worker
+posts every heartbeat to `POST /v1/hosts/{host_id}/heartbeat`
+(`host-worker/agent/api.py:158`); the server
+(`control-plane/api/src/routes/worker.ts:167–182`) sets
+`status = 'online'` (unless `draining`) and `last_seen = now()`,
+and stores `worker_version`, `capabilities`, `total_cpu`,
+`total_ram_mb` (the `hosts` row columns, returned by the list query
+at `worker.ts:248–251`). Verify live:
+
+```bash
+agent-host hosts list    # expect status=online, last_seen fresh
+```
+
+and against the DB:
+
+```sql
+select name, status, worker_version, capabilities,
+       total_cpu, total_ram_mb, last_seen
+  from hosts;
+```
+
+**Pass:** `status` is `online`, `last_seen` is within the heartbeat
+interval, and `worker_version`, `capabilities`, `total_cpu`,
+`total_ram_mb` are non-null from the worker's own report. The
+worker-side heartbeat payload builder is
+`enrich_heartbeat_payload` (`host-worker/agent/main.py:210`), and the
+claim long-poll the worker uses is
+`POST /v1/worker/tasks/claim?wait=` (`host-worker/agent/api.py:81`).
+
+### 7.5 Part 6D — Real deployment task flow (NOT YET EXECUTED)
+
+Each step below names the code path and the DB state that proves it
+happened. Run the flow via Steps 4–5 and query the DB between steps.
+
+1. **Agent POSTs deployment.** `POST /v1/deployments`
+   (`control-plane/api/src/routes/deployments.ts`) — validates the
+   payload/manifest and the fixed-port request; port collision → 409
+   before anything starts.
+2. **Validation.** Manifest is validated against PROTOCOL §4;
+   `volumes` in `agent.deploy.json` is rejected (compose is the
+   persistence path).
+3. **Scheduler selects host.** `selectHostForDeployment`
+   (`control-plane/api/src/lib/scheduler.ts:99`) picks an online,
+   non-draining host with matching capabilities — all inside the
+   caller's transaction (`scheduler.ts:99–115`).
+4. **Reservation.** Fixed-port reservations land in `port_allocations`
+   atomically with the deployment row
+   (`deployments.ts:226–290`); resource admission fails fast when the
+   request does not fit.
+5. **Deployment + task created.** `INSERT INTO deployments …` and
+   `INSERT INTO tasks …` with status `queued`
+   (`deployments.ts:259`, `deployments.ts:286`).
+6. **Worker claims.** Long-poll
+   `POST /v1/worker/tasks/claim?wait=` with Bearer `<redacted>` and
+   body `{host_id, capabilities}` (`api.py:81–92`); the server claim
+   is atomic (`FOR UPDATE SKIP LOCKED`, `worker.ts:297–328`) and
+   records the lease (`lease_expires_at = now() +
+   TASK_CLAIM_LEASE_S`, default 600s — `taskSweeper.ts:32`).
+7. **Artifact download + checksum.** The worker downloads the
+   artifact and re-verifies `sha256:<hex>` with a constant-time
+   compare before Docker ever runs
+   (`host-worker/deployments/pipeline.py:129–136`).
+8. **Docker build/run** on the host (Step 4).
+9. **Health check.** HTTP exact-200 on `127.0.0.1:<port>`, no
+   redirect following; failure triggers the unified automatic
+   rollback (Step 5).
+10. **Task completed → deployment running.** The worker posts progress
+    to `POST /v1/worker/tasks/:id/progress` (`api.py:184`); terminal
+    task state and `deployment.completed`/`running` are readable via
+    `agent-host deployments list` and the `events` journal.
+
+Verify each step in the DB, not just the CLI output:
+`deployments.status`, `tasks.status`, `port_allocations`, and the
+`events` rows (`deployment.requested`, `task.created`,
+`task.claimed`, `task.started`, `task.completed`,
+`deployment.completed`) form the audit trail.
+
+### 7.6 Part 6E — Failure test procedure: kill worker mid-deployment (NOT YET EXECUTED)
+
+Supplements Step 11 with DB-state assertions at every stage:
+
+```bash
+# 1. start a deploy (Step 4), then within ~5s on the host:
+sudo systemctl stop agent-host-worker        # worker dies mid-deployment
+sleep 700                                     # past TASK_CLAIM_LEASE_S (600s) + sweeper interval
+```
+
+**Pass conditions — verified against durable DB state, not logs:**
+
+- The task returns to `queued` after lease expiry: the sweeper
+  (`control-plane/api/src/lib/taskSweeper.ts`) requeues tasks whose
+  `lease_expires_at` has passed with no progress report.
+- The host flaps `online → offline/degraded → online`:
+  `HEARTBEAT_DEGRADED_AFTER_S` (90s) / `HEARTBEAT_OFFLINE_AFTER_S`
+  (300s) sweepers — query `hosts.status`, `hosts.last_seen`.
+- Restart the worker; it claims the requeued task and runs the full
+  pipeline to the **correct terminal state** — the same worker's boot
+  reconcile (`state.json` vs `docker ps`) must not leave a phantom
+  deployment behind.
+- `remove`/`rollback` tasks never auto-retry (by design); confirm no
+  retry rows/events were created for them.
+- Final assertion queries: `tasks.status` terminal,
+  `deployments.status` matches reality (`docker ps` on the host),
+  `events` shows the full chain including the sweep requeue. If the DB
+  and Docker disagree, the DB state wins only after the reconcile
+  report (`reconciliation` in the heartbeat payload, `main.py:285`)
+  is checked — otherwise the test fails.
+
+### 7.7 Part 6F — Cloudflare live test (NOT YET EXECUTED)
+
+Full chain (tunnel mode — the only mode that reaches this host; see
+§9 and `docs/cloudflare.md`):
+
+```
+Internet ──► Cloudflare (DNS + tunnel remote configuration)
+        ──► cloudflared (outbound, worker-supervised; token via env)
+        ──► host worker ingress routes ──► Docker container ──► /health
+```
+
+**The operator** performs this from an **external network** (not the
+host's own LAN), against a real domain
+(`app.example.com` in the operator's Cloudflare zone):
+
+1. DNS resolves `app.example.com` to Cloudflare.
+2. TLS terminates at Cloudflare (valid public certificate).
+3. Cloudflare routes through the tunnel — confirmed by the tunnel's
+   **remote** configuration (the local `config.yml` is a diagnostic
+   mirror only; `host-worker/ingress/__init__.py:13`).
+4. The tunnel reaches the worker's `cloudflared` process
+   (`host-worker/ingress/cloudflared.py`: supervised subprocess, token
+   via env, never argv, never logged).
+5. The worker's ingress routes the hostname to `127.0.0.1:<port>`.
+6. The container's `/health` returns HTTP 200 end-to-end:
+   `curl -s -o /dev/null -w '%{http_code}\n' https://app.example.com/health`
+   from the external network → `200`.
+
+**Do NOT claim public HTTPS until actually tested end-to-end from an
+external network.** (Prerequisite: the coordinator holds no Cloudflare
+API token, zone, or domain — §5 limitation 3.)
+
+### 7.8 CODE COMPLETE vs LIVE INFRASTRUCTURE VERIFIED
+
+| Area | Code complete | Live infrastructure verified |
+|---|---|---|
+| Migrations 001–012 chain | yes (local pg-mem / superuser CI) | **NOT YET** — needs real Postgres + non-superuser production role (§7.2) |
+| Control plane boot + `GET /v1/health` | yes (tests + contract checks) | **NOT YET** (§7.3) |
+| Worker install (systemd unit `agent-host-worker`) | yes (installer + unit file) | **NOT YET** (§7.4) |
+| Outbound-only host (zero listening sockets) | yes (code: `main.py`, `api.py`) | **NOT YET** (§7.1, Step 3) |
+| Heartbeat fields (`status`, `last_seen`, `worker_version`, `capabilities`, `total_cpu`, `total_ram_mb`) | yes (code + CI) | **NOT YET** (§7.4) |
+| Deploy pipeline (validation → scheduler → reservation → claim → checksum → Docker → health → completed) | yes (local + CI) | **NOT YET** (§7.5, Steps 4–5) |
+| Kill-worker failure test (lease expiry → requeue → reclaim → terminal state) | yes (logic + sweepers) | **NOT YET** (§7.6, Step 11) |
+| Cloudflare tunnel → public HTTPS from external network | yes (code + stubbed double) | **NOT YET** (§7.7, Step 9) |
+| Real Docker daemon, real systemd, real SQL (`FOR UPDATE SKIP LOCKED`, CHECK enforcement), real `cloudflared` | n/a (fakes only) | **NOT YET** (§5 limitation 4) |
+
+**Until every row in the right column is executed and recorded per §6,
+this document describes a code-complete system awaiting live
+acceptance — nothing in §7 has been run, and no live claim is made.**
+
+<!-- END of Part 6 live-integration section -->
