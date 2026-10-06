@@ -50,6 +50,9 @@ class FakeDockerClient:
     def ps(self, all=False):
         return list(self.ps_rows)
 
+    def compose_available(self):
+        return False
+
 
 class FakeAPI:
     pass
@@ -270,3 +273,123 @@ def test_collector_reports_reserved_separately_from_utilization(tmp_path):
     assert metrics["available_ram_mb"] == pytest.approx(
         metrics["total_ram_mb"] - 1024.0)
     assert metrics["available_disk_gb"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Spec §11: allocation is transactional — concurrent deploys cannot consume
+# the same capacity twice.
+# ---------------------------------------------------------------------------
+def test_concurrent_deploys_cannot_overcommit_resources(
+        tmp_path, monkeypatch, host_4cpu_16gb):
+    """Two simultaneous deploys each requesting 12GB on a 16GB host: exactly
+    one is admitted. The loser sees the winner's in-flight reservation
+    (not just persisted rows) and is rejected — no over-commit, no leak."""
+    import threading
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def _one(i):
+        barrier.wait(timeout=30)
+        try:
+            result = pipeline.deploy(
+                ctx, _deploy_task(f"race-app-{i}", f"dep-race-{i}", 1, "12g"))
+            outcomes[i] = ("admitted", result)
+        except pipeline.DeployError as exc:
+            outcomes[i] = ("rejected", str(exc))
+
+    threads = [threading.Thread(target=_one, args=(i,), daemon=True)
+               for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+        assert not t.is_alive(), "deploy thread hung"
+
+    admitted = [i for i, (k, _) in outcomes.items() if k == "admitted"]
+    rejected = [i for i, (k, _) in outcomes.items() if k == "rejected"]
+    assert len(admitted) == 1 and len(rejected) == 1, outcomes
+    assert "insufficient reservable memory" in outcomes[rejected[0]][1]
+
+    # No leaked reservation: the process-wide set is empty after both
+    # finished, and the winner's persisted row now carries the accounting —
+    # a third 12GB deploy is still rejected (store-based, not double).
+    assert pipeline.reserved_resources_snapshot() == {}
+    winner = ctx.deployment_store.load(f"dep-race-{admitted[0]}")
+    assert winner["status"] == "running"
+    assert collector.allocated_resources(
+        ctx.deployment_store)["ram_mb"] == 12288.0
+    with pytest.raises(pipeline.DeployError,
+                       match="insufficient reservable memory"):
+        pipeline.deploy(ctx, _deploy_task("race-app-2", "dep-race-2", 1, "12g"))
+    assert docker.run_calls and len(
+        [c for c in docker.run_calls]) == 1
+
+
+def test_failed_deploy_releases_its_reservation(
+        tmp_path, monkeypatch, host_4cpu_16gb):
+    """A deploy admitted and then failed (healthcheck) must not permanently
+    hold its reservation (spec §60): a retry afterwards fits again."""
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    calls = {"n": 0}
+
+    def _flaky(*a, **k):
+        calls["n"] += 1
+        return calls["n"] > 1  # first healthcheck fails, retry passes
+
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck", _flaky)
+    with pytest.raises(pipeline.DeployError, match="healthcheck failed"):
+        pipeline.deploy(ctx, _deploy_task("retry-app", "dep-retry-1", 1, "12g"))
+    assert pipeline.reserved_resources_snapshot() == {}
+
+    result = pipeline.deploy(
+        ctx, _deploy_task("retry-app", "dep-retry-2", 1, "12g"))
+    assert result["status"] == "running"
+    assert pipeline.reserved_resources_snapshot() == {}
+
+
+def test_rejected_admission_records_no_reservation(tmp_path, host_4cpu_16gb):
+    store = DeploymentStore(str(tmp_path))
+    with pytest.raises(pipeline.DeployError, match="insufficient reservable"):
+        pipeline.reserve_resources("dep-x", 99.0, 0.0, store)
+    with pytest.raises(pipeline.DeployError, match="insufficient reservable"):
+        pipeline.reserve_resources("dep-y", 0.0, 999999.0, store)
+    assert pipeline.reserved_resources_snapshot() == {}
+
+
+def test_reserve_and_release_roundtrip(tmp_path, host_4cpu_16gb):
+    store = DeploymentStore(str(tmp_path))
+    pipeline.reserve_resources("dep-a", 1.0, 4096.0, store)
+    assert pipeline.reserved_resources_snapshot() == {
+        "dep-a": {"cpu": 1.0, "ram_mb": 4096.0}}
+    # A second deploy sees the in-flight reservation, not just the store.
+    with pytest.raises(pipeline.DeployError, match="insufficient reservable"):
+        pipeline.reserve_resources("dep-b", 4.0, 16384.0, store)
+    pipeline.release_resource_reservation("dep-a")
+    assert pipeline.reserved_resources_snapshot() == {}
+    # Releasing a non-existent reservation is a safe no-op.
+    pipeline.release_resource_reservation("dep-a")
+
+
+def test_build_failure_after_admission_releases_reservation(
+        tmp_path, monkeypatch, host_4cpu_16gb):
+    """A §5 failure (here: compose requested but unavailable) happens after
+    the §3 resource reservation was taken: the reservation must be
+    released, not leaked for the life of the worker process."""
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    task = _deploy_task("compose-app", "dep-compose-1", 1, "4g")
+    task["payload"]["manifest"]["runtime"] = "docker-compose"
+    with pytest.raises(pipeline.DeployError, match="compose.*unavailable"):
+        pipeline.deploy(ctx, task)
+    assert pipeline.reserved_resources_snapshot() == {}
+    # and a later deploy is still admitted (capacity was not shrunk)
+    task2 = _deploy_task("ok-app", "dep-ok-1", 1, "4g")
+    result = pipeline.deploy(ctx, task2)
+    assert result["status"] == "running"
