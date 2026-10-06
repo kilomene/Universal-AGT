@@ -123,7 +123,9 @@ async function sweepOnce(pool: Pool, _cfg: TaskSweeperConfig): Promise<void> {
         actor_type: 'system',
         actor_id: 'task-sweeper',
         task_id: row.id,
-        host_id: row.assigned_to,
+        // §13: the host that lost the lease is claimed_by; assigned_to is
+        // the agent-requested pin (or null), not the claiming host.
+        host_id: row.claimed_by ?? row.assigned_to,
         payload: {
           previous_status: row.status,
           reason: row.status === 'retrying' ? 'retry_approved' : 'claim_lease_expired',
@@ -145,7 +147,9 @@ async function sweepOnce(pool: Pool, _cfg: TaskSweeperConfig): Promise<void> {
         actor_type: 'system',
         actor_id: 'task-sweeper',
         task_id: row.id,
-        host_id: row.assigned_to,
+        // §13: see the task.requeued event above — claimed_by is the host
+        // that lost the lease.
+        host_id: row.claimed_by ?? row.assigned_to,
         payload: { reason, attempts: attemptsAfter },
       });
       logger.warn('task failed by sweeper (lease expired, no retry)', {
