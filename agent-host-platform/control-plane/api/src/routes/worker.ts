@@ -584,6 +584,59 @@ async function mirrorDeploymentState(
     }
     if (changed && task.type === 'deploy' && !isRollbackTask && nextStatus === 'completed') {
       await releaseSupersededPortAllocations(client, deployment.project_id, deployment.host_id, deploymentId);
+      // Issue #2: the worker stopped the previous deployment's container
+      // and marked it superseded locally — mirror that here, in the same
+      // transaction that marked the new deployment running. Without this,
+      // the old row stays `running` and its reservation keeps counting
+      // against the host forever (the persistent-reservation leak).
+      // `superseded` releases the reservation but preserves the row as a
+      // rollback target.
+      const supRows = (
+        await client.query(
+          `UPDATE deployments SET status = 'superseded'
+           WHERE project_id = $1 AND host_id = $2 AND id <> $3 AND status = 'running'
+           RETURNING id`,
+          [deployment.project_id, deployment.host_id, deploymentId],
+        )
+      ).rows;
+      if (supRows.length > 0 && depEvent) {
+        (depEvent.payload as Record<string, unknown>).superseded_deployment_ids = supRows.map(
+          (r: { id: string }) => r.id,
+        );
+      }
+    }
+    if (
+      changed &&
+      isRollbackTask &&
+      nextStatus === 'completed' &&
+      depStatus === 'rolled_back'
+    ) {
+      // Successful rollback: the restored target serves again — move it
+      // back to `running` so its reservation is held again and the control
+      // plane agrees with the worker. The target is the control plane's
+      // own choice from task creation (payload.target_deployment_id),
+      // falling back to the worker's report (rolled_back_to) for
+      // hand-built tasks that omit it. Either way the id is guarded to
+      // the same project+host and only a `superseded` row is eligible, so
+      // a confused/malicious report cannot flip arbitrary deployments.
+      const payloadTarget =
+        typeof payload.target_deployment_id === 'string' && payload.target_deployment_id
+          ? payload.target_deployment_id
+          : null;
+      const reportedTarget =
+        reportedResult && typeof reportedResult === 'object'
+          ? (reportedResult as Record<string, unknown>).rolled_back_to
+          : null;
+      const restoreId =
+        payloadTarget ??
+        (typeof reportedTarget === 'string' && reportedTarget ? reportedTarget : null);
+      if (restoreId) {
+        await client.query(
+          `UPDATE deployments SET status = 'running', health_status = 'healthy'
+           WHERE id = $1 AND project_id = $2 AND host_id = $3 AND status = 'superseded'`,
+          [restoreId, deployment.project_id, deployment.host_id],
+        );
+      }
     }
     await client.query('COMMIT');
 
@@ -799,7 +852,7 @@ workerRouter.get('/domains', requireHost, async (req, res, next) => {
          AND d.status = 'active'
          AND d.ingress = 'tunnel'
          AND NOT (dep.status = ANY($2))`,
-      [req.auth!.id, ['failed', 'rolled_back', 'stopped', 'stopping']],
+      [req.auth!.id, ['failed', 'rolled_back', 'stopped', 'stopping', 'superseded']],
     );
     res.json({
       domains: rows.map((r) => ({
