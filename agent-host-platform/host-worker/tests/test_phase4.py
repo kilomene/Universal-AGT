@@ -417,11 +417,13 @@ def test_compose_rollback_tears_down_new_and_restores_previous(
                                               "art-v1", sum_v1))
     v1_state = ctx.deployment_store.load("cdep-v1")
     assert v1_state["status"] == "running"
-    assert v1_state["compose_project"] == "uaht-capp"
+    # §18: compose project names carry the project_id suffix for isolation
+    # ("proj-capp" -> "projcapp").
+    assert v1_state["compose_project"] == "uaht-capp-projcapp"
     assert v1_state["container_name"] is None
     assert v1_state["compose_file"] and Path(v1_state["compose_file"]).is_file()
     v1_file = v1_state["compose_file"]
-    assert docker.compose_up_calls[-1][1] == "uaht-capp"
+    assert docker.compose_up_calls[-1][1] == "uaht-capp-projcapp"
 
     # v2 deploy with a failing healthcheck
     art_v2 = _compose_artifact("capp")
@@ -434,16 +436,16 @@ def test_compose_rollback_tears_down_new_and_restores_previous(
 
     # the NEW unhealthy stack was torn down via compose down ...
     down_projects = [p for _f, p in docker.compose_down_calls]
-    assert "uaht-capp" in down_projects
+    assert "uaht-capp-projcapp" in down_projects
     # ... and the PREVIOUS stack was restored via compose up with v1's file
-    assert docker.compose_up_calls[-1] == (v1_file, "uaht-capp", True)
+    assert docker.compose_up_calls[-1] == (v1_file, "uaht-capp-projcapp", True)
 
     v2_state = ctx.deployment_store.load("cdep-v2")
     assert v2_state["status"] == "rolled_back"
     assert v2_state["rollback_of"] == "cdep-v1"
     assert ctx.deployment_store.load("cdep-v1")["status"] == "running"
     # the restored stack is live in the fake
-    assert "uaht-capp" in docker.compose_projects
+    assert "uaht-capp-projcapp" in docker.compose_projects
 
 
 def test_compose_rollback_without_previous_fails_clean(tmp_path, monkeypatch):
