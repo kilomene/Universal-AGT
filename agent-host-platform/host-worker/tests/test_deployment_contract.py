@@ -125,7 +125,9 @@ CONTRACT_MANIFEST = {
     "resources": {"memory": "1g", "cpu": 2},   # non-default limits
     "restart": "on-failure",                   # non-default policy (the bug)
     "env": {"APP_MODE": "contract", "LOG_LEVEL": "debug"},
-    "volumes": ["contract-data:/data"],
+    # NOTE (WS3, spec §6): manifest-level `volumes` is REJECTED by
+    # validate_manifest — persistent storage lives in the compose file for
+    # docker-compose runtimes, never in agent.deploy.json.
     "healthcheck": {"path": "/ready", "interval": "30s"},
     "domains": ["contract.example.com"],
 }
@@ -163,7 +165,8 @@ def _assert_contract(state, host_port):
     assert state["container_port"] == 8080
     assert state["ports"] == {str(host_port): 8080}
     assert state["healthcheck_path"] == "/ready"
-    assert state["volumes"] == ["contract-data:/data"]
+    # volumes: rejected by manifest validation (spec §6), never persisted
+    assert "volumes" not in state
     assert state["healthcheck"] == {"path": "/ready", "interval": "30s"}
     assert state["domains"] == ["contract.example.com"]
     assert state["manifest"]["restart"] == "on-failure"
@@ -301,7 +304,7 @@ def test_run_spec_from_state_falls_back_for_pre_contract_states():
 
 # ---------------------------------------------------------------------------
 # Spec §14: env updates must not silently change restart policy, CPU,
-# memory, port, volumes, image, healthcheck, domain, ingress or identity.
+# memory, port, image, healthcheck, domain, ingress or identity.
 # The spec's explicit case: restart=always survives an env update.
 # ---------------------------------------------------------------------------
 def test_environment_update_preserves_restart_always(tmp_path, monkeypatch):
@@ -360,3 +363,24 @@ def test_deploy_persists_artifact_id(tmp_path, monkeypatch):
     assert result["status"] == "running"
     state = ctx.deployment_store.load("dep-contract-1")
     assert state["artifact_id"] == "art-123"
+
+
+# ---------------------------------------------------------------------------
+# Spec §6 (WS3, Option B): a manifest carrying `volumes` fails the deploy
+# fast — before any build or docker interaction — with a clear error.
+# ---------------------------------------------------------------------------
+def test_deploy_rejects_manifest_volumes_before_any_docker_call(
+        tmp_path, monkeypatch):
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    manifest = dict(CONTRACT_MANIFEST)
+    manifest["volumes"] = ["contract-data:/data"]
+    task = _deploy_task()
+    task["payload"]["manifest"] = manifest
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    with pytest.raises(pipeline.DeployError, match="volumes"):
+        pipeline.deploy(ctx, task)
+    # rejected before any docker interaction
+    assert docker.run_calls == []
+    assert ctx.deployment_store.load("dep-contract-1") is None
