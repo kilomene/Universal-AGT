@@ -263,14 +263,12 @@ def test_deploy_helper_resolves_names_and_waits():
     assert task["status"] == "completed"
     assert deployment["status"] == "running"
     dep_body = next(c[2]["json"] for c in calls if c[1].endswith("/v1/deployments") and c[0] == "POST")
+    # None-valued options are omitted from the wire body (the API rejects
+    # explicit nulls for mode/idempotency_key/host_port).
     assert dep_body == {
         "project_id": "p-1",
         "version": "1.0.0",
         "host_id": "h-1",
-        "artifact_id": None,
-        "mode": None,
-        "idempotency_key": None,
-        "host_port": None,
     }
 
 
@@ -384,9 +382,8 @@ def test_get_logs_creates_task_and_polls_to_terminal():
     assert logs == "line1\nline2\n"
     method, url, kwargs = fake_request.calls[0]
     assert method == "POST" and url.endswith("/v1/tasks")
-    assert kwargs["json"] == {"type": "logs", "payload": {"deployment_id": "d-1"},
-                              "idempotency_key": None, "priority": None,
-                              "host_id": None, "mode": None}
+    # None-valued options are omitted from the wire body.
+    assert kwargs["json"] == {"type": "logs", "payload": {"deployment_id": "d-1"}}
 
 
 def test_get_logs_polls_existing_task_id():
