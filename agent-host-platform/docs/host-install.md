@@ -156,12 +156,12 @@ From the control plane side (agent API key):
 
 ```bash
 curl -s https://control-plane.example.com/v1/hosts \
-  -H "Authorization: Bearer $UAGT_API_KEY" | python3 -m json.tool
+  -H "Authorization: Bearer $UAHT_API_KEY" | python3 -m json.tool
 # expect persistent-host-01 with recent last_seen and cpu/ram/disk stats
 
 # End-to-end: ask the worker to report in
 curl -s -X POST https://control-plane.example.com/v1/tasks \
-  -H "Authorization: Bearer $UAGT_API_KEY" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $UAHT_API_KEY" -H 'Content-Type: application/json' \
   -d '{"type": "system-info", "payload": {}, "host_id": "<host uuid>"}'
 # then: GET /v1/tasks/:id → result {cpu, ram, disk, docker, ...}
 ```
