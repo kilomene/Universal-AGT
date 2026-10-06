@@ -1,7 +1,8 @@
 """agent-host CLI — talks to the control plane only, never to host IPs.
 
-Configuration via env vars (UAHT_BASE_URL, UAHT_API_KEY) or the
---base-url / --api-key flags.
+Configuration via env vars (UAHT_BASE_URL, UAHT_API_KEY,
+UAHT_PROVISIONING_TOKEN) or the --base-url / --api-key /
+--provisioning-token flags.
 """
 
 from __future__ import annotations
@@ -9,18 +10,48 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+from pathlib import Path
 
 from uaht_sdk import UahtClient, UahtError
 
 
-def _client(args) -> UahtClient:
+def _cli_version():
+    """§61: the CLI version has a single source of truth — the installed
+    distribution metadata (pyproject.toml "version"), served by --version.
+    When running from a bare source tree (not installed), fall back to
+    reading the version out of the source tree's pyproject.toml so the
+    output still matches the packaged version instead of a stale literal.
+    """
+    try:
+        return _pkg_version("agent-host-cli")
+    except PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
+        try:
+            text = pyproject.read_text()
+        except OSError:
+            return "0.0.0-dev"
+        m = re.search(r'^version = "([^"]+)"', text, re.M)
+        return m.group(1) if m else "0.0.0-dev"
+
+
+__version__ = _cli_version()
+
+
+def _provisioning_token(args):
+    return args.provisioning_token or os.environ.get("UAHT_PROVISIONING_TOKEN")
+
+
+def _client(args, require_key=True) -> UahtClient:
     base_url = args.base_url or os.environ.get("UAHT_BASE_URL")
     api_key = args.api_key or os.environ.get("UAHT_API_KEY")
     if not base_url:
         raise SystemExit("error: control plane base URL required — set UAHT_BASE_URL or pass --base-url")
-    if not api_key:
+    if require_key and not api_key:
         raise SystemExit("error: agent API key required — set UAHT_API_KEY or pass --api-key")
     return UahtClient(base_url=base_url, api_key=api_key)
 
@@ -59,16 +90,42 @@ def _row(resp, key):
 # -- commands ----------------------------------------------------------
 
 def cmd_hosts(args):
-    c = _client(args)
-    hosts = c.list_hosts()
-    rows = hosts.get("hosts", []) if isinstance(hosts, dict) else hosts
-    _emit(args, [{"id": h.get("id"), "name": h.get("name"), "status": h.get("status"),
-                  "worker_version": h.get("worker_version")} for h in rows])
+    # register works with a provisioning token alone (no agent key needed)
+    c = _client(args, require_key=args.action != "register")
+    if args.action == "register":
+        # Auth: an agent key with `deploy`, or the provisioning token via
+        # --provisioning-token / UAHT_PROVISIONING_TOKEN.
+        if not args.name:
+            raise SystemExit("error: hosts register requires --name")
+        capabilities = [s.strip() for s in args.capabilities.split(",") if s.strip()] if args.capabilities else None
+        resp = c.register_host(
+            name=args.name,
+            host_type=args.host_type,
+            capabilities=capabilities,
+            worker_version=args.worker_version,
+            provisioning_token=_provisioning_token(args),
+        )
+        host = resp.get("host", {}) if isinstance(resp, dict) else {}
+        row = dict(host) if isinstance(host, dict) else {}
+        row["host_token"] = resp.get("host_token") if isinstance(resp, dict) else None
+        _emit(args, row)
+    elif args.action == "get":
+        if not args.host:
+            raise SystemExit("error: hosts get requires --host <name-or-id>")
+        host_id = _resolve_host_id(c, args.host)
+        _emit(args, c.get_host(host_id))
+    else:  # list
+        hosts = c.list_hosts()
+        rows = hosts.get("hosts", []) if isinstance(hosts, dict) else hosts
+        _emit(args, [{"id": h.get("id"), "name": h.get("name"), "status": h.get("status"),
+                      "worker_version": h.get("worker_version")} for h in rows])
 
 
 def cmd_apps(args):
     c = _client(args)
-    services = c.list_services(host_id=args.host)
+    # GET /v1/services requires host_id to be a UUID; resolve a name first.
+    host_id = _resolve_host_id(c, args.host) if args.host else None
+    services = c.list_services(host_id=host_id)
     rows = services.get("services", []) if isinstance(services, dict) else services
     _emit(args, [{"id": s.get("id"), "deployment": s.get("deployment_id"), "project": s.get("project_id"),
                   "host": s.get("host_id"), "status": s.get("status"),
@@ -195,10 +252,22 @@ def cmd_rollback(args):
 
 def cmd_domains(args):
     c = _client(args)
+    if args.action == "get":
+        if not args.hostname:
+            raise SystemExit("error: domains get requires --hostname")
+        resp = c.get_domain(args.hostname)
+        _emit(args, resp.get("domain", resp) if isinstance(resp, dict) else resp)
+        return
+    if not args.deployment:
+        raise SystemExit(f"error: domains {args.action} requires --deployment")
     if args.action == "add":
+        if not args.hostname:
+            raise SystemExit("error: domains add requires --hostname")
         _emit(args, c.add_domain(args.deployment, args.hostname,
                                  ingress=args.ingress))
     elif args.action == "rm":
+        if not args.hostname:
+            raise SystemExit("error: domains rm requires --hostname")
         _emit(args, c.remove_domain(args.deployment, args.hostname))
     else:
         domains = c.list_domains(args.deployment)
@@ -209,6 +278,12 @@ def cmd_domains(args):
 
 def cmd_tasks(args):
     c = _client(args)
+    if args.action == "status":
+        if not args.task:
+            raise SystemExit("error: tasks status requires --task <id>")
+        resp = c.get_task(args.task)
+        _emit(args, resp.get("task", resp) if isinstance(resp, dict) else resp)
+        return
     tasks = c.list_tasks(status=args.status)
     rows = tasks.get("tasks", []) if isinstance(tasks, dict) else tasks
     _emit(args, [{"id": t.get("id"), "type": t.get("type"), "status": t.get("status"),
@@ -256,8 +331,11 @@ def _parse_permissions(value):
 
 
 def cmd_agents(args):
-    c = _client(args)
     if args.action == "register":
+        # Registration is gated on the provisioning token, NOT an agent
+        # key — it runs before any key exists.
+        prov = _provisioning_token(args)
+        c = _client(args, require_key=False)
         if not args.name:
             raise SystemExit("error: agents register requires --name")
         capabilities = [s.strip() for s in args.capabilities.split(",") if s.strip()] if args.capabilities else None
@@ -266,12 +344,18 @@ def cmd_agents(args):
             type=args.type,
             capabilities=capabilities,
             permissions=_parse_permissions(args.permissions),
+            provisioning_token=prov,
         )
         agent = resp.get("agent", {}) if isinstance(resp, dict) else {}
         row = dict(agent) if isinstance(agent, dict) else {}
         row["api_key"] = resp.get("api_key") if isinstance(resp, dict) else None
         _emit(args, row)
+    elif args.action == "rotate":
+        c = _client(args)
+        resp = c.rotate_agent_key()
+        _emit(args, resp if isinstance(resp, dict) else {"result": resp})
     else:  # me
+        c = _client(args)
         resp = c.me()
         _emit(args, resp.get("agent", resp) if isinstance(resp, dict) else resp)
 
@@ -368,10 +452,21 @@ def build_parser():
     )
     p.add_argument("--base-url", default=None, help="control plane base URL (or UAHT_BASE_URL)")
     p.add_argument("--api-key", default=None, help="agent API key (or UAHT_API_KEY)")
+    p.add_argument("--provisioning-token", default=None,
+                   help="provisioning token for agents/hosts registration (or UAHT_PROVISIONING_TOKEN)")
     p.add_argument("--json", action="store_true", help="emit JSON instead of tables")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("hosts", help="list persistent hosts")
+    h = sub.add_parser("hosts", help="list, register, or inspect persistent hosts")
+    h.add_argument("action", nargs="?", default="list", choices=["list", "register", "get"],
+                   help="list hosts (default), register a new host, or get one host")
+    h.add_argument("--host", default=None, help="host name or id (get)")
+    h.add_argument("--name", default=None, help="host name (register)")
+    h.add_argument("--host-type", default=None, help="host type label (register)")
+    h.add_argument("--capabilities", default=None,
+                   help="comma-separated capabilities, e.g. docker,compose (register)")
+    h.add_argument("--worker-version", default=None, help="worker version string (register)")
 
     a = sub.add_parser("apps", help="list running services (deployments)")
     a.add_argument("--host", default=None, help="filter by host name or id")
@@ -406,24 +501,27 @@ def build_parser():
     r.add_argument("--deployment", required=True, help="deployment id")
 
     d = sub.add_parser("domains", help="manage public hostnames for a deployment (optional Cloudflare DNS)")
-    d.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm"],
-                   help="list domains (default), add one, or remove one")
-    d.add_argument("--deployment", required=True, help="deployment id")
-    d.add_argument("--hostname", default=None, help="hostname for add/rm")
+    d.add_argument("action", nargs="?", default="list", choices=["list", "get", "add", "rm"],
+                   help="list domains (default), get one, add one, or remove one")
+    d.add_argument("--deployment", required=False, default=None, help="deployment id (list/add/rm)")
+    d.add_argument("--hostname", default=None, help="hostname for get/add/rm")
     d.add_argument("--ingress", default=None, choices=["tunnel", "direct"],
                    help="ingress mode for add (default: tunnel when "
                         "TUNNEL_INGRESS_HOSTNAME is set on the control plane, "
                         "else direct)")
 
-    t = sub.add_parser("tasks", help="list tasks in the durable queue")
-    t.add_argument("--status", default=None, help="filter by task status")
+    t = sub.add_parser("tasks", help="list tasks in the durable queue or show one")
+    t.add_argument("action", nargs="?", default="list", choices=["list", "status"],
+                   help="list tasks (default) or show one task's status")
+    t.add_argument("--status", default=None, help="filter by task status (list)")
+    t.add_argument("--task", default=None, help="task id (status)")
 
     e = sub.add_parser("events", help="show the append-only event journal")
     e.add_argument("--follow", action="store_true", help="follow the live SSE stream")
 
-    ag = sub.add_parser("agents", help="register an agent or show your own agent row")
-    ag.add_argument("action", nargs="?", default="me", choices=["register", "me"],
-                    help="register a new agent (default shows your own row)")
+    ag = sub.add_parser("agents", help="register an agent, rotate your key, or show your own agent row")
+    ag.add_argument("action", nargs="?", default="me", choices=["register", "me", "rotate"],
+                    help="register a new agent, rotate your own API key (default shows your own row)")
     ag.add_argument("--name", default=None, help="agent name (register)")
     ag.add_argument("--type", default=None, help="agent type label, e.g. ci, human (register)")
     ag.add_argument("--capabilities", default=None,
