@@ -13,6 +13,8 @@
  *   (lib/scheduler.ts) / normalize_resources (worker).
  */
 
+import { normalizeResources } from './scheduler';
+
 export const MANIFEST_RUNTIMES = ['docker', 'docker-compose', 'static'] as const;
 export const MANIFEST_RESTART_POLICIES = ['no', 'always', 'unless-stopped', 'on-failure'] as const;
 /** Single memory grammar shared by validation and normalization. */
@@ -154,4 +156,53 @@ export function validateManifest(manifest: unknown, projectName?: string): strin
   }
 
   return errors;
+}
+
+/**
+ * The scheduling-relevant contract of a manifest: identity (name, runtime)
+ * plus the normalized resources and capability list the scheduler consumes.
+ * Two manifests "agree" when the scheduler would derive the same
+ * reservation from either — this is the comparison the artifact
+ * finalization uses to prove the uploaded tarball matches the manifest
+ * registered at init (Fix #1 follow-up).
+ */
+export interface ManifestContract {
+  name: string | null;
+  runtime: string | null;
+  cpu: number | null;
+  ram_mb: number | null;
+  capabilities: string[];
+}
+
+export function manifestContractOf(manifest: unknown): ManifestContract {
+  const m = (manifest ?? {}) as Record<string, unknown>;
+  const { cpu, ram_mb } = normalizeResources(
+    (m as { resources?: unknown }).resources,
+  );
+  const caps = Array.isArray(m.capabilities)
+    ? (m.capabilities as unknown[])
+        .filter((c): c is string => typeof c === 'string')
+        .sort()
+    : [];
+  return {
+    name: typeof m.name === 'string' ? m.name : null,
+    runtime: typeof m.runtime === 'string' ? m.runtime : null,
+    cpu,
+    ram_mb,
+    capabilities: caps,
+  };
+}
+
+/** True when both manifests describe the same scheduling contract. */
+export function manifestContractsEqual(a: unknown, b: unknown): boolean {
+  const ca = manifestContractOf(a);
+  const cb = manifestContractOf(b);
+  return (
+    ca.name === cb.name &&
+    ca.runtime === cb.runtime &&
+    ca.cpu === cb.cpu &&
+    ca.ram_mb === cb.ram_mb &&
+    ca.capabilities.length === cb.capabilities.length &&
+    ca.capabilities.every((c, i) => c === cb.capabilities[i])
+  );
 }
