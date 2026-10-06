@@ -18,6 +18,13 @@ Startup:
      outbound-only) and sync tunnel routes after deploys/removes that
      carry domains
 
+Draining (§37): when the control plane advertises host.status=draining on
+a heartbeat response — or WORKER_DRAINING=true is configured locally —
+the claim loop stops claiming NEW tasks while heartbeats continue and
+in-flight dispatches finish. The drain state rides on every heartbeat
+payload (worker_status/draining) so the operator can watch running_apps
+drain to zero before replacing the host.
+
 The worker is OUTBOUND ONLY: it opens HTTPS connections to the control
 plane and never listens on any port. SIGTERM/SIGINT shut it down cleanly.
 """
@@ -86,6 +93,9 @@ def run_self_check(config: WorkerConfig) -> tuple[bool, dict]:
         report["ok"] = False
         return False, report
     checks["config"] = "ok"
+    checks["draining"] = ("draining (WORKER_DRAINING=true): "
+                          "no new tasks will be claimed"
+                          if config.draining else "ok (accepting work)")
     try:
         from deployments.state import DeploymentStore
         store = DeploymentStore(config.work_dir)
@@ -150,6 +160,76 @@ def detect_capabilities(docker) -> list:
     return caps
 
 
+def claims_paused(ctx: WorkerContext) -> bool:
+    """True when this worker must not claim NEW tasks.
+
+    Draining (§37) = operator-set at the control plane (advertised on the
+    heartbeat response, latched in ctx.draining) OR locally configured via
+    WORKER_DRAINING=true (config.draining, sticky). In-flight dispatches
+    are unaffected either way — they always run to completion.
+    """
+    return bool(getattr(ctx.config, "draining", False) or ctx.draining.is_set())
+
+
+def apply_server_state(ctx: WorkerContext, resp: dict | None) -> None:
+    """Latch control-plane-advertised host state from a heartbeat response.
+
+    The response carries the host row including `status`. An operator-set
+    `draining` status (never auto-flipped server-side) pauses new task
+    claims on this worker; when the operator clears draining server-side,
+    the next heartbeat resumes claiming. A locally configured
+    WORKER_DRAINING=true is sticky and is NOT cleared by this function.
+    Malformed/absent responses are ignored (fail-open: keep current state).
+    Also surfaces the control plane's worker_outdated signal (our reported
+    worker_version is below the plane's minimum): logged loudly once per
+    occurrence so the operator knows to update the worker.
+    """
+    resp = resp or {}
+    if resp.get("worker_outdated"):
+        if not getattr(ctx, "_outdated_warned", False):
+            ctx._outdated_warned = True
+            LOG.warning("control plane reports this worker is OUTDATED "
+                        "(worker_outdated): update the host worker to the "
+                        "minimum supported version")
+    else:
+        ctx._outdated_warned = False
+    host = resp.get("host") or {}
+    status = host.get("status")
+    if not isinstance(status, str):
+        return
+    if status == "draining":
+        if not ctx.draining.is_set():
+            ctx.draining.set()
+            LOG.warning("control plane reports host status=draining: "
+                        "no new tasks will be claimed; in-flight work finishes")
+    elif ctx.draining.is_set():
+        ctx.draining.clear()
+        LOG.info("control plane cleared draining state: resuming task claims")
+
+
+def enrich_heartbeat_payload(ctx: WorkerContext, payload: dict) -> dict:
+    """Add the §9 identity/status fields to the heartbeat payload.
+
+    host_id rides in the heartbeat URL; the name, worker status,
+    capabilities and ingress descriptor ride here. NEVER secrets: the
+    host token and the tunnel token are deliberately absent.
+    """
+    config = ctx.config
+    draining = claims_paused(ctx)
+    payload["host_name"] = config.host_name
+    payload["worker_version"] = getattr(config, "worker_version", "0.1.0")
+    payload["worker_status"] = "draining" if draining else "running"
+    payload["draining"] = draining
+    payload["capabilities"] = list(config.capabilities or [])
+    # getattr: WorkerContext.config is duck-typed (see context.py); test
+    # harnesses and older callers may not carry the ingress fields.
+    payload["ingress"] = {
+        "enabled": bool(getattr(config, "ingress_enabled", False)),
+        "provider": getattr(config, "ingress_provider", "") or "",
+    }
+    return payload
+
+
 def build_context(config: WorkerConfig) -> WorkerContext:
     for sub in ("logs", "deployments", "artifacts", "builds",
                 "updates", "releases", "quarantine"):
@@ -212,8 +292,13 @@ def heartbeat_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
             )
             if issues:
                 payload["issues"] = issues
+            # §9 identity/status envelope (no secrets); the one-shot
+            # reconciliation summary and crash-loop issues above ride along.
+            enrich_heartbeat_payload(ctx, payload)
             resp = api.heartbeat(config.host_id, payload)
             failures = 0
+            # §37: latch operator-set draining advertised on the response.
+            apply_server_state(ctx, resp)
             LOG.info("heartbeat ok (pending_tasks=%s)",
                      (resp or {}).get("pending_tasks"))
             try:
@@ -248,9 +333,21 @@ def claim_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
     api = ctx.api
     dispatcher = TaskDispatcher(ctx, api)
     failures = 0
+    drain_notice_logged = False
     with ThreadPoolExecutor(max_workers=MAX_DISPATCH_WORKERS,
                             thread_name_prefix="dispatch") as pool:
         while not stop_event.is_set():
+            # §37: a draining host stops receiving NEW work. In-flight
+            # dispatches already submitted to the pool run to completion;
+            # heartbeats (with draining=true) continue in the other thread.
+            if claims_paused(ctx):
+                if not drain_notice_logged:
+                    LOG.warning("draining: not claiming new tasks "
+                                "(in-flight work continues)")
+                    drain_notice_logged = True
+                stop_event.wait(config.poll_wait)
+                continue
+            drain_notice_logged = False
             try:
                 task = api.claim_task(config.host_id, config.capabilities,
                                       config.poll_wait)
@@ -314,6 +411,10 @@ def main(argv=None) -> int:
              {k: v for k, v in config.redacted().items() if k != "host_token"})
 
     ctx = build_context(config)
+
+    if config.draining:
+        LOG.warning("starting with WORKER_DRAINING=true: in-flight work "
+                    "will finish but no new tasks will be claimed")
 
     # Public ingress (Phase 7): optional, disabled by default. When enabled,
     # start the configured provider (e.g. a supervised cloudflared tunnel —
