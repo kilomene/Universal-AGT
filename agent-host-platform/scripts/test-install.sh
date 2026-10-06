@@ -166,7 +166,7 @@ check_present() { # $1=description $2=fixed string
 }
 check_present "set -euo pipefail" "set -euo pipefail"
 check_present "Linux gate" 'uname -s'
-check_present "python >= 3.10 gate" "3, 10"
+check_present "python >= 3.12 gate" "3, 12"
 check_present "docker daemon validation" "docker info"
 check_present "requirements.txt pip fallback" "requirements.txt"
 check_present "worker --self-check gate" "--self-check"
