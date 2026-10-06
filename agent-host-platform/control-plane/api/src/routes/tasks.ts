@@ -9,6 +9,14 @@ import { logger } from '../lib/log';
 import { releasePortAllocations } from '../lib/ports';
 import { canTransitionTask, isTaskStatus } from '../lib/stateMachine';
 import { requireAgent, requirePermission } from '../middleware/auth';
+import {
+  authorizeDeploymentAccess,
+  authorizeHostAccess,
+  authorizeTaskAccess,
+  canAccessTask,
+  inList,
+  listAccessibleProjectIds,
+} from '../lib/authz';
 import { decodeCursor, encodeCursor, isUuid, parseLimit } from './_helpers';
 import { failDomainsForDeployment } from './domains';
 
@@ -139,11 +147,21 @@ tasksRouter.post('/', requireAgent, async (req, res, next) => {
         sendError(res, 400, 'bad_request', 'host_id must be a UUID');
         return;
       }
-      const { rows } = await pool.query('SELECT id FROM hosts WHERE id = $1', [host_id]);
-      if (!rows[0]) {
-        sendError(res, 404, 'not_found', 'host not found');
+      // §10: an explicitly targeted host needs host-targeting access.
+      await authorizeHostAccess(pool, auth.id, host_id);
+    }
+    // §10: a task that references a deployment operates on that deployment's
+    // project — the agent needs project access for it.
+    const referencedDeploymentId =
+      payload && typeof payload === 'object'
+        ? (payload as Record<string, unknown>).deployment_id
+        : undefined;
+    if (typeof referencedDeploymentId === 'string' && referencedDeploymentId) {
+      if (!isUuid(referencedDeploymentId)) {
+        sendError(res, 400, 'bad_request', 'payload.deployment_id must be a UUID');
         return;
       }
+      await authorizeDeploymentAccess(pool, auth.id, referencedDeploymentId);
     }
 
     // Idempotency (PROTOCOL §2): same key + equal body -> replay; same key +
@@ -230,17 +248,25 @@ tasksRouter.get('/', requireAgent, requirePermission('read_status'), async (req,
     }
     const conds: string[] = [];
     const params: unknown[] = [];
+    // §10: a task is visible when the agent created it, or when its
+    // deployment's project is accessible to the agent.
+    const accessibleIds = await listAccessibleProjectIds(getPool(), req.auth!.id);
+    params.push(req.auth!.id);
+    const projectCond = inList('d.project_id', accessibleIds, params);
+    conds.push(
+      projectCond ? `(t.created_by = $1 OR ${projectCond})` : `t.created_by = $1`,
+    );
     if (typeof status === 'string') {
       if (!isTaskStatus(status)) {
         sendError(res, 400, 'bad_request', `unknown status: ${status}`);
         return;
       }
       params.push(status);
-      conds.push(`status = $${params.length}`);
+      conds.push(`t.status = $${params.length}`);
     }
     if (typeof type === 'string') {
       params.push(type);
-      conds.push(`type = $${params.length}`);
+      conds.push(`t.type = $${params.length}`);
     }
     if (typeof host_id === 'string') {
       if (!isUuid(host_id)) {
@@ -248,17 +274,19 @@ tasksRouter.get('/', requireAgent, requirePermission('read_status'), async (req,
         return;
       }
       params.push(host_id);
-      conds.push(`assigned_to = $${params.length}`);
+      conds.push(`t.assigned_to = $${params.length}`);
     }
     if (cursor) {
       params.push(cursor.created_at, cursor.id);
-      conds.push(`(created_at, id) < ($${params.length - 1}, $${params.length})`);
+      conds.push(`(t.created_at, t.id) < ($${params.length - 1}, $${params.length})`);
     }
     const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
     params.push(limit + 1);
     const pool = getPool();
     const { rows } = await pool.query(
-      `SELECT * FROM tasks ${where} ORDER BY created_at DESC, id DESC LIMIT $${params.length}`,
+      `SELECT t.* FROM tasks t
+       LEFT JOIN deployments d ON d.id = (t.payload->>'deployment_id')
+       ${where} ORDER BY t.created_at DESC, t.id DESC LIMIT $${params.length}`,
       params,
     );
     const hasMore = rows.length > limit;
@@ -278,11 +306,8 @@ tasksRouter.get('/:id', requireAgent, requirePermission('read_status'), async (r
       sendError(res, 400, 'bad_request', 'id must be a UUID');
       return;
     }
-    const task = await getTask(getPool(), req.params.id);
-    if (!task) {
-      next(new HttpError(404, 'not_found', 'task not found'));
-      return;
-    }
+    // §10: via task.created_by and/or task -> deployment -> project.
+    const task = await authorizeTaskAccess(getPool(), req.auth!.id, req.params.id);
     res.json({ task });
   } catch (err) {
     next(err);
@@ -307,8 +332,11 @@ tasksRouter.post('/:id/cancel', requireAgent, async (req, res, next) => {
     }
     const auth = req.auth!;
     const isCreator = task.created_by !== null && task.created_by === auth.id;
-    if (auth.permissions?.['deploy'] !== true && !isCreator) {
-      sendError(res, 403, 'forbidden', 'missing permission: deploy (or be the task creator)');
+    // §10: cancelling is allowed for the deploy permission, the task's
+    // creator, or an agent with access to the task's project.
+    const hasProjectAccess = await canAccessTask(pool, auth.id, task.id);
+    if (auth.permissions?.['deploy'] !== true && !isCreator && !hasProjectAccess) {
+      sendError(res, 403, 'forbidden', 'missing permission: deploy (or be the task creator or have project access)');
       return;
     }
     if (!canTransitionTask(task.status, 'cancelled')) {
@@ -366,6 +394,9 @@ async function decideApproval(req: Request, res: Response, next: NextFunction, a
       next(new HttpError(404, 'not_found', 'task not found'));
       return;
     }
+    // §10: approving/rejecting someone else's project task needs project
+    // access — the approve_deployments permission alone is not enough.
+    await authorizeTaskAccess(pool, req.auth!.id, task.id);
     const target = approve ? 'queued' : 'cancelled';
     if (task.status !== 'awaiting_approval' || !canTransitionTask(task.status, target)) {
       sendError(res, 409, 'conflict', `task is ${task.status}; only awaiting_approval tasks can be ${approve ? 'approved' : 'rejected'}`);
