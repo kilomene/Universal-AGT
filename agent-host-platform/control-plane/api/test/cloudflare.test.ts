@@ -190,12 +190,23 @@ describe('ensureCnameRecord', () => {
   it('reuses an identical existing record without POSTing', async () => {
     const fetchFn = mockFetchOnce({
       success: true,
-      result: [{ id: 'rec1', name: 'api.example.com', type: 'CNAME' }],
+      result: [{ id: 'rec1', name: 'api.example.com', type: 'CNAME', content: CFG.ingressHostname }],
     });
     const id = await ensureCnameRecord(CFG, 'api.example.com');
     expect(id).toBe('rec1');
     expect(fetchFn).toHaveBeenCalledTimes(1);
     expect(fetchFn.mock.calls[0][1].method).toBe('GET');
+  });
+
+  it('409s instead of adopting a same-named record that points elsewhere (W16)', async () => {
+    // An operator-managed record for the same name, pointing at a
+    // different target: adopting it would hand the system a record id it
+    // must never delete. The claim must fail, not take over.
+    mockFetchOnce({
+      success: true,
+      result: [{ id: 'rec-op', name: 'api.example.com', type: 'CNAME', content: 'legacy.other.net' }],
+    });
+    await expect(ensureCnameRecord(CFG, 'api.example.com')).rejects.toMatchObject({ status: 409 });
   });
 
   it('creates a proxied CNAME when none exists, with bearer auth', async () => {
