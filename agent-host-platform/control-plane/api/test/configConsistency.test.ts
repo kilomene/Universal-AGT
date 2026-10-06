@@ -123,10 +123,39 @@ describe('config naming consistency (W3)', () => {
       join(REPO_ROOT, 'agent-host-platform', 'scripts', 'install-host.sh'),
       'utf8',
     );
-    // The installer may read $UAHT_TUNNEL_TOKEN (input) and mention it in
-    // comments, but the worker.env heredoc key must be WORKER_TUNNEL_TOKEN.
-    const keyWrites = script.split('\n').filter((line) => /^UAHT_TUNNEL_TOKEN=/.test(line));
+    // The installer may read $UAHT_TUNNEL_TOKEN (input) — including a
+    // shell-local default assignment under `set -u` — and mention it in
+    // comments. What must never happen is the *worker.env heredoc* carrying
+    // a UAHT_-prefixed key: the runtime key there must be WORKER_TUNNEL_TOKEN.
+    const heredoc = script.match(/cat > "\$ENV_FILE" <<EOF\n([\s\S]*?)\nEOF/);
+    expect(heredoc, 'worker.env heredoc found in install-host.sh').not.toBeNull();
+    const keyWrites = heredoc![1].split('\n').filter((line) => /^UAHT_TUNNEL_TOKEN=/.test(line));
     expect(keyWrites).toEqual([]);
-    expect(script).toContain('WORKER_TUNNEL_TOKEN=$UAHT_TUNNEL_TOKEN');
+    expect(heredoc![1]).toContain('WORKER_TUNNEL_TOKEN=$UAHT_TUNNEL_TOKEN');
+  });
+});
+
+describe('config documentation completeness (W-C)', () => {
+  it('every env var the API reads via process.env is documented in .env.example and CONFIG.md', () => {
+    const example = readFileSync(
+      join(REPO_ROOT, 'agent-host-platform', 'control-plane', 'api', '.env.example'),
+      'utf8',
+    );
+    const configMd = readFileSync(
+      join(REPO_ROOT, 'agent-host-platform', 'docs', 'CONFIG.md'),
+      'utf8',
+    );
+    // Canonical names with exactly one meaning (see docs/CONFIG.md); the
+    // ones below were previously missing from one or both documents.
+    for (const name of [
+      'CLOUDFLARE_TUNNEL_API_TOKEN',
+      'CLOUDFLARE_ACCOUNT_ID',
+      'CLOUDFLARE_API_BASE',
+      'RATE_LIMIT_UNAUTH_PER_MIN',
+      'UAHT_ROTATE_RATE_PER_MIN',
+    ]) {
+      expect(example, `${name} documented in .env.example`).toContain(name);
+      expect(configMd, `${name} documented in CONFIG.md`).toContain(name);
+    }
   });
 });
