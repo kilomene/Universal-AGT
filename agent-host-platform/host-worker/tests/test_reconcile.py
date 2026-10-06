@@ -197,5 +197,62 @@ def test_summary_has_expected_shape(tmp_path):
     store = DeploymentStore(str(tmp_path))
     summary = reconcile_mod.reconcile(FakeCtx(store, FakeDockerClient()))
     assert set(summary) == {"reconciled", "already_running", "missing",
-                            "skipped", "actions", "at"}
+                            "skipped", "unexpected", "actions", "at"}
     assert summary["actions"] == []
+    assert summary["unexpected"] == []
+
+
+def test_unexpected_container_is_reported_not_destroyed(tmp_path):
+    """Spec §20: containers Docker knows that no deployment claims are
+    reported — never blindly destroyed."""
+    store = DeploymentStore(str(tmp_path))
+    _save(store, "dep-1")  # claims uaht-web-1-0-0
+    docker = FakeDockerClient()
+    docker.existing.add("uaht-web-1-0-0")
+    docker.running.add("uaht-web-1-0-0")
+    # a stray: crash-mid-deploy leftover / manually started / foreign tool
+    docker.existing.add("stray-debug-box")
+    docker.running.add("stray-debug-box")
+    docker.states["stray-debug-box"] = "running"
+
+    summary = reconcile_mod.reconcile(FakeCtx(store, docker))
+
+    assert summary["already_running"] == 1
+    assert summary["unexpected"] == [
+        {"name": "stray-debug-box", "state": "running"}]
+    # reported, and crucially NOT stopped/removed — reconcile has no
+    # destroy path for unclaimed containers
+    assert "stray-debug-box" in docker.existing
+    assert "stray-debug-box" in docker.running
+    assert any("unexpected container stray-debug-box" in a
+               for a in summary["actions"])
+
+
+def test_stopped_deployment_container_is_claimed_not_unexpected(tmp_path):
+    """A container belonging to a non-running (e.g. superseded) deployment
+    is still claimed — not flagged unexpected."""
+    store = DeploymentStore(str(tmp_path))
+    _save(store, "dep-1", status="superseded")
+    docker = FakeDockerClient()
+    docker.existing.add("uaht-web-1-0-0")
+    docker.states["uaht-web-1-0-0"] = "exited"
+
+    summary = reconcile_mod.reconcile(FakeCtx(store, docker))
+
+    assert summary["unexpected"] == []
+    assert summary["skipped"] == 0  # superseded is not desired-running; ignored
+
+
+def test_compose_project_containers_are_claimed(tmp_path):
+    store = DeploymentStore(str(tmp_path))
+    _save(store, "dep-1", container_name=None, compose_project="uaht-web")
+    docker = FakeDockerClient()
+    docker.existing.add("uaht-web-api-1")
+    docker.running.add("uaht-web-api-1")
+    docker.existing.add("uaht-webx-api-1")  # prefix lookalike: NOT claimed
+    docker.running.add("uaht-webx-api-1")
+
+    summary = reconcile_mod.reconcile(FakeCtx(store, docker))
+
+    assert summary["unexpected"] == [
+        {"name": "uaht-webx-api-1", "state": "running"}]
