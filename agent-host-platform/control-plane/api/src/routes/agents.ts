@@ -1,14 +1,67 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
+import type { Pool } from 'pg';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { generateAgentKey, sha256Hex, verifyToken } from '../lib/tokens';
-import { requireAgent } from '../middleware/auth';
+import { auditAuthFailure, requireAgent } from '../middleware/auth';
 import { rotationRateLimit } from '../middleware/rateLimit';
+import { decideIdempotency } from '../lib/idempotency';
 import { publicAgent } from './_helpers';
 
 export const agentsRouter = Router();
+
+// §7 registration idempotency for POST /v1/agents/register. Same semantics
+// as hosts (see routes/hosts.ts): a retry with the same idempotency_key and
+// equal parameters replays — the original API key is unrecoverable (hash
+// only), so a fresh key is minted and returned, letting the retrying client
+// recover working credentials instead of a dead 409. Agent rotation is
+// immediate (matching POST /v1/agents/me/rotate), so a spurious retry of an
+// already-delivered response invalidates the delivered key — retries must
+// only be sent when the original response was not received.
+async function replayAgentRegistration(
+  req: Request, res: Response, pool: Pool,
+  idemKey: string, regBody: { name: string; type: string; capabilities: unknown; permissions: unknown },
+): Promise<boolean> {
+  const { rows } = await pool.query(
+    'SELECT id, name, type, capabilities, permissions FROM agents WHERE idempotency_key = $1',
+    [idemKey],
+  );
+  const row = rows[0];
+  if (!row) return false;
+  const decision = decideIdempotency(
+    {
+      body: {
+        name: row.name,
+        type: row.type,
+        capabilities: row.capabilities ?? [],
+        permissions: row.permissions ?? {},
+      },
+    },
+    regBody,
+  );
+  if (decision === 'conflict') {
+    sendError(res, 409, 'conflict', 'idempotency_key was already used with different registration parameters');
+    return true;
+  }
+  const { token, hash } = generateAgentKey();
+  await pool.query('UPDATE agents SET api_key_hash = $2, updated_at = now() WHERE id = $1', [row.id, hash]);
+  await appendEvent(pool, {
+    type: 'agent.key_rotated',
+    actor_type: 'agent',
+    actor_id: row.name as string,
+    payload: { agent_id: row.id, reason: 'registration_idempotency_replay' },
+  });
+  const ar = await pool.query(
+    `SELECT id, name, type, capabilities, permissions, status, last_seen, metadata, created_at, updated_at
+       FROM agents WHERE id = $1`,
+    [row.id],
+  );
+  logger.info('agent registration replayed via idempotency key', { name: row.name });
+  res.status(200).json({ agent: publicAgent(ar.rows[0]), api_key: token, idempotent_replay: true });
+  return true;
+}
 
 // Registration access decision, extracted pure for tests.
 // - UAHT_PROVISIONING_TOKEN set: the X-Provisioning-Token header must match
@@ -46,7 +99,7 @@ export function checkRegistrationAccess(
 // whoever holds the provisioning token is trusted to scope the key.
 agentsRouter.post('/register', async (req, res, next) => {
   try {
-    const { name, type, capabilities, permissions } = req.body ?? {};
+    const { name, type, capabilities, permissions, idempotency_key } = req.body ?? {};
     if (typeof name !== 'string' || !name.trim()) {
       sendError(res, 400, 'bad_request', 'name is required');
       return;
@@ -60,27 +113,48 @@ agentsRouter.post('/register', async (req, res, next) => {
       return;
     }
     const pool = getPool();
+    // §7: optional idempotency key for safe client retries (lost responses).
+    let idemKey: string | null = null;
+    if (idempotency_key !== undefined) {
+      if (typeof idempotency_key !== 'string' || !idempotency_key.trim() || idempotency_key.length > 128) {
+        sendError(res, 400, 'bad_request', 'idempotency_key must be a non-empty string of at most 128 characters');
+        return;
+      }
+      idemKey = idempotency_key.trim();
+    }
+    const regBody = {
+      name: name.trim(),
+      type: typeof type === 'string' && type ? type : 'generic',
+      capabilities: capabilities ?? [],
+      permissions: permissions ?? {},
+    };
     const { rows: countRows } = await pool.query('SELECT count(*)::int AS n FROM agents');
-    const access = checkRegistrationAccess(
-      req.header('x-provisioning-token') ?? undefined,
-      Number(countRows[0]?.n ?? 0),
-    );
+    const presented = req.header('x-provisioning-token') ?? undefined;
+    const access = checkRegistrationAccess(presented, Number(countRows[0]?.n ?? 0));
     if (!access.ok) {
+      if (access.status === 401 && presented) {
+        // A provisioning token was presented but did not match: auditable
+        // auth failure (brute-force signal). Missing-token 401s are not
+        // audited — they are ordinary unauthorized requests.
+        void auditAuthFailure(req, 'POST /v1/agents/register', 'bad_provisioning_token');
+      }
       sendError(res, access.status, access.status === 401 ? 'unauthorized' : 'forbidden', access.message);
       return;
     }
+    if (idemKey && (await replayAgentRegistration(req, res, pool, idemKey, regBody))) return;
     const { token, hash } = generateAgentKey();
     try {
       const { rows } = await pool.query(
-        `INSERT INTO agents (name, type, capabilities, permissions, api_key_hash)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO agents (name, type, capabilities, permissions, api_key_hash, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id, name, type, capabilities, permissions, status, last_seen, metadata, created_at, updated_at`,
         [
-          name.trim(),
-          typeof type === 'string' && type ? type : 'generic',
-          JSON.stringify(capabilities ?? []),
-          JSON.stringify(permissions ?? {}),
+          regBody.name,
+          regBody.type,
+          JSON.stringify(regBody.capabilities),
+          JSON.stringify(regBody.permissions),
           hash,
+          idemKey,
         ],
       );
       const agent = publicAgent(rows[0]);
@@ -94,6 +168,7 @@ agentsRouter.post('/register', async (req, res, next) => {
       res.status(201).json({ agent, api_key: token });
     } catch (err: unknown) {
       if ((err as { code?: string }).code === '23505') {
+        if (idemKey && (await replayAgentRegistration(req, res, pool, idemKey, regBody))) return;
         sendError(res, 409, 'conflict', `agent name '${name.trim()}' already exists`);
         return;
       }
