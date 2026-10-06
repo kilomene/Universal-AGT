@@ -15,8 +15,7 @@ the implementation; where a value is a secret, the guide uses a
 
 - A Supabase project (or any Postgres 14+ you operate). You need a
   connection string and, once, a **superuser** connection for migration
-  `001` (installs the `pgcrypto` extension) and migration `005` (the
-  append-only journal's TRUNCATE block — an event trigger). Supabase's SQL
+  `001` (installs the `pgcrypto` extension). Supabase's SQL
   editor runs as superuser — fine. The API's startup preflight
   (`checkMigrationPrivileges`) detects the missing privilege and tells you
   exactly which migration needs it and the safe path (SQL editor), instead
@@ -48,7 +47,7 @@ The files: `agent-host-platform/database/migrations/`:
 | 002 | `002_artifact_status.sql` | Artifact upload status lifecycle |
 | 003 | `003_events_notify.sql` | `pg LISTEN/NOTIFY` plumbing for the SSE event bus |
 | 004 | `004_phase3_reliability.sql` | Claim leases, retry bookkeeping, port registry, `draining` host state |
-| 005 | `005_events_truncate_block.sql` | **Event trigger** aborting `TRUNCATE` on `events` (the append-only journal) — **needs superuser** (row triggers can't block `TRUNCATE`). Re-apply after any database restore. |
+| 005 | `005_events_truncate_block.sql` | `REVOKE TRUNCATE ON events FROM PUBLIC` — stops non-owner roles truncating the append-only journal (no superuser needed; full protection needs separate table ownership, see `docs/security.md`) |
 | 006 | `006_token_rotation_grace.sql` | Host token rotation grace window: `previous_token_hash` + `previous_token_expires_at` on `hosts` (no privilege issues) |
 | 007 | `007_domains_lifecycle.sql` | Domains become a first-class `domains` table (`requested → configuring → active → failed`, `removing → removed`); backfills from the legacy `deployments.domains` JSONB mirror (no privilege issues) |
 
@@ -61,8 +60,8 @@ select * from schema_migrations order by name;  -- 001…007 present
 
 ### Privileged migrations — the safe path
 
-Migrations `001` (pgcrypto extension) and `005` (TRUNCATE event trigger)
-need superuser. If the API connects as a non-superuser role, its startup
+Migration `001` (pgcrypto extension) needs superuser on a fresh database.
+If the API connects as a non-superuser role, its startup
 preflight refuses to run the migration and fails fast with a precise
 error naming the migration — it never skips a security migration. The
 safe path is always the same:
@@ -352,8 +351,7 @@ agent-host hosts   # status online, last_seen fresh
 ## 10. Production checklist
 
 - [ ] Postgres (Supabase) with migrations 001–007 applied; 001 (pgcrypto)
-      and 005 (TRUNCATE block) applied as superuser; 005 re-applied after
-      any restore.
+      applied as superuser on a fresh database.
 - [ ] `NODE_ENV=production`, `UAHT_PROVISIONING_TOKEN` set (API refuses to
       boot without it), `DATA_ENCRYPTION_KEY` backed up (64 hex chars).
 - [ ] HTTPS in front of the API (Caddy/nginx per §4); SSE unbuffered.
