@@ -30,6 +30,20 @@ Key guarantees:
     contract — plus its host ports free) is checked BEFORE anything is
     torn down. A bad target raises :class:`RollbackError` leaving the
     healthy deployment untouched.
+  * same-port rollbacks (spec §5): the deployment being replaced
+    (``current``) legitimately holds the target's host ports until its
+    teardown. The verify phase excludes the current deployment's
+    containers/ports from the collision check — a port bound ONLY by the
+    about-to-be-torn-down deployment is treated as free-after-teardown,
+    while a port held by anything else still fails the rollback loudly.
+    Teardown always runs before restore, so two physical containers never
+    claim the same host port at once.
+  * durable rollback phases (spec §6): the operation moves through
+    ``requested`` -> ``restoring`` -> ``health-checking`` ->
+    ``succeeded``, or lands in ``failed`` / ``partially_reconciled``.
+    The transient phases are recorded on the target row so a worker
+    crash mid-rollback is distinguishable on the next reconcile pass;
+    callers persist the terminal outcome (never a false success).
   * a port-settle failure never fails the rollback: it is logged and
     returned in the settle outcome (``settled: False`` + reason) so the
     caller records it instead of silently claiming success. Docker/OS
@@ -97,16 +111,118 @@ def _target_own_ports(target: dict) -> set:
     return ports
 
 
+def _current_container_names(docker, current: Optional[dict]) -> set:
+    """Container names owned by the deployment being replaced.
+
+    The explicit rollback path tears this deployment down in its
+    ``before_restore`` hook, so its containers/ports must not read as a
+    collision during verify (spec §5, same-port case). Covers both the
+    single-container name and every container of a compose project
+    (compose names containers ``<project>-<service>-<seq>``).
+    """
+    names: set = set()
+    if not current:
+        return names
+    cname = current.get("container_name")
+    if cname:
+        names.add(cname)
+    project = current.get("compose_project")
+    if project:
+        names.update(_compose_stack_container_names(docker, project))
+    return names
+
+
+def _compose_stack_container_names(docker, project: str) -> set:
+    """Every container name belonging to a compose project.
+
+    From ``compose ps`` records first, plus a ``docker ps -a`` prefix
+    scan (same rule as ``reconcile._compose_name_matches``) in case the
+    compose CLI reports nothing. Tolerant of doubles without the method.
+    """
+    names: set = set()
+    try:
+        records = docker.compose_ps(project) or []
+    except Exception:
+        records = []
+    for rec in records:
+        n = rec.get("Name") or rec.get("ID")
+        if n:
+            names.add(str(n).lstrip("/"))
+    try:
+        rows = docker.ps(all=True) or []
+    except Exception:
+        rows = []
+    for row in rows or []:
+        n = (row.get("Names") or "").lstrip("/")
+        if n == project or n.startswith(project + "-"):
+            names.add(n)
+    return names
+
+
+def _current_recorded_ports(current: Optional[dict]) -> set:
+    """Host ports the deployment being replaced has recorded.
+
+    Mirrors ``DeploymentStore.used_host_ports`` (host_port + compose
+    ports): these registry entries belong to the deployment the rollback
+    is tearing down, so they must not read as a collision against the
+    target (spec §5, same-port case).
+    """
+    ports: set = set()
+    if not current:
+        return ports
+    for raw in [current.get("host_port")] + list(
+            current.get("compose_ports") or []):
+        try:
+            ports.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return ports
+
+
+def _mark_target_phase(store, target_id: str, phase: str, log) -> None:
+    """Record a transient rollback phase on the target row (spec §6).
+
+    Never fails the rollback: a marker write is best-effort. A worker
+    crash between markers leaves a transient phase the next reconcile
+    pass detects and marks failed loudly instead of silently
+    resurrecting the torn-down deployment.
+    """
+    try:
+        row = store.load(target_id)
+    except Exception as exc:
+        log(f"rollback: could not read target row for phase {phase!r}: "
+            f"{exc}")
+        return
+    if row is None:
+        return
+    try:
+        row["rollback_status"] = phase
+        store.save(row)
+    except Exception as exc:
+        log(f"rollback: could not record phase {phase!r}: {exc}")
+
+
 def _verify_container_ports_free(docker, target: dict, target_id,
-                                 log) -> None:
-    """The target's recorded host ports must be free before teardown."""
+                                 log, current: Optional[dict] = None
+                                 ) -> None:
+    """The target's recorded host ports must be free before teardown.
+
+    The target's own (stopped) container and the deployment being
+    replaced (``current`` — torn down by the caller's ``before_restore``
+    hook) are excluded: in the same-port case the current deployment
+    legitimately binds the target's ports until its teardown, so a port
+    bound ONLY by it is treated as free-after-teardown. A port held by
+    anything else fails the rollback loudly.
+    """
     from deployments.pipeline import run_spec_from_state, verify_host_port_free
     spec = run_spec_from_state(target)
     own = {target["container_name"]} if target.get("container_name") else set()
+    tolerated = _current_container_names(docker, current)
     for host_port in (spec.get("ports") or {}):
         try:
             verify_host_port_free(docker, int(host_port), log=log,
-                                  exclude_names=own)
+                                  exclude_names=own | tolerated,
+                                  tolerate_bound_by=tolerated)
         except Exception as exc:
             raise RollbackError(
                 f"rollback target {target_id} cannot be restored: host port "
@@ -116,7 +232,8 @@ def _verify_container_ports_free(docker, target: dict, target_id,
 
 
 def verify_target_restorable(docker, target: dict, log=None,
-                             registry_used: Optional[set] = None) -> None:
+                             registry_used: Optional[set] = None,
+                             current: Optional[dict] = None) -> None:
     """Fail fast (before the current deployment is touched) when the
     rollback target cannot be brought back up. Raises RollbackError.
 
@@ -130,6 +247,12 @@ def verify_target_restorable(docker, target: dict, log=None,
     own (stopped) container/stack — and the ports its own contract
     claims — are excluded from the collision check: ``docker start``
     reuses its existing port mapping.
+
+    ``current`` (optional): the deployment being replaced. Its
+    containers and recorded ports are excluded from the collision check
+    as well (spec §5, same-port case): its teardown frees them before
+    the restore, so they must not read as a collision. A port held by
+    anything else still fails the rollback.
     """
     from deployments.pipeline import (run_spec_from_state,
                                       verify_compose_ports_free)
@@ -142,13 +265,15 @@ def verify_target_restorable(docker, target: dict, log=None,
             # check: `docker start` is a no-op and the port is
             # legitimately held by the target itself.
             if _container_status(docker, name) != "running":
-                _verify_container_ports_free(docker, target, target_id, log)
+                _verify_container_ports_free(docker, target, target_id, log,
+                                             current=current)
             return
         # GC'd generation: rebuildable only when the persisted contract's
         # image is still available.
         spec_image = target.get("image") or run_spec_from_state(target)["image"]
         if spec_image and docker.image_exists(spec_image):
-            _verify_container_ports_free(docker, target, target_id, log)
+            _verify_container_ports_free(docker, target, target_id, log,
+                                         current=current)
             return
         raise RollbackError(
             f"rollback target {target_id} cannot be restored: container "
@@ -170,11 +295,20 @@ def verify_target_restorable(docker, target: dict, log=None,
                 continue
         # The target's own claimed ports are legitimately its own (the
         # automatic path rolls back while the target row is still
-        # "running", so the registry still lists them).
-        reg = set(registry_used or set()) - _target_own_ports(target)
+        # "running", so the registry still lists them) — and so are the
+        # current deployment's (spec §5: its teardown frees them).
+        reg = (set(registry_used or set()) - _target_own_ports(target)
+               - _current_recorded_ports(current))
+        current_names = _current_container_names(docker, current)
         try:
-            verify_compose_ports_free(docker, target["compose_project"],
-                                      ports, log=log, registry_used=reg)
+            verify_compose_ports_free(
+                docker, target["compose_project"], ports, log=log,
+                registry_used=reg,
+                exclude_names=(
+                    _compose_stack_container_names(
+                        docker, target["compose_project"])
+                    | current_names),
+                tolerate_bound_by=current_names)
         except Exception as exc:
             raise RollbackError(
                 f"rollback target {target_id} cannot be restored: {exc}; "
@@ -342,8 +476,8 @@ def settle_rollback_ports(ctx, log, deployment_id: str,
 def perform_rollback(ctx, docker, *, log: Callable[[str], None],
                      target: dict, healthcheck_timeout: int = 60,
                      verify: bool = True,
-                     before_restore: Optional[Callable[[], None]] = None
-                     ) -> dict:
+                     before_restore: Optional[Callable[[], None]] = None,
+                     current: Optional[dict] = None) -> dict:
     """Execute the full rollback against ``target`` — the ONE
     implementation both the automatic (deploy-time) and explicit
     (handler) rollback paths call.
@@ -358,6 +492,17 @@ def perform_rollback(ctx, docker, *, log: Callable[[str], None],
       verify and before restore. Explicit rollback passes its teardown
       of the current deployment here, so a verified target never
       competes with the deployment it replaces for ports.
+    * ``current``: optional state of the deployment being replaced.
+      Used ONLY by the verify phase (spec §5, same-port case): its
+      containers and recorded ports are excluded from the collision
+      check because ``before_restore`` frees them before the restore.
+      The automatic path leaves it None — the failed deployment was
+      already torn down.
+
+    The transient phases (``restoring``, ``health-checking``) are
+    recorded durably on the target row (spec §6): a worker crash
+    mid-rollback leaves a marker the next reconcile pass detects instead
+    of silently resurrecting the torn-down deployment.
 
     Commits the target's state row (``status="running"``,
     ``health_status`` from the REAL health check — never assumed) and
@@ -371,6 +516,8 @@ def perform_rollback(ctx, docker, *, log: Callable[[str], None],
     failed deployment's row and raises DeployError; the explicit path
     marks the current deployment rolled_back and settles port
     reservations with the control plane (see settle_rollback_ports).
+    Neither caller may report success when the target is unhealthy —
+    spec §6 persists rollback_failed, not a false "rolled_back".
     """
     store = ctx.deployment_store
     target_id = target.get("deployment_id")
@@ -380,13 +527,16 @@ def perform_rollback(ctx, docker, *, log: Callable[[str], None],
     if verify:
         log(f"rollback: verifying target {target_id} is restorable")
         verify_target_restorable(docker, fresh, log=log,
-                                 registry_used=store.used_host_ports())
+                                 registry_used=store.used_host_ports(),
+                                 current=current)
         log(f"rollback: target {target_id} verified restorable")
+    _mark_target_phase(store, target_id, "restoring", log)
     if before_restore is not None:
         before_restore()
     # -- restore ------------------------------------------------------------
     restored_via = restore_target(docker, fresh, log=log)
     # -- health-check-target (REAL; never raises) ---------------------------
+    _mark_target_phase(store, target_id, "health-checking", log)
     health = healthcheck_restored_target(
         docker, fresh, timeout_secs=healthcheck_timeout, log=log)
     # -- commit state: health_status comes from the real check result ------
@@ -394,12 +544,15 @@ def perform_rollback(ctx, docker, *, log: Callable[[str], None],
     committed["status"] = "running"
     if health is True:
         committed["health_status"] = "healthy"
+        committed["rollback_status"] = "succeeded"
     elif health is False:
         committed["health_status"] = "unhealthy"
+        committed["rollback_status"] = "failed"
     else:
         # No host port to check against (e.g. compose target whose port
         # could not be discovered): keep the previously recorded value.
         committed.setdefault("health_status", "unknown")
+        committed["rollback_status"] = "succeeded"
     store.save(committed)
     log(f"rollback complete: {target_id} restored via {restored_via}, "
         f"health_status={committed['health_status']}")
