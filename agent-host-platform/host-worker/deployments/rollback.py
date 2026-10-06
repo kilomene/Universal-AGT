@@ -24,7 +24,9 @@ Key guarantees:
     (``health.checker.wait_for_healthcheck`` on the target's recorded
     host port). It is never marked healthy just because a container
     restarted; a target that cannot become healthy is recorded
-    ``"unhealthy"`` honestly.
+    ``"unhealthy"`` honestly, and a target with nothing health-checkable
+    (no host port to check against) is recorded ``"unknown"`` — unknown
+    is never a success: the rollback fails durably (``rollback_failed``).
   * verify-before-destroy: the target's restorability (container or
     compose stack present — or rebuildable from the persisted deployment
     contract — plus its host ports free) is checked BEFORE anything is
@@ -44,12 +46,13 @@ Key guarantees:
     The transient phases are recorded on the target row so a worker
     crash mid-rollback is distinguishable on the next reconcile pass;
     callers persist the terminal outcome (never a false success).
-  * a port-settle failure never fails the rollback: it is logged and
+  * a port-settle failure never reports success: it is logged and
     returned in the settle outcome (``settled: False`` + reason) so the
-    caller records it instead of silently claiming success. Docker/OS
-    state and the worker's deployment state are reconciled physically by
-    the verify/restore phases; the control-plane registry is advisory
-    and the worker's physical port checks are the backstop.
+    caller records a durable ``rollback_failed`` (``partially_reconciled``)
+    instead of claiming success. Docker/OS state and the worker's
+    deployment state are reconciled physically by the verify/restore
+    phases; the control-plane registry is advisory and the worker's
+    physical port checks are the backstop.
 
 Production paths use no mocks: every docker interaction goes through the
 injected docker client, the health check is the real
@@ -429,11 +432,13 @@ def settle_rollback_ports(ctx, log, deployment_id: str,
     base_url attributes — no new client method, no new protocol.
 
     Never raises: the registry is advisory and the worker's physical
-    port checks are the backstop, so a settle failure must not fail an
-    already-completed rollback. Returns ``{"settled": bool, ...}`` with
-    the server-reported released/restored/skipped counts (or a
-    ``"reason"`` when skipped/failed) so the caller records the outcome
-    instead of silently claiming success.
+    port checks are the backstop. A settle failure never reports
+    success — it is returned in the settle outcome (``settled: False`` +
+    reason) so the caller records it durably (``rollback_failed`` /
+    ``partially_reconciled``) instead of silently claiming success.
+    Returns ``{"settled": bool, ...}`` with the server-reported
+    released/restored/skipped counts (or a ``"reason"`` when
+    skipped/failed).
     """
     log = log or (lambda line: None)
     outcome = {"settled": False, "released": None, "restored": None,
@@ -516,8 +521,9 @@ def perform_rollback(ctx, docker, *, log: Callable[[str], None],
     failed deployment's row and raises DeployError; the explicit path
     marks the current deployment rolled_back and settles port
     reservations with the control plane (see settle_rollback_ports).
-    Neither caller may report success when the target is unhealthy —
-    spec §6 persists rollback_failed, not a false "rolled_back".
+    Neither caller may report success unless the target was proven
+    healthy — an unhealthy OR unknown target persists rollback_failed,
+    never a false "rolled_back".
     """
     store = ctx.deployment_store
     target_id = target.get("deployment_id")
@@ -549,10 +555,14 @@ def perform_rollback(ctx, docker, *, log: Callable[[str], None],
         committed["health_status"] = "unhealthy"
         committed["rollback_status"] = "failed"
     else:
-        # No host port to check against (e.g. compose target whose port
-        # could not be discovered): keep the previously recorded value.
-        committed.setdefault("health_status", "unknown")
-        committed["rollback_status"] = "succeeded"
+        # No host port could be checked against (e.g. the target was
+        # restored but exposes no health-checkable endpoint): its health
+        # is UNKNOWN — and unknown is never a success. Persist
+        # rollback_failed honestly; the caller must not report
+        # "rolled_back". (The stale pre-rollback value is overwritten on
+        # purpose: it described the target before the restore, not now.)
+        committed["health_status"] = "unknown"
+        committed["rollback_status"] = "failed"
     store.save(committed)
     log(f"rollback complete: {target_id} restored via {restored_via}, "
         f"health_status={committed['health_status']}")
