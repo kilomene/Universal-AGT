@@ -10,7 +10,7 @@ import contextlib
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator
 
 
 def _identity(text: str) -> str:
