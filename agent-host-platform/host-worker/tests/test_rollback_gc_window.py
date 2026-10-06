@@ -31,6 +31,9 @@ class FakeDocker:
     def image_exists(self, tag):
         return tag in self.images
 
+    def ps(self, all=False):
+        return []
+
     def start(self, name, timeout=120):
         self.start_calls.append(name)
         if name not in self.containers:
