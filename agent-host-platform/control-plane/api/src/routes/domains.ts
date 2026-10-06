@@ -1,4 +1,6 @@
 import { Router, type Response } from 'express';
+import https from 'node:https';
+import { resolve4, resolve6 } from 'node:dns/promises';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
@@ -228,32 +230,227 @@ async function getDeployment(pool: Pool, id: string) {
 /** HTTPS reachability probe. Informational only: any HTTP response (even
  *  4xx/5xx) proves the path resolves through the edge to an origin.
  *
- *  SECURITY (W16 audit): redirects are NOT followed (`redirect: 'manual'`).
- *  The probe URL is built from an agent-supplied hostname; following a
- *  redirect could make the control plane issue a request to an
- *  attacker-chosen internal URL (SSRF). A 3xx is still recorded as a
- *  response — the probe only needs to know the name resolves to *something*
- *  answering.
+ *  SECURITY (§5 follow-up — SSRF/DNS-rebinding hardening): this probe makes
+ *  the CONTROL PLANE issue an HTTPS request to a hostname that arrived in
+ *  an agent task payload. Hostname syntax alone (isValidHostname) does not
+ *  stop DNS-based SSRF: an attacker-controlled name can resolve to
+ *  127.0.0.1, 10/8, 169.254.169.254 (cloud metadata), or any other
+ *  internal address, and DNS rebinding can flip the answer between our
+ *  check and our connection (TOCTOU).
+ *
+ *  Defense, in order:
+ *   1. resolve A + AAAA ourselves via node:dns/promises;
+ *   2. require at least one address AND require EVERY resolved address to
+ *      be a public (non-special-use) IP — fail closed on any private,
+ *      loopback, link-local, multicast, reserved, or documentation range;
+ *   3. pin the validated address for the actual connection with a custom
+ *      `lookup` on the HTTPS request (documented node:https API): the
+ *      socket always dials the IP we validated, so a rebinding flip
+ *      mid-probe cannot redirect the connection. SNI and the Host header
+ *      still carry the original hostname, and TLS certificate verification
+ *      stays on;
+ *   4. redirects are never followed (node:https does not follow them —
+ *      same guarantee the old `redirect: 'manual'` gave). A 3xx is still
+ *      recorded as a response: the probe only needs to know the name
+ *      resolves to *something* answering.
  */
-export async function probeHttps(hostname: string): Promise<{ reachable: boolean; status: number | null }> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 8000);
-  try {
-    const res = await fetch(`https://${hostname}/`, {
-      signal: ctrl.signal,
-      redirect: 'manual',
-    });
-    try {
-      await res.body?.cancel();
-    } catch {
-      /* best effort */
-    }
-    return { reachable: true, status: res.status };
-  } catch {
-    return { reachable: false, status: null };
-  } finally {
-    clearTimeout(timer);
+
+// -- private/special-use ranges: the probe must never dial these ---------
+const IPV4_PART = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+const IPV6_HEX = /^[0-9a-fA-F]{1,4}$/;
+
+function parseIpv4(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!IPV4_PART.test(p)) return null;
+    n = n * 256 + Number(p);
   }
+  return n >>> 0;
+}
+
+function inCidrV4(n: number, base: string, bits: number): boolean {
+  const b = parseIpv4(base);
+  if (b === null) return false;
+  const mask = bits === 0 ? 0 : ((0xffffffff << (32 - bits)) >>> 0);
+  return (((n & mask) >>> 0) === ((b & mask) >>> 0));
+}
+
+/** Denied IPv4 ranges: [base, prefix bits]. */
+const DENIED_V4: Array<[string, number]> = [
+  ['0.0.0.0', 8], // "this network"
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10], // CGNAT shared space
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16], // link-local (cloud metadata lives here)
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24], // IETF protocol assignments
+  ['192.0.2.0', 24], // TEST-NET-1 (documentation)
+  ['192.88.99.0', 24], // 6to4 relay anycast (deprecated)
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15], // benchmarking
+  ['198.51.100.0', 24], // TEST-NET-2 (documentation)
+  ['203.0.113.0', 24], // TEST-NET-3 (documentation)
+  ['224.0.0.0', 4], // multicast
+  ['240.0.0.0', 4], // reserved
+];
+
+function parseIpv6(ip: string): bigint | null {
+  // Split off an embedded IPv4 tail (e.g. ::ffff:192.0.2.1).
+  let v4tail: number | null = null;
+  let head = ip;
+  const lastColon = ip.lastIndexOf(':');
+  const tail = lastColon >= 0 ? ip.slice(lastColon + 1) : ip;
+  if (tail.includes('.')) {
+    v4tail = parseIpv4(tail);
+    if (v4tail === null || lastColon < 0) return null;
+    head = ip.slice(0, lastColon);
+  }
+  const halves = head.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  for (const h of [...left, ...right]) {
+    if (!IPV6_HEX.test(h)) return null;
+  }
+  const v4groups = v4tail !== null ? 2 : 0;
+  const missing = 8 - v4groups - left.length - right.length;
+  if (halves.length === 1) {
+    if (missing !== 0) return null; // no :: but not 8 groups
+  } else if (missing < 0) {
+    return null;
+  }
+  const groups = [...left, ...Array(Math.max(0, missing)).fill('0'), ...right];
+  let n = 0n;
+  for (const g of groups) n = (n << 16n) | BigInt(parseInt(g, 16));
+  if (v4tail !== null) n = (n << 32n) | BigInt(v4tail);
+  return n;
+}
+
+function inCidrV6(n: bigint, base: bigint, bits: number): boolean {
+  const shift = BigInt(128 - bits);
+  return (n >> shift) === (base >> shift);
+}
+
+/** Denied IPv6 ranges: [base, prefix bits]. */
+const DENIED_V6: Array<[string, number]> = [
+  ['::', 96], // unspecified + deprecated IPv4-compatible ::/96
+  ['::1', 128], // loopback
+  ['fc00::', 7], // unique local
+  ['fe80::', 10], // link-local
+  ['ff00::', 8], // multicast
+  ['2001:db8::', 32], // documentation
+  ['64:ff9b::', 96], // NAT64 well-known prefix (embeds arbitrary v4)
+  ['64:ff9b:1::', 48], // NAT64 local-use
+  ['100::', 64], // discard
+  ['2001::', 23], // IETF special purpose (Teredo, etc.)
+  ['2001:10::', 28], // ORCHIDv2
+];
+
+/**
+ * True when `ip` is a public, globally-routable address the probe may dial.
+ * Anything unparsable fails closed (false). IPv4-mapped IPv6
+ * (::ffff:a.b.c.d) is classified by its embedded IPv4 address.
+ * Exported for the security test suite.
+ */
+export function isPublicIpAddress(ip: string): boolean {
+  const v4 = parseIpv4(ip);
+  if (v4 !== null) {
+    return !DENIED_V4.some(([base, bits]) => inCidrV4(v4, base, bits));
+  }
+  const v6 = parseIpv6(ip);
+  if (v6 === null) return false;
+  if ((v6 >> 32n) === 0xffffn) {
+    // ::ffff:0:0/96 — IPv4-mapped: judge the embedded IPv4 address.
+    const embedded = Number(v6 & 0xffffffffn);
+    return !DENIED_V4.some(([base, bits]) => inCidrV4(embedded, base, bits));
+  }
+  return !DENIED_V6.some(([base, bits]) => {
+    const b = parseIpv6(base);
+    return b !== null && inCidrV6(v6, b, bits);
+  });
+}
+
+/**
+ * Resolve a probe hostname to its public addresses. Throws when the
+ * hostname is invalid, does not resolve, or ANY resolved address (A or
+ * AAAA) is non-public — fail closed. Exported for the security test suite.
+ */
+export async function resolveProbeAddresses(hostname: string): Promise<string[]> {
+  if (!isValidHostname(hostname)) {
+    throw new Error(`probe refused: ${hostname} is not a valid public hostname`);
+  }
+  const [a, aaaa] = await Promise.all([
+    resolve4(hostname).catch((): string[] => []),
+    resolve6(hostname).catch((): string[] => []),
+  ]);
+  const addresses = [...a, ...aaaa];
+  if (addresses.length === 0) {
+    throw new Error(`probe refused: ${hostname} does not resolve to any address`);
+  }
+  for (const ip of addresses) {
+    if (!isPublicIpAddress(ip)) {
+      throw new Error(`probe refused: ${hostname} resolves to a non-public address`);
+    }
+  }
+  return addresses;
+}
+
+export async function probeHttps(hostname: string): Promise<{ reachable: boolean; status: number | null }> {
+  let pinned: string;
+  try {
+    pinned = (await resolveProbeAddresses(hostname))[0];
+  } catch {
+    // Refused (invalid name, no resolution, or non-public address) and
+    // plain DNS failure both read as "not reachable" — the probe is
+    // informational and never blocks 'active'.
+    return { reachable: false, status: null };
+  }
+  const family = pinned.includes(':') ? 6 : 4;
+  // Pin the validated IP at the socket layer: even if the hostname's DNS
+  // flips between resolveProbeAddresses() and connect (rebinding), the
+  // request can only ever reach the address we validated. TLS SNI and the
+  // HTTP Host header still carry the original hostname.
+  const lookup = (
+    _hostname: string,
+    _options: unknown,
+    callback: (err: null, address: string, family: number) => void,
+  ): void => {
+    callback(null, pinned, family);
+  };
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (r: { reachable: boolean; status: number | null }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const timer = setTimeout(() => {
+      req?.destroy();
+      finish({ reachable: false, status: null });
+    }, 8000);
+    let req: import('node:http').ClientRequest;
+    try {
+      req = https.get(
+        `https://${hostname}/`,
+        { lookup, timeout: 8000 },
+        (res) => {
+          res.resume(); // drain the body; we only need the status line
+          finish({ reachable: true, status: res.statusCode ?? null });
+        },
+      );
+    } catch {
+      finish({ reachable: false, status: null });
+      return;
+    }
+    req.on('timeout', () => {
+      req.destroy();
+      finish({ reachable: false, status: null });
+    });
+    req.on('error', () => finish({ reachable: false, status: null }));
+  });
 }
 
 /**
