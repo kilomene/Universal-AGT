@@ -57,12 +57,15 @@ The files: `agent-host-platform/database/migrations/`:
 | 005 | `005_events_truncate_block.sql` | `REVOKE TRUNCATE ON events FROM PUBLIC` — stops non-owner roles truncating the append-only journal (no superuser needed; full protection needs separate table ownership, see `docs/security.md`) |
 | 006 | `006_token_rotation_grace.sql` | Host token rotation grace window: `previous_token_hash` + `previous_token_expires_at` on `hosts` (no privilege issues) |
 | 007 | `007_domains_lifecycle.sql` | Domains become a first-class `domains` table (`requested → configuring → active → failed`, `degraded` as a live-but-unverified state, `removing → removed`); backfills from the legacy `deployments.domains` JSONB mirror (no privilege issues) |
+| 008 | `008_task_queue_hardening.sql` | `domains.status` CHECK recreated to allow `'degraded'` (007's constraint omitted it while the reconciler transitions to it — real PostgreSQL would 500; pg-mem doesn't enforce CHECKs so suites stayed green); `domains.idempotency_key` unique; `tasks.type` 18-type CHECK + `attempts >= 0` + `max_attempts >= 1`; `deployments.health_status` CHECK; three hot-path indexes (`idx_tasks_claimable`, `idx_tasks_claimed_by`, `idx_tasks_payload_deployment_id`) |
+| 009 | `009_heartbeat_enrichment.sql` | `worker_draining`, `worker_status`, `ingress` (jsonb), `reported_host_name` columns for the enriched heartbeat (2026-10-06: `capabilities` already existed) |
+| 010 | `010_registration_idempotency.sql` | Nullable `idempotency_key` on `hosts`/`agents` + partial unique indexes (registration replay) |
 
 Verify:
 
 ```sql
 -- in the Supabase SQL editor
-select * from schema_migrations order by name;  -- 001…007 present
+select * from schema_migrations order by name;  -- 001…010 present
 ```
 
 ### Privileged migrations — the safe path
@@ -454,7 +457,7 @@ agent-host hosts   # status online, last_seen fresh
 
 ## 11. Production checklist
 
-- [ ] Postgres (Supabase) with migrations 001–007 applied; 001 (pgcrypto)
+- [ ] Postgres (Supabase) with migrations 001–010 applied; 001 (pgcrypto)
       applied as superuser on a fresh database.
 - [ ] `NODE_ENV=production`, `UAHT_PROVISIONING_TOKEN` set (API refuses to
       boot without it), `DATA_ENCRYPTION_KEY` backed up (64 hex chars).
