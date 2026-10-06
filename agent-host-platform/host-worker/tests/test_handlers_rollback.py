@@ -71,15 +71,19 @@ def _state(dep_id, name, project="proj-1", status="running"):
     }
 
 
-def test_rollback_honors_target_deployment_id(tmp_path):
+def test_rollback_honors_target_deployment_id(tmp_path, monkeypatch):
+    from health import checker as health_checker
     docker = FakeDocker()
     docker.containers["c-current"] = {"running": True}
     docker.containers["c-target"] = {"running": False}
     docker.containers["c-newer"] = {"running": False}
     ctx = FakeCtx(tmp_path, docker)
     ctx.deployment_store.save(_state("dep-cur", "c-current"))
-    ctx.deployment_store.save(_state("dep-target", "c-target"))
+    ctx.deployment_store.save(_state_with_port("dep-target", "c-target",
+                                               18921, status="superseded"))
     ctx.deployment_store.save(_state("dep-newer", "c-newer"))
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
 
     task = {"id": "t1", "type": "rollback",
             "payload": {"deployment_id": "dep-cur",
@@ -88,6 +92,8 @@ def test_rollback_honors_target_deployment_id(tmp_path):
 
     # the EXPLICIT target was restored, not the newest candidate (dep-newer)
     assert result["rolled_back_to"] == "dep-target"
+    assert result["status"] == "rolled_back"
+    assert result["target_health_status"] == "healthy"
     assert "c-target" in docker.start_calls
     assert "c-newer" not in docker.start_calls
     assert ctx.deployment_store.load("dep-cur")["status"] == "rolled_back"
@@ -173,12 +179,19 @@ def _rollback_ctx(tmp_path, docker, session):
     return ctx
 
 
-def test_rollback_settles_ports_via_control_plane(tmp_path):
+def test_rollback_settles_ports_via_control_plane(tmp_path, monkeypatch):
+    from health import checker as health_checker
     docker = FakeDocker()
     docker.containers["c-current"] = {"running": True}
     docker.containers["c-target"] = {"running": False}
     session = _FakeSession()
     ctx = _rollback_ctx(tmp_path, docker, session)
+    # the target must be PROVEN healthy before the settle is attempted
+    # (Part 2E: settle runs only after health is verified)
+    ctx.deployment_store.save(_state_with_port("dep-target", "c-target",
+                                               18925, status="superseded"))
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
 
     task = {"id": "t1", "type": "rollback",
             "payload": {"deployment_id": "dep-cur",
@@ -186,6 +199,7 @@ def test_rollback_settles_ports_via_control_plane(tmp_path):
     result = handlers.handle_rollback(ctx, task)
 
     assert result["status"] == "rolled_back"
+    assert result["target_health_status"] == "healthy"
     assert result["ports_settled"] is True
     assert len(session.posts) == 1
     post = session.posts[0]
@@ -194,25 +208,35 @@ def test_rollback_settles_ports_via_control_plane(tmp_path):
     assert post["json"] == {"target_deployment_id": "dep-target"}
 
 
-def test_rollback_settle_failure_does_not_fail_rollback(tmp_path):
+def test_rollback_settle_failure_is_durable_failure(tmp_path, monkeypatch):
+    """Part 2E: the target is proven healthy but the port-registry settle
+    fails — the rollback is recorded as a durable failure
+    (rollback_failed / partially_reconciled), NEVER reported as success."""
+    from health import checker as health_checker
     docker = FakeDocker()
     docker.containers["c-current"] = {"running": True}
     docker.containers["c-target"] = {"running": False}
     session = _FakeSession(fail_with=ConnectionError("control plane down"))
     ctx = _rollback_ctx(tmp_path, docker, session)
+    ctx.deployment_store.save(_state_with_port("dep-target", "c-target",
+                                               18926, status="superseded"))
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
 
     task = {"id": "t1", "type": "rollback",
             "payload": {"deployment_id": "dep-cur",
                         "target_deployment_id": "dep-target"}}
     result = handlers.handle_rollback(ctx, task)  # must not raise
 
-    # Spec §6: the physical restore happened, but the port-registry
-    # settle failed — persist rollback_failed (partially_reconciled),
-    # never a false "rolled_back".
+    # Spec §6: the physical restore happened and the target is healthy,
+    # but the port-registry settle failed — persist rollback_failed
+    # (partially_reconciled), never a false "rolled_back".
     assert result["status"] == "rollback_failed"
     assert result["rollback_status"] == "partially_reconciled"
     assert result["rolled_back_to"] == "dep-target"
+    assert result["target_health_status"] == "healthy"
     assert result["ports_settled"] is False
+    assert len(session.posts) == 1  # settle WAS attempted (target healthy)
     cur = ctx.deployment_store.load("dep-cur")
     assert cur["status"] == "rollback_failed"
     assert cur["rollback_status"] == "partially_reconciled"
@@ -224,15 +248,20 @@ def test_rollback_settle_failure_does_not_fail_rollback(tmp_path):
     assert any("non-fatal" in line for _, line in ctx.logged)
 
 
-def test_rollback_without_api_session_skips_settle(tmp_path):
+def test_rollback_without_api_session_skips_settle(tmp_path, monkeypatch):
     # FakeCtx has no api attribute at all (older doubles): settle is
-    # skipped, the rollback itself is unaffected.
+    # skipped, the rollback itself is unaffected — but only because the
+    # target was proven healthy (Part 2E).
+    from health import checker as health_checker
     docker = FakeDocker()
     docker.containers["c-current"] = {"running": True}
     docker.containers["c-target"] = {"running": False}
     ctx = FakeCtx(tmp_path, docker)
     ctx.deployment_store.save(_state("dep-cur", "c-current"))
-    ctx.deployment_store.save(_state("dep-target", "c-target"))
+    ctx.deployment_store.save(_state_with_port("dep-target", "c-target",
+                                               18927, status="superseded"))
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
 
     task = {"id": "t1", "type": "rollback",
             "payload": {"deployment_id": "dep-cur",
