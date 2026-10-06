@@ -32,6 +32,18 @@ def _task_id(task: dict) -> str:
     return task.get("id", "unknown")
 
 
+def _validated_artifact_id(payload: dict) -> str:
+    """artifact_id from the payload, validated as a path component (§16).
+
+    Callers build artifacts/<id>.bin paths from this value; an unvalidated
+    id ("../../..") would steer makedirs/file writes outside the work dir.
+    """
+    try:
+        return deploy_pipeline.validate_artifact_id(payload.get("artifact_id"))
+    except ValueError as exc:
+        raise HandlerError(str(exc)) from exc
+
+
 def _require(payload: dict, *keys: str) -> None:
     missing = [k for k in keys if payload.get(k) in (None, "")]
     if missing:
@@ -111,24 +123,46 @@ def _restore_deployment(ctx, docker, state: dict) -> None:
         )
 
 
+def _docker_status(docker, name):
+    """Container status or None; tolerant of doubles without the method."""
+    fn = getattr(docker, "container_status", None)
+    if fn is None:
+        return None
+    try:
+        return fn(name)
+    except Exception:
+        return None
+
+
 def _verify_target_restorable(ctx, docker, target: dict) -> None:
     """Fail fast (before the current deployment is touched) when the
     rollback target cannot be brought back up.
 
     A container target is restorable when its container still exists, or
     when it can be rebuilt from the persisted contract (image recorded and
-    present). A compose target needs its compose file. Anything else raises
-    HandlerError while the current deployment keeps serving.
+    present). A compose target needs its compose file. In both cases the
+    target's recorded host ports must be free (spec §21: host availability
+    verified) — a port squatted by another container would make the restore
+    fail AFTER the healthy current deployment was destroyed, so the
+    rollback is refused loudly instead. The target's own (stopped)
+    container/stack is excluded from the collision check: `docker start`
+    reuses its existing port mapping.
     """
     from deployments.pipeline import run_spec_from_state
     target_id = target.get("deployment_id")
     if target.get("container_name"):
         name = target["container_name"]
         if docker.container_exists(name):
+            # A target whose container is already running needs no port
+            # check: `docker start` is a no-op and the port is legitimately
+            # held by the target itself.
+            if _docker_status(docker, name) != "running":
+                _verify_target_ports_free(ctx, docker, target, target_id)
             return
         spec = run_spec_from_state(target)
         image = spec["image"]
         if image and docker.image_exists(image):
+            _verify_target_ports_free(ctx, docker, target, target_id)
             return
         raise HandlerError(
             f"rollback target {target_id} cannot be restored: container "
@@ -137,15 +171,84 @@ def _verify_target_restorable(ctx, docker, target: dict) -> None:
         )
     if target.get("compose_project"):
         compose_file = target.get("compose_file")
-        if compose_file and Path(compose_file).is_file():
-            return
-        raise HandlerError(
-            f"rollback target {target_id} cannot be restored: compose file "
-            f"{compose_file!r} is missing; redeploy required"
-        )
+        if not (compose_file and Path(compose_file).is_file()):
+            raise HandlerError(
+                f"rollback target {target_id} cannot be restored: compose file "
+                f"{compose_file!r} is missing; redeploy required"
+            )
+        _verify_target_compose_ports_free(ctx, docker, target, target_id)
+        return
     raise HandlerError(  # pragma: no cover — callers check _restorable first
         f"rollback target {target_id} has nothing to restore"
     )
+
+
+def _verify_target_ports_free(ctx, docker, target: dict, target_id) -> None:
+    """The target's recorded host ports must be free before teardown."""
+    from deployments.pipeline import run_spec_from_state, verify_host_port_free
+    spec = run_spec_from_state(target)
+    own = {target["container_name"]} if target.get("container_name") else set()
+    for host_port in (spec.get("ports") or {}):
+        try:
+            verify_host_port_free(docker, int(host_port),
+                                  exclude_names=own)
+        except Exception as exc:
+            raise HandlerError(
+                f"rollback target {target_id} cannot be restored: host port "
+                f"{host_port} is not free ({exc}); refusing to tear down "
+                f"the current deployment"
+            ) from exc
+
+
+def _verify_target_compose_ports_free(ctx, docker, target: dict,
+                                      target_id) -> None:
+    """The target compose stack's declared ports must be free before teardown."""
+    from deployments.pipeline import verify_compose_ports_free
+    ports = []
+    for p in target.get("compose_ports") or []:
+        try:
+            ports.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    try:
+        verify_compose_ports_free(
+            docker, target["compose_project"], ports,
+            registry_used=ctx.deployment_store.used_host_ports())
+    except Exception as exc:
+        raise HandlerError(
+            f"rollback target {target_id} cannot be restored: {exc}; "
+            f"refusing to tear down the current deployment"
+        ) from exc
+
+
+def _healthcheck_restored_target(ctx, docker, target: dict, payload: dict,
+                                 task_id: str):
+    """Health-check the rollback target after it is restored (spec §21).
+
+    Returns True (healthy), False (unhealthy) or None (no host port
+    recorded — nothing to check against). Never raises: the restore
+    already happened, so an unhealthy target is reported honestly via its
+    health_status rather than hidden behind a task failure.
+    """
+    from health import checker as health_checker
+    host_port = target.get("host_port")
+    if not host_port:
+        return None
+    path = target.get("healthcheck_path") or "/"
+    timeout = int(payload.get("healthcheck_timeout", 60))
+    ctx.log(task_id,
+            f"rollback healthcheck: GET :{host_port}{path} "
+            f"(timeout {timeout}s)")
+    try:
+        ok = health_checker.wait_for_healthcheck(
+            int(host_port), path, timeout_secs=timeout,
+            log=lambda line: ctx.log(task_id, line))
+    except Exception as exc:
+        ctx.log(task_id, f"rollback target healthcheck error: {exc}")
+        return False
+    ctx.log(task_id,
+            f"rollback target health: {'healthy' if ok else 'UNHEALTHY'}")
+    return ok
 
 
 def _teardown_current(ctx, docker, state: dict) -> None:
@@ -325,18 +428,29 @@ def handle_rollback(ctx, task: dict) -> dict:
             f"rolling back {current['deployment_id']} -> {target['deployment_id']}")
     # Verify BEFORE teardown: a rollback must never destroy the healthy
     # current deployment when the target cannot be restored (e.g. its
-    # container was garbage-collected beyond the keep-generations window).
+    # container was garbage-collected beyond the keep-generations window)
+    # or when the target's host ports are no longer free.
     _verify_target_restorable(ctx, docker, target)
     _teardown_current(ctx, docker, current)
     _restore_deployment(ctx, docker, target)
+    # Spec §21: the restored target is health-checked before it is
+    # promoted. An unhealthy target is reported honestly (health_status)
+    # rather than hidden behind a task failure — the restore happened.
+    target_health = _healthcheck_restored_target(
+        ctx, docker, target, payload, _task_id(task))
     current["status"] = "rolled_back"
     ctx.deployment_store.save(current)
     target["status"] = "running"
+    target["health_status"] = (
+        "healthy" if target_health else
+        "unhealthy" if target_health is False else
+        target.get("health_status", "unknown"))
     ctx.deployment_store.save(target)
     ports_settled = _settle_rollback_ports(
         ctx, _task_id(task), current["deployment_id"], target["deployment_id"])
     return {"deployment_id": current["deployment_id"], "status": "rolled_back",
             "rolled_back_to": target["deployment_id"],
+            "target_health_status": target["health_status"],
             "ports_settled": ports_settled}
 
 
@@ -454,6 +568,7 @@ def handle_build(ctx, task: dict) -> dict:
     """Download an artifact and build a docker image (no run)."""
     payload = _payload(task)
     _require(payload, "project_id", "artifact_id")
+    artifact_id = _validated_artifact_id(payload)
     docker = ctx.require_docker()
     task_id = _task_id(task)
 
@@ -463,14 +578,14 @@ def handle_build(ctx, task: dict) -> dict:
     work_dir = Path(ctx.config.work_dir)
     artifacts_dir = work_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    dest = str(artifacts_dir / f"{payload['artifact_id']}.bin")
-    ctx.log(task_id, f"downloading artifact {payload['artifact_id']}")
+    dest = str(artifacts_dir / f"{artifact_id}.bin")
+    ctx.log(task_id, f"downloading artifact {artifact_id}")
     ctx.api.download_artifact(
-        payload["artifact_id"], dest, expected_size=payload.get("artifact_size"))
+        artifact_id, dest, expected_size=payload.get("artifact_size"))
     if not deploy_pipeline.verify_checksum(dest, expected_checksum):
         quarantine = work_dir / deploy_pipeline.QUARANTINE_DIRNAME
         quarantine.mkdir(parents=True, exist_ok=True)
-        qpath = quarantine / f"{payload['artifact_id']}-{int(time.time())}.bin"
+        qpath = quarantine / f"{artifact_id}-{int(time.time())}.bin"
         import shutil
         shutil.move(dest, qpath)
         raise HandlerError(
@@ -634,20 +749,21 @@ def handle_environment_update(ctx, task: dict) -> dict:
 def handle_artifact_download(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "artifact_id")
+    artifact_id = _validated_artifact_id(payload)
     base = _confined_path(
         Path(ctx.config.apps_dir).resolve(), payload.get("destination"),
         "destination")
-    dest = str(base / f"{payload['artifact_id']}.bin") \
+    dest = str(base / f"{artifact_id}.bin") \
         if base.is_dir() or not payload.get("destination") else str(base)
     base.parent.mkdir(parents=True, exist_ok=True)
-    ctx.log(_task_id(task), f"downloading artifact {payload['artifact_id']}")
+    ctx.log(_task_id(task), f"downloading artifact {artifact_id}")
     ctx.api.download_artifact(
-        payload["artifact_id"], dest, expected_size=payload.get("artifact_size"))
+        artifact_id, dest, expected_size=payload.get("artifact_size"))
     expected = payload.get("artifact_checksum")
     if expected and not deploy_pipeline.verify_checksum(dest, expected):
         os.remove(dest)
         raise HandlerError("downloaded artifact failed checksum verification")
-    return {"artifact_id": payload["artifact_id"], "path": dest,
+    return {"artifact_id": artifact_id, "path": dest,
             "sha256": _sha256_file(dest)}
 
 
