@@ -306,9 +306,10 @@ def handle_rollback(ctx, task: dict) -> dict:
     # Spec §6: the operation is recorded durably on the current
     # deployment's row — requested -> succeeded / failed /
     # partially_reconciled — and a rollback is only reported "rolled_back"
-    # when the target was restored AND verified healthy AND the port
-    # registry settled. Anything less persists rollback_failed, never a
-    # false success.
+    # when the target was restored AND proven healthy (health == healthy,
+    # never merely "not unhealthy") AND the port registry settled. An
+    # unhealthy OR unknown target, or a failed port settle, persists
+    # rollback_failed — never a false success.
     current["rollback_status"] = "requested"
     current["rollback_target_deployment_id"] = target["deployment_id"]
     current.pop("rollback_error", None)
@@ -324,16 +325,28 @@ def handle_rollback(ctx, task: dict) -> dict:
         current["rollback_error"] = str(exc)[:500]
         ctx.deployment_store.save(current)
         raise HandlerError(str(exc)) from exc
-    target_healthy = outcome["target_health_status"] != "unhealthy"
-    # Spec §3: reconcile the control-plane port registry (release the
-    # rolled-back deployment's reservations, re-reserve the target's).
-    # Never fails the rollback; a failure is logged and reported via
-    # ports_settled instead of silently claimed. A skipped settle (no
-    # control-plane session — tests/doubles only) is not a failure.
-    settle = rollback_mod.settle_rollback_ports(
-        ctx, log, current["deployment_id"], outcome["rolled_back_to"])
-    settle_failed = (not settle["settled"]
-                     and settle.get("reason") != "no control-plane session")
+    target_healthy = outcome["target_health_status"] == "healthy"
+    # Spec Part 2 (state machine): healthy -> settle ports -> reconcile
+    # -> rolled_back; (unhealthy|unknown) -> rollback_failed. Port
+    # settlement runs ONLY after the target is proven healthy — settling
+    # the registry for a target whose health is unverified would bless a
+    # broken promotion.
+    if target_healthy:
+        # Spec §3: reconcile the control-plane port registry (release the
+        # rolled-back deployment's reservations, re-reserve the target's).
+        # A settle failure never reports success: it is recorded durably
+        # (rollback_failed / partially_reconciled) with the settle outcome
+        # kept on the row for reconciliation/retry. A skipped settle (no
+        # control-plane session — tests/doubles only) is not a failure.
+        settle = rollback_mod.settle_rollback_ports(
+            ctx, log, current["deployment_id"], outcome["rolled_back_to"])
+        settle_failed = (not settle["settled"]
+                         and settle.get("reason") != "no control-plane session")
+    else:
+        settle = {"settled": False, "released": None, "restored": None,
+                  "skipped": None,
+                  "reason": "settle skipped: target health not verified"}
+        settle_failed = False
     if target_healthy and not settle_failed:
         final_status = "rolled_back"
         rb_status = "succeeded"
@@ -343,6 +356,12 @@ def handle_rollback(ctx, task: dict) -> dict:
         rb_status = "partially_reconciled"
         rb_error = (f"target restored and healthy but port-registry settle "
                     f"failed: {settle.get('reason')}")
+    elif outcome["target_health_status"] == "unknown":
+        final_status = "rollback_failed"
+        rb_status = "failed"
+        rb_error = (f"target {outcome['rolled_back_to']} restored but "
+                    f"target health could not be verified "
+                    f"(target_health_status=unknown)")
     else:
         final_status = "rollback_failed"
         rb_status = "failed"
