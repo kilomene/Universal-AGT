@@ -156,11 +156,14 @@ class UahtClient:
         "api_key": ...}`` — the api_key is shown once.
         """
         headers = {"X-Provisioning-Token": provisioning_token} if provisioning_token else None
-        return self._post(
-            "/agents/register",
-            {"name": name, "type": type, "capabilities": capabilities, "permissions": permissions},
-            headers=headers,
-        )
+        body = {"name": name}
+        if type is not None:
+            body["type"] = type
+        if capabilities is not None:
+            body["capabilities"] = capabilities
+        if permissions is not None:
+            body["permissions"] = permissions
+        return self._post("/agents/register", body, headers=headers)
 
     def me(self):
         return self._get("/agents/me")
@@ -176,17 +179,16 @@ class UahtClient:
 
     # -- §3.2 Tasks ---------------------------------------------------
     def create_task(self, type, payload=None, idempotency_key=None, priority=None, host_id=None, mode=None):
-        return self._post(
-            "/tasks",
-            {
-                "type": type,
-                "payload": payload or {},
-                "idempotency_key": idempotency_key,
-                "priority": priority,
-                "host_id": host_id,
-                "mode": mode,
-            },
-        )
+        body = {"type": type, "payload": payload or {}}
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        if priority is not None:
+            body["priority"] = priority
+        if host_id is not None:
+            body["host_id"] = host_id
+        if mode is not None:
+            body["mode"] = mode
+        return self._post("/tasks", body)
 
     def get_task(self, task_id):
         return self._get(f"/tasks/{task_id}")
@@ -272,16 +274,14 @@ class UahtClient:
         ``{"host": ..., "host_token": ...}`` — the host_token is shown once.
         """
         headers = {"X-Provisioning-Token": provisioning_token} if provisioning_token else None
-        return self._post(
-            "/hosts/register",
-            {
-                "name": name,
-                "host_type": host_type,
-                "capabilities": capabilities,
-                "worker_version": worker_version,
-            },
-            headers=headers,
-        )
+        body = {"name": name}
+        if host_type is not None:
+            body["host_type"] = host_type
+        if capabilities is not None:
+            body["capabilities"] = capabilities
+        if worker_version is not None:
+            body["worker_version"] = worker_version
+        return self._post("/hosts/register", body, headers=headers)
 
     def rotate_host_token(self, host_id, grace_seconds=None):
         """Rotate a host's own control-plane token (protocol §3.4).
@@ -301,10 +301,16 @@ class UahtClient:
 
     # -- §3.5 Projects & artifacts ------------------------------------
     def create_project(self, name, owner=None, repository=None, runtime=None, configuration=None):
-        return self._post(
-            "/projects",
-            {"name": name, "owner": owner, "repository": repository, "runtime": runtime, "configuration": configuration},
-        )
+        body = {"name": name}
+        if owner is not None:
+            body["owner"] = owner
+        if repository is not None:
+            body["repository"] = repository
+        if runtime is not None:
+            body["runtime"] = runtime
+        if configuration is not None:
+            body["configuration"] = configuration
+        return self._post("/projects", body)
 
     def list_projects(self):
         # The server does not paginate this endpoint (no limit/cursor on
@@ -415,18 +421,18 @@ class UahtClient:
     # -- §3.6 Deployments ----------------------------------------------
     def create_deployment(self, project_id, version, host_id=None, artifact_id=None, mode=None,
                           idempotency_key=None, host_port=None):
-        return self._post(
-            "/deployments",
-            {
-                "project_id": project_id,
-                "version": version,
-                "host_id": host_id,
-                "artifact_id": artifact_id,
-                "mode": mode,
-                "idempotency_key": idempotency_key,
-                "host_port": host_port,
-            },
-        )
+        body = {"project_id": project_id, "version": version}
+        if host_id is not None:
+            body["host_id"] = host_id
+        if artifact_id is not None:
+            body["artifact_id"] = artifact_id
+        if mode is not None:
+            body["mode"] = mode
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        if host_port is not None:
+            body["host_port"] = host_port
+        return self._post("/deployments", body)
 
     def get_deployment(self, deployment_id):
         return self._get(f"/deployments/{deployment_id}")
