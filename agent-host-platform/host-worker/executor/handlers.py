@@ -64,10 +64,37 @@ def _restore_deployment(ctx, docker, state: dict) -> None:
     """Bring a rollback target back up: `docker start` for container
     deployments, `docker compose up` with the stored compose file for
     compose deployments. Scoped strictly to the target's own recorded
-    names — never by project-prefix matching."""
+    names — never by project-prefix matching.
+
+    If the target's container was garbage-collected (older than the
+    DEPLOY_KEEP_GENERATIONS window), fall back to rebuilding it from the
+    persisted deployment contract, exactly like reconcile does. Callers
+    must run _verify_target_restorable() BEFORE tearing down the current
+    deployment so a failed rollback never leaves the project down.
+    """
+    from deployments.pipeline import run_spec_from_state
     task_id = "rollback"
     if state.get("container_name"):
-        docker.start(state["container_name"])
+        name = state["container_name"]
+        if docker.container_exists(name):
+            docker.start(name)
+            return
+        # GC'd generation: rebuild from the stored contract.
+        spec = run_spec_from_state(state)
+        image = spec["image"]
+        if not image or not docker.image_exists(image):
+            raise HandlerError(
+                f"rollback target {state.get('deployment_id')} container "
+                f"{name} is gone and its image {image!r} is unavailable; "
+                f"redeploy required"
+            )
+        env = dict(state.get("env") or {})  # non-secret env only, as in reconcile
+        docker.run(name, image, ports=spec["ports"], env=env or None,
+                   memory=spec["memory"], cpus=spec["cpus"],
+                   restart=spec["restart"])
+        ctx.log(task_id,
+                f"rollback target container {name} was GC'd; rebuilt from "
+                f"image {image} (non-secret env only)")
     elif state.get("compose_project"):
         compose_file = state.get("compose_file")
         if not compose_file or not Path(compose_file).is_file():
@@ -82,6 +109,43 @@ def _restore_deployment(ctx, docker, state: dict) -> None:
         raise HandlerError(
             f"rollback target {state.get('deployment_id')} has nothing to restore"
         )
+
+
+def _verify_target_restorable(ctx, docker, target: dict) -> None:
+    """Fail fast (before the current deployment is touched) when the
+    rollback target cannot be brought back up.
+
+    A container target is restorable when its container still exists, or
+    when it can be rebuilt from the persisted contract (image recorded and
+    present). A compose target needs its compose file. Anything else raises
+    HandlerError while the current deployment keeps serving.
+    """
+    from deployments.pipeline import run_spec_from_state
+    target_id = target.get("deployment_id")
+    if target.get("container_name"):
+        name = target["container_name"]
+        if docker.container_exists(name):
+            return
+        spec = run_spec_from_state(target)
+        image = spec["image"]
+        if image and docker.image_exists(image):
+            return
+        raise HandlerError(
+            f"rollback target {target_id} cannot be restored: container "
+            f"{name} is gone (beyond the GC window) and image {image!r} is "
+            f"unavailable; redeploy required"
+        )
+    if target.get("compose_project"):
+        compose_file = target.get("compose_file")
+        if compose_file and Path(compose_file).is_file():
+            return
+        raise HandlerError(
+            f"rollback target {target_id} cannot be restored: compose file "
+            f"{compose_file!r} is missing; redeploy required"
+        )
+    raise HandlerError(  # pragma: no cover — callers check _restorable first
+        f"rollback target {target_id} has nothing to restore"
+    )
 
 
 def _teardown_current(ctx, docker, state: dict) -> None:
@@ -259,6 +323,10 @@ def handle_rollback(ctx, task: dict) -> dict:
         target = candidates[0]  # list_all is newest-first
     ctx.log(_task_id(task),
             f"rolling back {current['deployment_id']} -> {target['deployment_id']}")
+    # Verify BEFORE teardown: a rollback must never destroy the healthy
+    # current deployment when the target cannot be restored (e.g. its
+    # container was garbage-collected beyond the keep-generations window).
+    _verify_target_restorable(ctx, docker, target)
     _teardown_current(ctx, docker, current)
     _restore_deployment(ctx, docker, target)
     current["status"] = "rolled_back"
