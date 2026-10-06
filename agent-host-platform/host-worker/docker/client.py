@@ -119,6 +119,20 @@ def sanitize_ident(value: str, max_len: int = 120) -> str:
     return cleaned[:max_len] or "unnamed"
 
 
+def _reject_flag_like(value: str, what: str) -> str:
+    """Fail closed on a value that would be parsed as a CLI flag.
+
+    A positional argv element starting with "-" is parsed by the docker CLI
+    (pflag) as a FLAG, not as the intended positional — an untrusted payload
+    must never reach that parsing ambiguity (§17, first applied to run()'s
+    image). Values consumed as a flag's own argument (after -t/-f/-e/-p)
+    cannot hit this; only bare positionals need the guard.
+    """
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        raise ValueError(f"invalid {what} {value!r}; must not start with '-'")
+    return value
+
+
 class DockerClient:
     def __init__(self, binary: str = DOCKER_BINARY):
         if shutil.which(binary) is None:
@@ -162,6 +176,10 @@ class DockerClient:
     def build(self, context_dir: str, dockerfile: str, tag: str,
               build_args: Optional[dict] = None, timeout: int = 1200) -> str:
         validate_build_args(build_args)
+        # §17: context_dir is the last positional in the argv — a value
+        # starting with "-" would be parsed as a flag, not the build
+        # context. (dockerfile/tag are consumed as -f/-t values.)
+        _reject_flag_like(context_dir, "build context")
         argv = ["build", "-t", tag, "-f", dockerfile]
         for key, val in (build_args or {}).items():
             argv += ["--build-arg", f"{key}={val}"]
@@ -170,10 +188,15 @@ class DockerClient:
         return (proc.stdout or "")[-4000:]
 
     def image_exists(self, tag: str) -> bool:
+        # §17: tag is a bare positional for `image inspect` — fail closed
+        # on flag-shaped values (state-file tags reach this path via gc).
+        _reject_flag_like(tag, "image tag")
         proc = self._run("image", "inspect", tag, check=False)
         return proc.returncode == 0
 
     def remove_image(self, tag: str) -> None:
+        # §17: tag is a bare positional for `rmi` — see image_exists.
+        _reject_flag_like(tag, "image tag")
         self._run("rmi", tag, check=False)
 
     # -- containers ------------------------------------------------------
@@ -325,6 +348,28 @@ class DockerClient:
         argv += ["down"]
         return self._run(*argv, timeout=timeout, check=False,
                          env=compose_subprocess_env()).stdout[-4000:]
+
+    def _compose_lifecycle(self, subcommand: str, project_name: str,
+                           timeout: int = 300) -> str:
+        """`docker compose -p <name> <restart|stop|start>`.
+
+        Operates on the project's labeled containers — no compose file
+        needed, mirroring compose_ps. Runs with the scrubbed compose env
+        like every other compose invocation.
+        """
+        return self._run("compose", "-p", sanitize_ident(project_name),
+                         subcommand, timeout=timeout,
+                         env=compose_subprocess_env()).stdout[-4000:]
+
+    def compose_restart(self, project_name: str, timeout: int = 300) -> str:
+        return self._compose_lifecycle("restart", project_name,
+                                       timeout=timeout)
+
+    def compose_stop(self, project_name: str, timeout: int = 300) -> str:
+        return self._compose_lifecycle("stop", project_name, timeout=timeout)
+
+    def compose_start(self, project_name: str, timeout: int = 300) -> str:
+        return self._compose_lifecycle("start", project_name, timeout=timeout)
 
     def compose_ps(self, project_name: str, timeout: int = 60) -> list:
         """`docker compose -p <name> ps --format json`, parsed to a list of
