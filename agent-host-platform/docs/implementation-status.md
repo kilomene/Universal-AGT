@@ -8,22 +8,17 @@ in this document: the three categories below. Historical phase notes at the
 bottom are narrative only and carry no competing scores.
 
 **Last verified evidence:**
-- Control-plane API: 311/311 vitest (W18 audit run 2026-10-05/06; 1 flaky
-  failure in 1 of 3 full runs — `secretsRoutes` GET-keys assertion, green
-  on re-run and 3/3 isolated).
-- Host worker: 478/478 pytest (W18 audit run 2026-10-05/06, incl. 6 E2E +
-  12 final-acceptance steps).
-- JS SDK: **42/42** `node:test` (re-run locally 2026-10-06 by WS-J).
-- Python SDK: 40/41 pytest locally 2026-10-06 — 1 failure is a
-  **test-authoring bug** (`test_rotate_host_token_posts_grace_and_adopts_new_token`
-  asserts the literal string `"Bearer <redacted>"` while the client
-  correctly sends the real token; reported to the coordinator, no code
-  change made).
+- Control-plane API: **400/400** vitest (2026-10-06 final pass: 29→30 files).
+- Host worker: **636/636** pytest, 2 skipped (2026-10-06 final pass).
+- JS SDK: **44/44** `node:test` (2026-10-06).
+- Python SDK: **43/43** pytest locally 2026-10-06 (the earlier 40/41 failure
+  was a test-authoring bug in the fixture assertion — fixed, client code was
+  always correct).
 - CLI smoke: 20/20 invocations (19 commands; from CI).
-- CI: **12 jobs green 2026-10-06** (run 37401611475): control-plane,
+- CI: **12 jobs green 2026-10-06** (run 37424657757): control-plane,
   migration-validation, js-sdk, host-worker, installer, python-sdk, cli,
-  dashboard, security, secrets-sweep, dist-drift-guard, e2e (API against a
-  real PostgreSQL 16 service container: migration chain 001–007 applied
+  dashboard, security, secrets-sweep, build-consistency, e2e (API against a
+  real PostgreSQL 16 service container: migration chain 001–010 applied
   via `npm run migrate`, API booted, claim exclusivity proven).
 - Dashboard: `check.py` + dashboard↔route contract match run in CI;
   `index.html` parses, `app.js` passes `node --check`. **No functional
@@ -76,7 +71,7 @@ hidden gaps.
 | A31 | Dashboard | Hosts/apps/deployments/tasks panels, Approvals dossier + confirmations, service actions (restart/stop/start), SSE live, sessionStorage-only key, 401→re-auth; every dashboard-called endpoint contract-matched against real routes in CI | `check.py` + route-match CI job |
 | A32 | CLI | 19 commands (`hosts apps deploy logs restart stop start status rollback domains tasks events agents projects deployments approve reject cancel secrets`), global `--json`, `UAHT_BASE_URL`/`UAHT_API_KEY` or flags, provisioning-token flag for registration | smoke 20/20 |
 | A33 | JS SDK | 42/42 `node:test`; zero-dep; SSE async generator with `since`; `deploy()` helper; `rotateKey`, `tailLogs`, `getLogs`, `addDomain(..., ingress?)` | local run 2026-10-06 |
-| A34 | Python SDK | Parity with JS (`since` forwarded, `on_event` callback, `rotate_agent_key`, `tail_logs`, `add_domain`); 40/41 locally — the 1 failure is the test-authoring bug noted above (reported, not a code defect) | local run 2026-10-06 |
+| A34 | Python SDK | Parity with JS (`since` forwarded, `on_event` callback, `rotate_agent_key`, `tail_logs`, `add_domain`); 43/43 locally 2026-10-06 | local run 2026-10-06 |
 | A35 | E2E chains | 6/6 worker E2E (fake control plane over real HTTP + subprocess-backed containers: full chain, agent disappearance, manual gate, broken app, health-fail rollback, multi-app) + 21/21 API flow tests + 12/12 final-acceptance steps | local runs 2026-10-05/06 |
 
 Provisioning facts preserved: one token (`UAHT_PROVISIONING_TOKEN`), two
