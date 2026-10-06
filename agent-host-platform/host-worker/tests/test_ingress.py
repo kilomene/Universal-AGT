@@ -515,3 +515,76 @@ def test_apply_routes_rewrites_mirror_without_restarting_tunnel(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# §34: cloudflared.log rotation — the tunnel appends forever; the log must
+# never grow unbounded on a persistent host
+# ---------------------------------------------------------------------------
+
+def test_cloudflared_log_rotates_when_over_cap(tmp_path):
+    from ingress.cloudflared import _rotate_log_if_needed
+    log = tmp_path / "cloudflared.log"
+    log.write_bytes(b"x" * 2048)
+    _rotate_log_if_needed(str(log), max_bytes=1024, rotations=1)
+    assert not log.exists(), "oversized log must be rotated away"
+    rotated = tmp_path / "cloudflared.log.1"
+    assert rotated.read_bytes() == b"x" * 2048
+
+
+def test_cloudflared_log_not_rotated_when_under_cap(tmp_path):
+    from ingress.cloudflared import _rotate_log_if_needed
+    log = tmp_path / "cloudflared.log"
+    log.write_bytes(b"x" * 512)
+    _rotate_log_if_needed(str(log), max_bytes=1024, rotations=1)
+    assert log.read_bytes() == b"x" * 512
+    assert not (tmp_path / "cloudflared.log.1").exists()
+
+
+def test_cloudflared_log_rotation_missing_file_is_noop(tmp_path):
+    from ingress.cloudflared import _rotate_log_if_needed
+    # Must not raise — rotation runs on every (re)spawn, including the first.
+    _rotate_log_if_needed(str(tmp_path / "cloudflared.log"),
+                          max_bytes=1024, rotations=1)
+
+
+def test_cloudflared_log_rotation_is_bounded(tmp_path):
+    from ingress.cloudflared import _rotate_log_if_needed
+    log = tmp_path / "cloudflared.log"
+    (tmp_path / "cloudflared.log.1").write_bytes(b"old")
+    log.write_bytes(b"y" * 2048)
+    _rotate_log_if_needed(str(log), max_bytes=1024, rotations=1)
+    # The stale .1 is dropped, not shifted to .2: at most rotations+1 files.
+    assert (tmp_path / "cloudflared.log.1").read_bytes() == b"y" * 2048
+    assert not (tmp_path / "cloudflared.log.2").exists()
+
+
+def test_spawn_rotates_log_before_opening(tmp_path, monkeypatch):
+    # _spawn() must rotate the log before the new tunnel process opens it
+    # for append — otherwise restarts append to an ever-growing file.
+    from ingress import cloudflared as cf_mod
+    from ingress.cloudflared import CloudflaredTunnelProvider
+    rotated = []
+    monkeypatch.setattr(cf_mod, "_rotate_log_if_needed",
+                        lambda path: rotated.append(path))
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.pid = 4242
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(cf_mod.subprocess, "Popen", FakePopen)
+    p = CloudflaredTunnelProvider()
+    p._binary = "/usr/bin/cloudflared"
+    p._log_path = str(tmp_path / "cloudflared.log")
+    p._token = "tok"
+    proc = p._spawn()
+    assert rotated == [p._log_path]
+    assert proc.kwargs["stdout"] is not None
+    # token still via env, never argv (§25)
+    assert "tok" not in " ".join(proc.args[0])
+    assert proc.kwargs["env"]["TUNNEL_TOKEN"] == "tok"
