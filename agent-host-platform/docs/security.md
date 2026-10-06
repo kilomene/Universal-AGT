@@ -44,7 +44,7 @@ Two bearer-token credential kinds, both sent as
 Agent API keys carry a scoped permission set, enforced per endpoint
 (canonical list — `src/middleware/auth.ts`, `PERMISSIONS`):
 
-`deploy`, `approve_deployments`, `read_status`, `restart`, `stop`, `manage_secrets`, `manage_domains`
+`deploy`, `approve_deployments`, `read_status`, `restart`, `stop`, `manage_secrets`, `manage_domains`, `admin`
 
 Register agents with the minimal set for their job. A deploy-only CI agent
 gets `deploy` + `read_status` — it cannot restart services, approve other
@@ -52,6 +52,59 @@ agents' manual deployments, or touch secrets. Approval for manual-mode
 deploys is itself a permission (`approve_deployments`), so the "second pair
 of eyes" can't be the same key that requested the deploy unless you grant
 it both.
+
+`admin` (2026-10-06) is operator-grade: it gates agent lifecycle
+(`POST /v1/agents/:id/suspend|resume|revoke`), project owner assignment
+(`POST /v1/projects/:id/owner`), and project membership management.
+`requireOperator` accepts an agent with `admin` **or** the
+`UAHT_PROVISIONING_TOKEN` bearer, so a deployment without any admin agent
+still has an operator path. Keep `admin` off every key that doesn't
+strictly need it — it is the strongest credential in the agent trust
+model short of the provisioning token itself.
+
+### Agent lifecycle (operator only)
+
+- `POST /v1/agents/:id/suspend` — `active → suspended`. Takes effect
+  immediately: `attachAuth` rejects every non-active agent, so the
+  suspended key stops working on the next request.
+- `POST /v1/agents/:id/resume` — `suspended → active`. A revoked agent
+  can never be resumed.
+- `POST /v1/agents/:id/revoke` — any non-revoked status → `revoked`;
+  the stored `api_key_hash` is replaced with an unmatchable random
+  value, so the key dies instantly and permanently.
+- An agent can never suspend or revoke **itself** (403).
+- Events `agent.suspended` / `agent.resumed` / `agent.revoked` carry the
+  agent id/name and the previous status only — **no secrets**. The agent's
+  queued work stays durable: tasks already claimed keep running on their
+  host; suspended agents' new requests are rejected at auth.
+
+## Project ownership and access control (2026-10-06)
+
+Beyond the global permission flags, the control plane enforces
+resource-level authorization (`src/lib/authz.ts`), wired into the
+projects, deployments, tasks, artifacts, secrets, services, and domains
+routes:
+
+- **`projects.owner_agent_id`** (migration `011`) — the explicit owner
+  of a project. `POST /v1/projects` sets the caller as owner. Backfill:
+  migration `011` resolved the legacy `owner` *name* to an agent row;
+  projects whose owner name could not be resolved are recorded in the
+  `migration_reports` table — never silently assigned to a random agent —
+  and stay ownerless (legacy-open).
+- **`project_members`** — explicit ACL rows granting a non-owner agent
+  access to a project (`GET|POST /v1/projects/:id/members`,
+  `DELETE /v1/projects/:id/members/:agent_id`; reads need
+  `read_status`, changes need `deploy`).
+- **`agent_host_access`** — per-host targeting ACL: an agent may
+  explicitly pin a deployment to a host (`POST /v1/deployments`
+  `host_id`, or `POST /v1/tasks` `host_id`) only when an access row
+  exists for the agent+host pair.
+- **Legacy-open rule (backwards compatibility):** a project with
+  `owner_agent_id IS NULL` is accessible to every agent, and a host with
+  zero `agent_host_access` rows may be targeted by every agent. Existing
+  installations keep working; close an ownerless project down with
+  `POST /v1/projects/:id/owner` (operator), and the first access row for
+  a host switches it to strict mode.
 
 ## Host worker containment
 
@@ -245,6 +298,7 @@ Every security-relevant action emits an event:
 `agent.connected`, `task.*`, `artifact.*`,
 `deployment.*`, `service.*`, `host.registered/online/degraded/offline`,
 `secret.changed`, `secret.deleted`, `agent.key_rotated`,
+`agent.suspended`, `agent.resumed`, `agent.revoked`,
 `host.token_rotated`, `auth.failed` (a presented-but-rejected credential at
 a registration gate — never the credential value). Events are
 **append-only** — there is no delete or
