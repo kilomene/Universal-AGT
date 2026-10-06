@@ -11,6 +11,7 @@ import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { requireAgent, requirePermission } from '../middleware/auth';
 import { authorizeArtifactAccess, authorizeProjectAccess, inList, listAccessibleProjectIds } from '../lib/authz';
+import { validateManifest } from '../lib/manifest';
 import { isUuid } from './_helpers';
 
 export const artifactsRouter = Router();
@@ -58,7 +59,7 @@ function isChecksumFormat(s: unknown): s is string {
 // POST /v1/artifacts/init — agent with deploy permission.
 artifactsRouter.post('/init', requireAgent, requirePermission('deploy'), async (req, res, next) => {
   try {
-    const { project_id, filename, size, checksum, version } = req.body ?? {};
+    const { project_id, filename, size, checksum, version, manifest } = req.body ?? {};
     if (!isUuid(project_id)) {
       sendError(res, 400, 'bad_request', 'project_id (UUID) is required');
       return;
@@ -88,14 +89,33 @@ artifactsRouter.post('/init', requireAgent, requirePermission('deploy'), async (
     const pool = getPool();
     // §10: via project -> owner/ACL (also 404s on a missing project).
     await authorizeProjectAccess(pool, req.auth!.id, project_id);
+    // Fix #1: the artifact may carry its agent.deploy.json manifest. When
+    // present it is validated here with the same grammar the worker
+    // enforces (lib/manifest.ts, twin of the worker's validate_manifest)
+    // and stored on the row; the scheduler then reserves from THIS
+    // manifest — the exact definition the worker will deploy — instead of
+    // the possibly-stale projects.configuration. Omitted -> NULL ->
+    // scheduler falls back to project configuration (legacy behavior).
+    let storedManifest: string | null = null;
+    if (manifest !== undefined && manifest !== null) {
+      const projName = (
+        await pool.query('SELECT name FROM projects WHERE id = $1', [project_id])
+      ).rows[0]?.name;
+      const manifestErrors = validateManifest(manifest, typeof projName === 'string' ? projName : undefined);
+      if (manifestErrors.length > 0) {
+        sendError(res, 422, 'unprocessable', `artifact manifest invalid: ${manifestErrors[0]}`);
+        return;
+      }
+      storedManifest = JSON.stringify(manifest);
+    }
     const id = randomUUID();
     const safeName = basename(filename);
     const storagePath = `${id}/${safeName}`;
     try {
       const { rows } = await pool.query(
-        `INSERT INTO artifacts (id, project_id, filename, storage_path, checksum, size, version, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending') RETURNING *`,
-        [id, project_id, safeName, storagePath, checksum.toLowerCase(), size, version],
+        `INSERT INTO artifacts (id, project_id, filename, storage_path, checksum, size, version, status, manifest)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8) RETURNING *`,
+        [id, project_id, safeName, storagePath, checksum.toLowerCase(), size, version, storedManifest],
       );
       res.status(201).json({ artifact: rows[0], upload_url: `/v1/artifacts/${id}/content` });
     } catch (err: unknown) {
