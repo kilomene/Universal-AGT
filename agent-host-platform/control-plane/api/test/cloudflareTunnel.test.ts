@@ -254,13 +254,17 @@ describe('collectDesiredRoutes', () => {
     expect(managed).toEqual(new Set(['a.example.com', 'b.example.com']));
   });
 
-  it('includes an in-flight (configuring) domain via extra', async () => {
+  it('includes an in-flight (configuring) domain via extra, but does NOT grant it ownership of remote rules', async () => {
+    // W16 hardening: a first-time claim must not silently take over a
+    // remote rule the operator manages outside this system — so `extra`
+    // lands in `desired` but stays OUT of `managed`. setRemoteTunnelIngress
+    // 409s when a desired-but-unmanaged hostname already has a remote rule.
     const d = db([]);
     const { desired, managed } = await collectDesiredRoutes(d as any, {
       hostname: 'new.example.com',
       port: 19000,
     });
     expect(desired).toEqual([{ hostname: 'new.example.com', port: 19000 }]);
-    expect(managed.has('new.example.com')).toBe(true);
+    expect(managed.has('new.example.com')).toBe(false);
   });
 });
