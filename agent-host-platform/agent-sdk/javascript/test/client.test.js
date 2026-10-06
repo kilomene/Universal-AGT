@@ -601,6 +601,25 @@ describe("initArtifact basename", () => {
     await client.initArtifact({ project_id: "p1", filePath: weird, version: "1.0.0" });
     const body = JSON.parse(calls[0].opts.body);
     assert.equal(body.filename, "app.tar.gz");
+    assert.ok(!("manifest" in body));
+  });
+
+  it("sends the manifest when provided (Fix #1: scheduler reserves from it)", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(join(tmpdir(), "uaht-"));
+    const file = join(dir, "app.tar.gz");
+    writeFileSync(file, "bytes");
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "test-key",
+      fetch: mockFetch(jsonResponse(201, { artifact: { id: "a1" }, upload_url: "/v1/artifacts/a1/content" })),
+    });
+    const manifest = { name: "p1", runtime: "docker", resources: { cpu: 2, memory: "1Gi" } };
+    await client.initArtifact({ project_id: "p1", filePath: file, version: "1.0.0", manifest });
+    const body = JSON.parse(calls[0].opts.body);
+    assert.deepEqual(body.manifest, manifest);
   });
 });
 
