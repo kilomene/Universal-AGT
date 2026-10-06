@@ -77,7 +77,7 @@ Universal-AGT/
 cd agent-host-platform/control-plane/api
 npm ci
 npm run build
-# apply migrations 001…007 against Postgres first, then:
+# apply migrations 001…010 against Postgres first, then:
 DATABASE_URL="postgresql://user:pass@localhost:5432/uagt" \
 DATA_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
 UAHT_PROVISIONING_TOKEN="<pick-a-strong-value>" \
@@ -179,6 +179,7 @@ python3 agent-host-platform/examples/validate.py
 | [`docs/security.md`](agent-host-platform/docs/security.md) | Auth model, permissions, worker containment, artifact integrity, rate limits |
 | [`docs/troubleshooting.md`](agent-host-platform/docs/troubleshooting.md) | Symptom → cause → fix for the real failure modes |
 | [`docs/e2e-live-checklist.md`](agent-host-platform/docs/e2e-live-checklist.md) | 14 live-infrastructure checks (Supabase + real host + real Docker) |
+| [`docs/live-acceptance.md`](agent-host-platform/docs/live-acceptance.md) | **Live acceptance**: production smoke-test procedure, required env vars, and the final acceptance checklist |
 | [`docs/implementation-status.md`](agent-host-platform/docs/implementation-status.md) | Acceptance scorecard + per-phase resolution log |
 
 ## Conventions
