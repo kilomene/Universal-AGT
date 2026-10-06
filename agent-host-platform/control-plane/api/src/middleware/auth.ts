@@ -1,6 +1,8 @@
 import type { NextFunction, Request, Response } from 'express';
 import { getPool } from '../db/pool';
 import { HttpError, sendError } from '../lib/errors';
+import { appendEvent } from '../lib/events';
+import { logger } from '../lib/log';
 import { sha256Hex, verifyToken } from '../lib/tokens';
 
 // PROTOCOL §1: two credential kinds, both `Authorization: Bearer <token>`.
@@ -158,6 +160,35 @@ export function requirePermission(name: string) {
   };
 }
 
+// Best-effort audit of a rejected credential at a registration gate.
+// Emits `auth.failed` into the event journal: endpoint, reason, and which
+// header carried the credential — NEVER the credential value itself.
+// Fire-and-forget by design: it must never throw, never block the response,
+// and never leak the presented token into logs. Journal-write volume is
+// bounded by the unauthenticated rate limiter (10/min per IP) on these
+// endpoints, so a brute-force probe cannot flood the journal.
+export async function auditAuthFailure(
+  req: Request,
+  endpoint: string,
+  reason: 'bad_provisioning_token' | 'insufficient_permission',
+): Promise<void> {
+  try {
+    const pool = getPool();
+    await appendEvent(pool, {
+      type: 'auth.failed',
+      actor_type: req.auth?.kind ?? 'anonymous',
+      actor_id: req.auth?.name ?? null,
+      payload: {
+        endpoint,
+        reason,
+        credential_via: req.header('x-provisioning-token') ? 'x-provisioning-token' : 'bearer',
+      },
+    });
+  } catch (err) {
+    logger.warn('auth failure audit failed', { err: String(err) });
+  }
+}
+
 // Provisioning bootstrap for POST /v1/hosts/register: either a matching
 // UAHT_PROVISIONING_TOKEN bearer, or an agent token with the deploy permission.
 // (Choice documented in README: env token for hands-off bootstrap.)
@@ -186,6 +217,14 @@ export function provisioningOrDeploy(req: Request, _res: Response, next: NextFun
   if (!req.auth && !token) {
     return next(new HttpError(401, 'unauthorized', 'missing or invalid provisioning credential (X-Provisioning-Token header or bearer token)'));
   }
+  // A credential was presented but did not authorize this request: either
+  // the provisioning token was wrong, or an authenticated agent lacks the
+  // deploy permission. Both are auditable auth failures.
+  void auditAuthFailure(
+    req,
+    'POST /v1/hosts/register',
+    token ? 'bad_provisioning_token' : 'insufficient_permission',
+  );
   return next(new HttpError(403, 'forbidden', 'host registration requires a provisioning token or the deploy permission'));
 }
 
