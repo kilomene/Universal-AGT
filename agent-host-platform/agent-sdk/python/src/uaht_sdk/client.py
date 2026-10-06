@@ -12,6 +12,7 @@ import hashlib
 import os
 import time
 from typing import Any, Callable, Dict, Iterator, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -19,6 +20,11 @@ from .errors import UahtError
 from .sse import iter_sse_events
 
 TERMINAL_TASK_STATES = frozenset({"completed", "failed", "cancelled"})
+
+# §61: the SDK version has a single source of truth — this constant.
+# pyproject.toml "version" must match it (scripts/check-build-consistency.sh
+# fails CI on drift); the default User-Agent is derived from it.
+__version__ = "1.0.0"
 
 
 def _rows(body: Any, key: str) -> list:
@@ -46,28 +52,35 @@ def _task_logs_text(task: Dict[str, Any]) -> str:
 
 
 class UahtClient:
-    """Agent-facing control-plane client (agent API key, §1)."""
+    """Agent-facing control-plane client (agent API key, §1).
+
+    ``api_key`` is optional: registration flows (``register_agent``,
+    ``register_host`` with a provisioning token) run before any agent key
+    exists. When omitted, no ``Authorization`` header is sent. The client
+    is credential-neutral — a host token can be passed as ``api_key`` for
+    host-side operations like ``rotate_host_token``.
+    """
 
     def __init__(
         self,
         base_url: str,
-        api_key: str,
+        api_key: Optional[str] = None,
         *,
         session: Optional[requests.Session] = None,
-        user_agent: str = "uaht-sdk/1.0.0",
+        user_agent: Optional[str] = None,
     ):
         if not base_url:
             raise TypeError("base_url is required")
-        if not api_key:
-            raise TypeError("api_key is required")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.session = session or requests.Session()
-        self.user_agent = user_agent
+        self.user_agent = user_agent if user_agent is not None else f"uaht-sdk/{__version__}"
 
     # -- internals ----------------------------------------------------
     def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        headers = {"Authorization": f"Bearer {self.api_key}", "User-Agent": self.user_agent}
+        headers = {"User-Agent": self.user_agent}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if extra:
             headers.update(extra)
         return headers
@@ -79,16 +92,21 @@ class UahtClient:
         *,
         body: Any = None,
         params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
         stream: bool = False,
     ) -> Any:
         url = f"{self.base_url}/v1{path}"
         if params:
             params = {k: v for k, v in params.items() if v is not None}
         try:
+            base = {"Content-Type": "application/json"} if body is not None else None
+            if headers:
+                base = dict(base or {})
+                base.update(headers)
             resp = self.session.request(
                 method,
                 url,
-                headers=self._headers({"Content-Type": "application/json"} if body is not None else None),
+                headers=self._headers(base),
                 json=body,
                 params=params,
                 stream=stream,
@@ -118,8 +136,8 @@ class UahtClient:
     def _get(self, path, params=None):
         return self._request("GET", path, params=params)
 
-    def _post(self, path, body=None, params=None):
-        return self._request("POST", path, body=body, params=params)
+    def _post(self, path, body=None, params=None, headers=None):
+        return self._request("POST", path, body=body, params=params, headers=headers)
 
     def _put(self, path, body=None):
         return self._request("PUT", path, body=body)
@@ -128,10 +146,20 @@ class UahtClient:
         return self._request("DELETE", path, body=body)
 
     # -- §3.1 Agents --------------------------------------------------
-    def register_agent(self, name, type=None, capabilities=None, permissions=None):
+    def register_agent(self, name, type=None, capabilities=None, permissions=None, provisioning_token=None):
+        """Register a new agent (protocol §3.1).
+
+        The control plane gates this endpoint on the ``X-Provisioning-Token``
+        header (bootstrap mode allows the very first registration without
+        it). Pass ``provisioning_token``; no agent key is needed — the
+        constructor's ``api_key`` may be omitted. Returns ``{"agent": ...,
+        "api_key": ...}`` — the api_key is shown once.
+        """
+        headers = {"X-Provisioning-Token": provisioning_token} if provisioning_token else None
         return self._post(
             "/agents/register",
             {"name": name, "type": type, "capabilities": capabilities, "permissions": permissions},
+            headers=headers,
         )
 
     def me(self):
@@ -234,6 +262,42 @@ class UahtClient:
 
     def get_host(self, host_id):
         return self._get(f"/hosts/{host_id}")
+
+    def register_host(self, name, host_type=None, capabilities=None, worker_version=None, provisioning_token=None):
+        """Register a host (protocol §3.4).
+
+        Auth: the provisioning token sent as the ``X-Provisioning-Token``
+        header (or as Bearer), OR an agent key with the ``deploy``
+        permission (then the constructor's ``api_key`` is used). Returns
+        ``{"host": ..., "host_token": ...}`` — the host_token is shown once.
+        """
+        headers = {"X-Provisioning-Token": provisioning_token} if provisioning_token else None
+        return self._post(
+            "/hosts/register",
+            {
+                "name": name,
+                "host_type": host_type,
+                "capabilities": capabilities,
+                "worker_version": worker_version,
+            },
+            headers=headers,
+        )
+
+    def rotate_host_token(self, host_id, grace_seconds=None):
+        """Rotate a host's own control-plane token (protocol §3.4).
+
+        Auth is the host token itself (pass it as the constructor's
+        ``api_key``). The server invalidates the old token immediately
+        unless ``grace_seconds`` (1..3600) is given; the client adopts the
+        new token on success. Returns ``{"host_token": ...}``.
+        """
+        body = {}
+        if grace_seconds is not None:
+            body["grace_seconds"] = grace_seconds
+        res = self._post(f"/hosts/{host_id}/rotate-token", body)
+        if isinstance(res, dict) and res.get("host_token"):
+            self.api_key = res["host_token"]
+        return res
 
     # -- §3.5 Projects & artifacts ------------------------------------
     def create_project(self, name, owner=None, repository=None, runtime=None, configuration=None):
@@ -384,8 +448,12 @@ class UahtClient:
 
     def get_domain(self, hostname):
         """Fetch one domain's lifecycle row: status, dns_configured,
-        tunnel_configured, https_reachable, verified_at, error."""
-        return self._get(f"/domains/{hostname}")
+        tunnel_configured, https_reachable, verified_at, error.
+
+        The hostname is URL-encoded to match the JS SDK's
+        ``encodeURIComponent`` (safe='' mirrors its unreserved set closely
+        enough for DNS names, and encodes everything else)."""
+        return self._get(f"/domains/{quote(hostname, safe='')}")
 
     def remove_domain(self, deployment_id, hostname):
         return self._delete("/domains", {"deployment_id": deployment_id, "hostname": hostname})
@@ -411,8 +479,6 @@ class UahtClient:
         return self._get(f"/projects/{project_id}/secrets")
 
     def delete_secret(self, project_id, name):
-        from urllib.parse import quote
-
         return self._delete(f"/projects/{project_id}/secrets/{quote(name, safe='')}")
 
     # -- §3.8 Events ---------------------------------------------------
