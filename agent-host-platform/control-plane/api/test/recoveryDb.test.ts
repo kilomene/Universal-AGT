@@ -66,7 +66,8 @@ function setupDb() {
       total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION,
       total_disk_gb DOUBLE PRECISION,
       cpu_pct DOUBLE PRECISION, ram_pct DOUBLE PRECISION, disk_pct DOUBLE PRECISION,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      worker_draining BOOLEAN NOT NULL DEFAULT false
     );
     CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL,
       owner TEXT, owner_agent_id TEXT, runtime TEXT, configuration JSONB);
@@ -98,7 +99,8 @@ function setupDb() {
       status TEXT NOT NULL DEFAULT 'requested',
       task_id TEXT,
       created_at TIMESTAMPTZ DEFAULT now(),
-      UNIQUE (project_id, host_id, version)
+      UNIQUE (project_id, host_id, version),
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE port_allocations (
       host_id TEXT NOT NULL, port INT NOT NULL, deployment_id TEXT NOT NULL,
