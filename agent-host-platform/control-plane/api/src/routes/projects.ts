@@ -4,6 +4,7 @@ import { sendError, HttpError } from '../lib/errors';
 import { requireAgent, requirePermission } from '../middleware/auth';
 import { isUuid } from './_helpers';
 import { secretsRouter } from './secrets';
+import { DEPLOYMENT_MANIFEST_VERSION } from '../lib/versions';
 
 export const projectsRouter = Router();
 
@@ -42,6 +43,24 @@ function validateConfiguration(configuration: unknown, projectName: string): str
   }
   if (cfg.restart !== undefined && !['no', 'always', 'unless-stopped', 'on-failure'].includes(cfg.restart as string)) {
     return "configuration.restart must be one of: no, always, unless-stopped, on-failure";
+  }
+  // §61: the deployment manifest schema carries a meaningful version. It is
+  // optional (older manifests predate it) but when present it must be a
+  // dotted version, and its major version must not be newer than the schema
+  // this control plane implements — a newer major means a manifest shape we
+  // cannot understand, so it fails fast here instead of mid-deploy.
+  if (cfg.manifestVersion !== undefined) {
+    if (typeof cfg.manifestVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(cfg.manifestVersion)) {
+      return 'configuration.manifestVersion must look like "1.0.0"';
+    }
+    const manifestMajor = parseInt(cfg.manifestVersion.split('.')[0] as string, 10);
+    const supportedMajor = parseInt(DEPLOYMENT_MANIFEST_VERSION.split('.')[0] as string, 10);
+    if (manifestMajor > supportedMajor) {
+      return (
+        `configuration.manifestVersion major version ${manifestMajor} is not supported ` +
+        `(this control plane implements manifest schema ${DEPLOYMENT_MANIFEST_VERSION})`
+      );
+    }
   }
   return null;
 }
