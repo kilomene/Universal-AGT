@@ -26,9 +26,9 @@ openssl rand -hex 32   # paste into DATA_ENCRYPTION_KEY
 ## Running
 
 `dist/` is generated build output and is **never committed** — every run
-builds from `src/`. `npm start` runs the compiled `dist/index.js`, so it
-requires a prior `npm run build`; `npm run prod` does build + start in one
-step.
+builds from `src/`. `npm start` rebuilds `dist/` from `src/` first and then
+runs the compiled `dist/index.js`, so production can never execute a stale
+build; `npm run prod` is an alias for `npm start`.
 
 Against **local Postgres**:
 
