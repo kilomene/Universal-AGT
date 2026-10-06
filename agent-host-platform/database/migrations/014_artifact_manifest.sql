@@ -1,0 +1,25 @@
+-- ============================================================================
+-- 014_artifact_manifest.sql
+--
+-- Fix #1 (resource contract): the resource reservation must represent the
+-- exact resources the host worker will actually deploy. The worker deploys
+-- the artifact's agent.deploy.json manifest — not projects.configuration
+-- (which is set at project creation and can go stale). This column stores
+-- the agent.deploy.json manifest as validated by the control plane at
+-- artifact-init time, using the same grammar the worker enforces
+-- (host-worker/deployments/manifest.py).
+--
+-- Scheduler rule (routes/deployments.ts): when the deployment references
+-- an artifact whose manifest is present, resource requirements (and the
+-- runtime capability) come from artifacts.manifest. When the artifact has
+-- no stored manifest (legacy artifacts, or init without a manifest), the
+-- scheduler falls back to projects.configuration — the previous behavior
+-- is preserved, nothing that worked before breaks.
+--
+-- The worker closes the trust gap at deploy time: it re-validates the
+-- tarball's agent.deploy.json and refuses to deploy when the tarball
+-- demands MORE than the task payload's reserved contract (fail loudly,
+-- never silently over-commit the host).
+-- ============================================================================
+
+ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS manifest jsonb;
