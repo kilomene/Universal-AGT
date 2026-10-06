@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,6 +128,22 @@ class UpdateError(Exception):
     """Self-update failed; the previous version is still active."""
 
 
+# The advertised version becomes path components (<work>/updates/<version>,
+# <work>/releases/<version>). It arrives in the heartbeat response, so
+# validate it as a single safe path component: "../.." or absolute paths
+# must never steer the download/extraction outside the work dir.
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _validate_version(version: str) -> str:
+    if not isinstance(version, str) or not _VERSION_RE.match(version):
+        raise UpdateError(
+            f"refusing worker update: version {version!r} is not a safe "
+            "path component"
+        )
+    return version
+
+
 def _version_key(version: str) -> tuple:
     """Rough semver-ish ordering: '1.2.3' -> (1, 2, 3)."""
     parts = []
@@ -192,6 +209,7 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
     expected_sha = str(update_info.get("sha256", "")).strip().lower()
     if not version or not url or not expected_sha:
         raise UpdateError("worker_update missing version/url/sha256")
+    _validate_version(version)
     if not is_newer(version, current_version):
         if log:
             log(f"update {version} not newer than {current_version}; skipping")
