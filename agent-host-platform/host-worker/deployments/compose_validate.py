@@ -75,7 +75,7 @@ DENIED_MOUNT_BASENAMES = ("docker.sock",)
 
 #: Restart policies / memory / cpu formats accepted for resource limits.
 _CPU_RE = re.compile(r"^\d+(\.\d+)?$")
-_MEMORY_RE = re.compile(r"^\d+(\.\d+)?[bkmgBKMG]$|^\d+$")
+_MEMORY_RE = re.compile(r"^\d+(\.\d+)?[bkmgBKMG][iI]?$|^\d+$")  # optional `i` suffix: "512Mi" is manifest-valid
 
 
 # ---------------------------------------------------------------------------
