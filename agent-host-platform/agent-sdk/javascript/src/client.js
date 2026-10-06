@@ -9,7 +9,15 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { Readable } from "node:stream";
+
+// §61: the SDK version has a single source of truth — package.json.
+// The default User-Agent is derived from it so the two can never drift.
+const require = createRequire(import.meta.url);
+const { version: SDK_VERSION } = require("../package.json");
+
+export { SDK_VERSION };
 
 export class UahtError extends Error {
   /** @param {string} code - protocol error code (e.g. "forbidden") */
@@ -26,11 +34,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class UahtClient {
   /**
-   * @param {{baseUrl: string, apiKey: string, fetch?: typeof fetch, userAgent?: string}} opts
+   * @param {{baseUrl: string, apiKey?: string, fetch?: typeof fetch, userAgent?: string}} opts
+   *
+   * `apiKey` is optional: registration flows (`registerAgent`,
+   * `registerHost` with a provisioning token) run before any agent key
+   * exists. When omitted, no `Authorization` header is sent.
    */
-  constructor({ baseUrl, apiKey, fetch: fetchImpl, userAgent = "uaht-sdk/1.0.0" }) {
+  constructor({ baseUrl, apiKey = null, fetch: fetchImpl, userAgent = `uaht-sdk/${SDK_VERSION}` }) {
     if (!baseUrl) throw new TypeError("baseUrl is required");
-    if (!apiKey) throw new TypeError("apiKey is required");
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.apiKey = apiKey;
     this.fetch = fetchImpl || globalThis.fetch.bind(globalThis);
@@ -38,11 +49,9 @@ export class UahtClient {
   }
 
   _headers(extra = {}) {
-    return {
-      Authorization: `Bearer ${this.apiKey}`,
-      "User-Agent": this.userAgent,
-      ...extra,
-    };
+    const headers = { "User-Agent": this.userAgent, ...extra };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    return headers;
   }
 
   async _request(method, path, { body, query, headers } = {}) {
@@ -94,8 +103,8 @@ export class UahtClient {
   _get(path, query) {
     return this._request("GET", path, { query });
   }
-  _post(path, body, query) {
-    return this._request("POST", path, { body, query });
+  _post(path, body, query, headers) {
+    return this._request("POST", path, { body, query, headers });
   }
   _put(path, body) {
     return this._request("PUT", path, { body });
@@ -105,8 +114,20 @@ export class UahtClient {
   }
 
   // ---- §3.1 Agents ----
-  registerAgent({ name, type, capabilities, permissions }) {
-    return this._post("/agents/register", { name, type, capabilities, permissions });
+  /**
+   * Register a new agent (protocol §3.1). The control plane gates this
+   * endpoint on the `X-Provisioning-Token` header (bootstrap mode allows
+   * the very first registration without it). Pass `provisioningToken`;
+   * no agent key is needed — the constructor's apiKey may be omitted.
+   * @returns {{agent: object, api_key: string}} — the api_key is shown once.
+   */
+  registerAgent({ name, type, capabilities, permissions, provisioningToken }) {
+    return this._post(
+      "/agents/register",
+      { name, type, capabilities, permissions },
+      undefined,
+      provisioningToken ? { "X-Provisioning-Token": provisioningToken } : undefined
+    );
   }
   me() {
     return this._get("/agents/me");
@@ -229,6 +250,37 @@ export class UahtClient {
   }
   getHost(id) {
     return this._get(`/hosts/${id}`);
+  }
+
+  /**
+   * Register a host (protocol §3.4). Auth: the provisioning token sent as
+   * the `X-Provisioning-Token` header (or as Bearer), OR an agent key with
+   * the `deploy` permission (then the constructor's apiKey is used).
+   * @returns {{host: object, host_token: string}} — the host_token is shown once.
+   */
+  registerHost({ name, host_type, capabilities, worker_version, provisioningToken }) {
+    return this._post(
+      "/hosts/register",
+      { name, host_type, capabilities, worker_version },
+      undefined,
+      provisioningToken ? { "X-Provisioning-Token": provisioningToken } : undefined
+    );
+  }
+
+  /**
+   * Rotate a host's own control-plane token (protocol §3.4). Auth is the
+   * host token itself (pass it as the constructor's apiKey — the client
+   * is agent-neutral about which credential kind it carries).
+   * The server invalidates the old token immediately unless `graceSeconds`
+   * (1..3600) is given; the client adopts the new token on success.
+   * @returns {{host_token: string}}
+   */
+  async rotateHostToken(id, { graceSeconds } = {}) {
+    const body = {};
+    if (graceSeconds !== undefined && graceSeconds !== null) body.grace_seconds = graceSeconds;
+    const res = await this._post(`/hosts/${id}/rotate-token`, body);
+    if (res && res.host_token) this.apiKey = res.host_token;
+    return res;
   }
 
   // ---- §3.5 Projects & artifacts ----
