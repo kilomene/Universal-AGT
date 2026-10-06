@@ -138,6 +138,10 @@ export async function uploadArtifactContent(req: Request, res: Response, next: N
       next(new HttpError(404, 'not_found', 'artifact not found'));
       return;
     }
+    // §10: via artifact -> project -> project ACL. Without this gate any
+    // agent with the deploy permission could overwrite another project's
+    // artifact bytes (W3 Part 4 audit, 2026-10-06).
+    await authorizeArtifactAccess(pool, req.auth!.id, id);
     if (artifact.status === 'ready') {
       sendError(res, 409, 'conflict', 'artifact content already uploaded');
       return;
