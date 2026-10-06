@@ -51,7 +51,7 @@ retryable failures, and `cancelled` reachable from any non-terminal state.
 |---|---|---|---|
 | GET | `/v1/hosts` | agent key (`read_status`) | All hosts |
 | GET | `/v1/hosts/:id` | agent key (`read_status`) | Host + last heartbeat stats + running apps |
-| POST | `/v1/hosts/register` | Bearer provisioning token (`UAHT_PROVISIONING_TOKEN`) **or** agent key with `deploy` | Register a host; returns `host_token` **once** |
+| POST | `/v1/hosts/register` | `X-Provisioning-Token` header **or** `Authorization: Bearer <token>` (`UAHT_PROVISIONING_TOKEN`), **or** agent key with `deploy` | Register a host; returns `host_token` **once** |
 | POST | `/v1/hosts/:id/rotate-token` | host token | Rotate the host's token; returns the **new** token once |
 
 ## Worker-facing (host token only)
@@ -106,12 +106,17 @@ Deployment statuses: `requested`, `approved`, `building`, `starting`,
 | GET | `/v1/domains/:hostname` | agent key (`manage_domains`) | One domain's full lifecycle state |
 | DELETE | `/v1/domains` | agent key (`manage_domains`) | Detach: delete tunnel route + DNS record, verify gone (`{"deployment_id","hostname"}`) |
 
-Domain lifecycle: `requested → configuring → active → failed`, and
-`removing → removed` on detach. A domain attached to a deployment that
-reaches a terminal state is marked `failed` (routes dropped, DNS removed,
-event emitted); see [`cloudflare.md`](cloudflare.md) for the two ingress
-modes and the remote-vs-local control authority statement — DNS alone
-cannot reach an outbound-only host.
+Domain lifecycle: `requested → configuring → active → failed`, with
+`degraded` as a live-but-unverified state (`active → degraded → active`
+on recovery, `→ failed` when unrecoverable), and `removing → removed` on
+detach. A domain attached to a deployment that reaches a terminal state
+is marked `failed` (routes dropped, DNS removed, event emitted); the
+domain reconciler (`DOMAIN_RECONCILE_INTERVAL_S`) periodically
+re-verifies active domains against the authoritative remote tunnel
+configuration and emits `domain.reconcile` (plus `domain.degraded` /
+`domain.recovered` on transitions); see [`cloudflare.md`](cloudflare.md)
+for the two ingress modes and the remote-vs-local control authority
+statement — DNS alone cannot reach an outbound-only host.
 
 ## Secrets
 
@@ -128,8 +133,10 @@ cannot reach an outbound-only host.
 | GET | `/v1/events?type=&since=&limit=&cursor=` | agent key (`read_status`) | Paginated event history |
 | GET | `/v1/events/stream` | agent key (`read_status`) | SSE live stream, `data: {event}\n\n` per event |
 
-Canonical event types (41 — every type the server emits; see PROTOCOL §3.8):
-`agent.connected`, `agent.key_rotated`,
+Canonical event types (46 — every type the server emits, verified by
+extracting all event literals from `control-plane/api/src/routes/` +
+`lib/` + `middleware/` 2026-10-06):
+`agent.connected`, `agent.key_rotated`, `auth.failed`,
 `task.created/claimed/started/retrying/awaiting_approval/approved/rejected/completed/failed/cancelled`,
 `task.requeued`,
 `artifact.created`, `artifact.upload_failed`,
@@ -137,10 +144,19 @@ Canonical event types (41 — every type the server emits; see PROTOCOL §3.8):
 `deployment.rollback_requested`, `deployment.rollback_failed`,
 `deployment.ports_settled`,
 `service.started/stopped/restarted/removed`, `service.crash_loop`,
-`domain.requested/active/failed/removed`, `domain.remove_failed`,
+`domain.requested/active/degraded/recovered/failed/removed`,
+`domain.remove_failed`, `domain.reconcile`,
 `host.registered/online/offline/degraded`, `host.token_rotated`,
+`host.worker_outdated`,
 `secret.changed`, `secret.deleted`.
 Treat unknown types as opaque.
+
+(2026-10-06 correction, synced in PROTOCOL §3.8 the same day: earlier
+revisions of these docs said 41 — the W15 contract audit missed
+`auth.failed` (emitted on bad provisioning token, `middleware/auth.ts`),
+`host.worker_outdated` (heartbeat with an old worker, `routes/worker.ts`),
+and the domain reconciler's `domain.degraded`/`domain.recovered`/
+`domain.reconcile` (`routes/domains.ts`, `lib/domainReconciler.ts`).)
 
 ## Misc
 
