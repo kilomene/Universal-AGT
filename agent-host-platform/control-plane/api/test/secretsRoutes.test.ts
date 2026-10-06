@@ -72,7 +72,9 @@ function setupDb() {
       token_hash TEXT NOT NULL,
       idempotency_key TEXT,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE projects (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
@@ -112,7 +114,8 @@ function setupDb() {
     CREATE TABLE deployments (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
       host_id TEXT NOT NULL, version TEXT,
-      status TEXT NOT NULL DEFAULT 'requested'
+      status TEXT NOT NULL DEFAULT 'requested',
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
   `);
   const pg = db.adapters.createPg();
