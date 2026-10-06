@@ -234,7 +234,7 @@ describe('collectDesiredRoutes', () => {
         if (sql.includes('FROM domains d')) {
           return {
             rows: domains
-              .filter((d) => d.status === 'active' && d.ingress === 'tunnel')
+              .filter((d) => ['active', 'degraded'].includes(d.status) && d.ingress === 'tunnel')
               .map((d) => ({ hostname: d.hostname, deployment_id: d.deployment_id })),
           };
         }
@@ -248,10 +248,16 @@ describe('collectDesiredRoutes', () => {
       { hostname: 'a.example.com', deployment_id: 'd1', status: 'active', ingress: 'tunnel' },
       { hostname: 'b.example.com', deployment_id: 'd2', status: 'failed', ingress: 'tunnel' },
       { hostname: 'c.example.com', deployment_id: 'd3', status: 'active', ingress: 'direct' },
+      { hostname: 'g.example.com', deployment_id: 'd4', status: 'degraded', ingress: 'tunnel' },
     ]);
     const { desired, managed } = await collectDesiredRoutes(d as any);
-    expect(desired).toEqual([{ hostname: 'a.example.com', port: 18001 }]);
-    expect(managed).toEqual(new Set(['a.example.com', 'b.example.com']));
+    // 'degraded' rows are should-be-routed: the reconcile keeps their
+    // remote rules instead of dropping them mid-verification-gap.
+    expect(desired).toEqual([
+      { hostname: 'a.example.com', port: 18001 },
+      { hostname: 'g.example.com', port: 18001 },
+    ]);
+    expect(managed).toEqual(new Set(['a.example.com', 'b.example.com', 'g.example.com']));
   });
 
   it('includes an in-flight (configuring) domain via extra, but does NOT grant it ownership of remote rules', async () => {
