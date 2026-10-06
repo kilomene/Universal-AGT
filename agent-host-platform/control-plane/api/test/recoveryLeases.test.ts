@@ -52,7 +52,9 @@ function setupDb() {
       token_hash TEXT NOT NULL,
       idempotency_key TEXT,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY DEFAULT gen_random_uuid(), type TEXT NOT NULL,
@@ -71,7 +73,8 @@ function setupDb() {
       project_id TEXT NOT NULL, host_id TEXT, version TEXT,
       status TEXT NOT NULL DEFAULT 'requested',
       task_id TEXT,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE events (
       id SERIAL PRIMARY KEY, type TEXT NOT NULL,
