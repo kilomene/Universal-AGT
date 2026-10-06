@@ -31,7 +31,14 @@ pool or listening: production (default — `NODE_ENV` unset or anything other
 than `development`) is strict and refuses to boot on any missing/malformed
 required variable, naming it precisely. `NODE_ENV=development` relaxes
 **only** `UAHT_PROVISIONING_TOKEN` (agent-registration bootstrap mode) and
-says so at boot. There are no insecure fallbacks in any mode.
+says so at boot. There are no insecure fallbacks in any mode. The validator
+also rejects malformed optional configuration — an invalid
+`TUNNEL_INGRESS_HOSTNAME`, tunnel ingress without Cloudflare tunnel
+credentials, a half-configured Cloudflare DNS (token without zone or vice
+versa), an invalid `PUBLIC_INGRESS_HOSTNAME` / `PORT`, non-positive rate
+limits, and conflicting heartbeat thresholds — and reports non-fatal issues
+(DNS credentials with no ingress target, `LOG_LEVEL=debug` in production)
+as boot warnings. Secret values are never printed, only variable names.
 
 | Variable | Required in production | Default / notes |
 |---|---|---|
@@ -47,12 +54,14 @@ says so at boot. There are no insecure fallbacks in any mode.
 | `RATE_LIMIT_AGENT_PER_MIN` | no | `120` |
 | `RATE_LIMIT_HOST_PER_MIN` | no | `600` |
 | `RATE_LIMIT_UNAUTH_PER_MIN` | no | `10` per IP (registration/login-shaped endpoints) |
+| `UAHT_ROTATE_RATE_PER_MIN` | no | `10` per credential (rotation endpoints) |
 | `HEARTBEAT_SWEEP_INTERVAL_S` | no | `30` |
 | `HEARTBEAT_DEGRADED_AFTER_S` | no | `90` |
 | `HEARTBEAT_OFFLINE_AFTER_S` | no | `300` |
 | `PG_POOL_MAX` | no | `10` |
 | `LOG_LEVEL` | no | `info` |
 | `CLOUDFLARE_API_TOKEN` | no | Optional; with `CLOUDFLARE_ZONE_ID` enables `POST /v1/domains` DNS management (scoped to Zone / DNS / Edit). |
+| `CLOUDFLARE_API_BASE` | no | Test hook only — leave unset in production. Defaults to `https://api.cloudflare.com/client/v4`. |
 | `CLOUDFLARE_ZONE_ID` | no | Optional; see above. |
 | `CLOUDFLARE_TUNNEL_API_TOKEN` | no | Optional; dedicated token for tunnel config sync (needs Account / Cloudflare Tunnel / Edit). Falls back to `CLOUDFLARE_API_TOKEN` when unset. See `docs/cloudflare.md`. |
 | `CLOUDFLARE_ACCOUNT_ID` | no | Optional; required alongside a tunnel token for tunnel route management (tunnel id is parsed from `TUNNEL_INGRESS_HOSTNAME`). |
