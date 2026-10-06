@@ -289,3 +289,46 @@ def test_is_newer_ordering():
     assert self_update.is_newer("1.0.1", "1.0.0")
     assert not self_update.is_newer("1.0.0", "1.0.0")
     assert not self_update.is_newer("0.9.9", "1.0.0")
+
+
+# ---------------------------------------------------------------------------
+# WS2 re-audit: the advertised version becomes filesystem path components
+# (<work>/updates/<version>, <work>/releases/<version>). A traversal in the
+# version string must be refused before any directory is created.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("bad_version", [
+    "../../evil",
+    "..\\evil",
+    "../..",
+    "/abs/path",
+    "1.0;rm",
+    "1.0\n2.0",
+    "-leading-dash",
+    ".hidden",
+    "v" * 65,  # over the length cap
+])
+def test_malicious_version_refused_before_any_download(tmp_path, work, bad_version):
+    def _must_not_run(url, dest):
+        raise AssertionError("download must not be attempted")
+
+    with pytest.raises(self_update.UpdateError, match="not a safe path component"):
+        self_update.apply_update(
+            {"version": bad_version, "url": "https://example.com/w.tar.gz",
+             "sha256": "ab" * 32},
+            str(work), "1.0.0", download_fn=_must_not_run)
+    # No update/release directory was created for the hostile version.
+    assert not (work / "updates" / bad_version).exists()
+    assert (tmp_path / "evil").exists() is False
+
+
+def test_empty_version_rejected_as_missing(tmp_path, work):
+    with pytest.raises(self_update.UpdateError, match="missing version/url/sha256"):
+        self_update.apply_update(
+            {"version": "", "url": "https://example.com/w.tar.gz",
+             "sha256": "ab" * 32},
+            str(work), "1.0.0")
+
+
+@pytest.mark.parametrize("good_version", ["1.2.3", "2.0.0-rc1", "v1_2", "2026.10.06"])
+def test_sane_versions_still_accepted_as_paths(work, good_version):
+    assert self_update._validate_version(good_version) == good_version
