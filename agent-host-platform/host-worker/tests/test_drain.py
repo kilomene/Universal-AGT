@@ -182,7 +182,56 @@ def test_enrich_heartbeat_payload_has_no_secrets():
     assert not any("token" in key.lower() for key in out)
 
 
-# -- claim_loop behavior ----------------------------------------------------------
+# -- heartbeat_loop log-prune wiring ------------------------------------------------
+
+
+class _FakeHeartbeatAPI:
+    def __init__(self):
+        self.heartbeats = 0
+
+    def heartbeat(self, host_id, payload):
+        self.heartbeats += 1
+        return {"pending_tasks": 0, "host": {"status": "online"}}
+
+
+class _FakeLogStore:
+    def __init__(self):
+        self.prune_calls = 0
+
+    def prune(self, max_age_days=None, deployment_store=None, log=None):
+        self.prune_calls += 1
+        return {"deleted": [], "kept": [], "errors": []}
+
+
+def test_heartbeat_loop_prunes_every_20th_heartbeat(monkeypatch):
+    ctx = _ctx(heartbeat_interval=1)
+    api = _FakeHeartbeatAPI()
+    store = _FakeLogStore()
+    ctx.api = api
+    ctx.log_store = store
+    monkeypatch.setattr(main_mod.health_collector, "collect_metrics",
+                        lambda **kw: {})
+    monkeypatch.setattr(main_mod.crashloop_mod, "evaluate",
+                        lambda ctx, **kw: [])
+    monkeypatch.setattr(main_mod.self_update, "check_and_apply",
+                        lambda resp, ctx, log=None: None)
+    # drive 21 heartbeats quickly: interval=1s would be slow, so patch the
+    # wait to return immediately and stop after 21 beats
+    original_wait = threading.Event.wait
+    def fast_wait(self, timeout=None):
+        if api.heartbeats >= 21:
+            self.set()
+        return original_wait(self, 0.001)
+    monkeypatch.setattr(threading.Event, "wait", fast_wait)
+    stop = threading.Event()
+    thread = threading.Thread(target=main_mod.heartbeat_loop,
+                              args=(ctx, stop), daemon=True)
+    thread.start()
+    thread.join(timeout=15)
+    assert not thread.is_alive()
+    assert api.heartbeats >= 20
+    # prune fires on the 20th heartbeat only
+    assert store.prune_calls == 1
 
 
 class _FakeAPI:
