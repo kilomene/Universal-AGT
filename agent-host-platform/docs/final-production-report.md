@@ -220,7 +220,21 @@
 - **Clients:** JS SDK `client.test.js` extended; Python SDK `test_client.py` (fixture fix); CLI `smoke_help.py` extended (37 commands JSON-valid).
 
 ## 7. Full CI result
-*(To be filled after the push — the run is watched to green per standing orders.)*
+**GREEN — run 37423891504, commit `b54767b6`, 2026-10-06:** all 12 jobs pass:
+| Job | Result |
+|---|---|
+| Control Plane API (tsc + vitest) | ✅ success |
+| Host Worker (pytest) | ✅ success |
+| Security tests (API + host worker) | ✅ success |
+| JS SDK (node:test) | ✅ success |
+| Python SDK (pytest) | ✅ success |
+| CLI (smoke) | ✅ success |
+| Dashboard (static check) | ✅ success |
+| Migrations (numbering + parse + schema coverage) | ✅ success |
+| E2E smoke (API + real PostgreSQL 16) | ✅ success |
+| Installer validation (dry-run, no root) | ✅ success |
+| Build consistency (no committed output, clean source build, version coherence) | ✅ success |
+| Secrets sweep | ✅ success |
 
 ## 8. Live infrastructure tests performed
 None could be executed: no persistent Linux host, no Supabase project, and no Cloudflare API token were available to this pass (see §10). Everything below was verified against real components locally (real PostgreSQL 16 in CI's e2e job, real API server + pg-mem suites, real worker logic, labeled fake-Cloudflare doubles).
