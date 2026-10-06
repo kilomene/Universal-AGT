@@ -47,6 +47,13 @@ STATUS_FILENAME = "worker.status.json"
 HEALTH_TIMEOUT_S = int(os.environ.get("WORKER_UPDATE_HEALTH_TIMEOUT_S", "120") or 120)
 HEALTH_POLL_INTERVAL_S = 5
 
+# The update tarball is extracted with tarfile.data_filter (PEP 706),
+# which exists only on Python 3.12+. The installer enforces >= 3.12;
+# this probe turns a stale interpreter into a clear UpdateError instead
+# of an unhandled TypeError — extraction must never run without the
+# symlink/hardlink protection.
+_HAS_DATA_FILTER = hasattr(tarfile, "data_filter")
+
 
 def write_status_file(work_dir: str, version: str) -> Path:
     """Record a boot marker for the post-update health gate to read."""
@@ -248,6 +255,18 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
         raise UpdateError(
             f"update {version} checksum mismatch (got {actual_sha[:16]}...); "
             "aborted, current version untouched")
+
+    # Refuse before creating anything: tarball extraction needs
+    # tarfile.data_filter (PEP 706, Python 3.12+) for symlink/hardlink
+    # protection. The installer enforces >= 3.12; on a stale interpreter
+    # fail closed here instead of an unhandled TypeError mid-extract.
+    if not _HAS_DATA_FILTER:
+        raise UpdateError(
+            "refusing worker update: this worker runs on Python "
+            f"{sys.version.split()[0]}, but tarball extraction requires "
+            "tarfile.data_filter (Python 3.12+) for symlink/hardlink "
+            "protection"
+        )
 
     if release_dir.exists():
         shutil.rmtree(release_dir)
