@@ -27,9 +27,16 @@ the implementation; where a value is a secret, the guide uses a
 
 ## 1. Database: Supabase setup + migrations in order
 
-1. Create a Supabase project; note the **connection string** (use the
-   transaction pooler URI if your client is serverless — the API uses a
-   `pg` pool, `PG_POOL_MAX=10` by default).
+1. Create a Supabase project; note the **connection string**. For the
+   control-plane API, use the **direct connection** (port `5432`) or a
+   **session-mode** pooler URI — NOT the transaction-mode pooler: the API
+   holds a persistent `LISTEN uag_events` connection for the SSE event
+   bus, and transaction-mode poolers (Supavisor) do not support
+   `LISTEN`/`NOTIFY`. The bus degrades gracefully (a 5s backstop poll
+   keeps events flowing when `LISTEN` is unavailable), but live SSE
+   latency stretches to ~5s. The direct connection also avoids surprises
+   with the startup migration runner, which holds one connection per
+   migration.
 2. Apply the migrations **in order** — either let the API do it (it runs
    `runMigrations` at every startup) or apply explicitly:
 
@@ -49,7 +56,7 @@ The files: `agent-host-platform/database/migrations/`:
 | 004 | `004_phase3_reliability.sql` | Claim leases, retry bookkeeping, port registry, `draining` host state |
 | 005 | `005_events_truncate_block.sql` | `REVOKE TRUNCATE ON events FROM PUBLIC` — stops non-owner roles truncating the append-only journal (no superuser needed; full protection needs separate table ownership, see `docs/security.md`) |
 | 006 | `006_token_rotation_grace.sql` | Host token rotation grace window: `previous_token_hash` + `previous_token_expires_at` on `hosts` (no privilege issues) |
-| 007 | `007_domains_lifecycle.sql` | Domains become a first-class `domains` table (`requested → configuring → active → failed`, `removing → removed`); backfills from the legacy `deployments.domains` JSONB mirror (no privilege issues) |
+| 007 | `007_domains_lifecycle.sql` | Domains become a first-class `domains` table (`requested → configuring → active → failed`, `degraded` as a live-but-unverified state, `removing → removed`); backfills from the legacy `deployments.domains` JSONB mirror (no privilege issues) |
 
 Verify:
 
@@ -76,6 +83,46 @@ safe path is always the same:
 `005` is database-global, not a schema object: `pg_dump` schema-only
 dumps do not capture it, so re-apply it after any database restore.
 
+### Migration runner notes
+
+- Migrations are numbered `001`…`007`, no gaps (CI enforces this).
+- A migration file may opt out of the runner's transaction wrapper with
+  a marker line `-- migrate: no-transaction` (parsed by
+  `src/db/migrate.ts` `requiresNoTransaction`) — for statements that
+  cannot run inside a transaction block. No current migration uses it;
+  the old `005` event-trigger revision needed it before PostgreSQL
+  rejected the approach entirely (event triggers do not support
+  `TRUNCATE` — verified on PG 16).
+- `database/schema/schema.sql` is kept as the canonical superset of the
+  chain (CI checks every table the migrations create exists there).
+
+### Supabase project-level setup (what the dashboard/SQL editor must do once)
+
+1. **`pgcrypto` extension** — allowlisted on Supabase; enable in
+   Dashboard → Database → Extensions, or run
+   `create extension "pgcrypto";` in the SQL editor. (Migration `001`
+   does `CREATE EXTENSION IF NOT EXISTS "pgcrypto"` itself when the
+   connection can — the API's startup preflight
+   `checkMigrationPrivileges` fails fast with this exact path instead
+   of a cryptic error when it cannot.)
+2. **Role ownership.** Run the migrations as the `postgres` role (SQL
+   editor). All other migrations (`002`–`007`) are plain DDL/DML that
+   need only *table ownership*, not superuser — they run fine as any
+   role that owns the tables, which is why the chain also works against
+   a local Postgres when run as a non-superuser owner role. Keep the
+   API's `DATABASE_URL` on the same role that owns the tables (the
+   `postgres` role on Supabase), or `ALTER TABLE … OWNER TO` them all
+   to a dedicated app role. Startup itself runs
+   `CREATE TABLE IF NOT EXISTS schema_migrations`, so the runtime role
+   needs `CREATE` on the `public` schema.
+3. **No RLS needed.** The tables are not row-level-security gated; the
+   API authorizes in application code. Supabase's `anon`/`service_role`
+   keys are irrelevant here — connect the API as the owning role via
+   the database connection string, not the API keys.
+4. **Poole`r mode** — see §1: direct/session-mode for the API so
+   `LISTEN uag_events` works; transaction mode only degrades SSE
+   liveness to the 5s backstop poll.
+
 ## 2. Environment variables (control plane)
 
 Copy `control-plane/api/.env.example` to `.env` and fill it in. Every
@@ -97,6 +144,7 @@ reference for every configuration name in the system — including the
 | `RATE_LIMIT_AGENT_PER_MIN` | `120` | Per agent API key |
 | `RATE_LIMIT_HOST_PER_MIN` | `600` | Per host token |
 | `RATE_LIMIT_UNAUTH_PER_MIN` | `10` | Per IP, unauthenticated (registration, etc.) |
+| `UAHT_ROTATE_RATE_PER_MIN` | `10` | Per credential, credential-rotation endpoints (`/agents/me/rotate`, `/hosts/:id/rotate-token`) |
 | `HEARTBEAT_SWEEP_INTERVAL_S` | `30` | Stale-host sweeper cadence |
 | `HEARTBEAT_DEGRADED_AFTER_S` | `90` | No heartbeat this long → `degraded` (`host.degraded`) |
 | `HEARTBEAT_OFFLINE_AFTER_S` | `300` | No heartbeat this long → `offline` (`host.offline`). Operator-set `draining` is never auto-flipped. |
@@ -133,16 +181,16 @@ npm run build
 npm start        # serves REST at /v1 and the dashboard at /
 ```
 
-`npm start` runs the compiled output in `dist/`, so it **requires a prior
-`npm run build`** — `dist/` is never committed to the repo. Use
-`npm run prod` (build + start in one step) when you want a single command:
+`npm start` rebuilds `dist/` from `src/` before running it, so it can never
+execute a stale build — `dist/` is never committed to the repo. `npm run
+prod` is an alias for `npm start`:
 
 ```bash
-npm run prod     # npm run build && npm start
+npm run prod     # same as npm start (builds from source, then serves)
 ```
 
 `npm start` runs migrations automatically; `npm run migrate` does it
-explicitly. Health check: `GET /v1/health` → `{ok: true, version, time}`.
+explicitly. Health check: `GET /v1/health` → `{ok: true, version, min_worker_version, time}`.
 
 ### systemd example
 
@@ -277,14 +325,14 @@ H="X-Provisioning-Token: <your-UAHT_PROVISIONING_TOKEN>"
 # muse: full operator — deploy, restart/stop services, approve manual deploys
 curl -s -X POST $CP/v1/agents/register -H 'Content-Type: application/json' -H "$H" \
   -d '{"name": "muse", "type": "ci", "capabilities": ["docker", "compose"],
-       "permissions": {"deploy": true, "read_status": true, "read_logs": true,
+       "permissions": {"deploy": true, "read_status": true,
                        "restart": true, "stop": true, "approve_deployments": true}}'
 # → 201 {"agent": {...}, "api_key": "<show once>"}
 
 # instinct: deploy-only builder — cannot restart/stop/approve or touch secrets
 curl -s -X POST $CP/v1/agents/register -H 'Content-Type: application/json' -H "$H" \
   -d '{"name": "instinct", "type": "ci", "capabilities": ["docker"],
-       "permissions": {"deploy": true, "read_status": true, "read_logs": true}}'
+       "permissions": {"deploy": true, "read_status": true}}'
 ```
 
 Store each key in that agent's secret storage. Permissions are fixed at
@@ -336,7 +384,63 @@ Full story: [`cloudflare.md`](cloudflare.md).
 5. `agent-host domains add --deployment <id> --hostname api.example.com --ingress tunnel`
    → CNAME created, `ingress-sync` queued, worker writes the route table.
 
-## 9. Troubleshooting
+## 9. Backup & restore
+
+The control plane is the source of truth; the host is disposable. Back
+up accordingly — **the persistent host's local disk must never be the
+only copy of critical control-plane state** (its `state.json` files are
+worker-local caches; the durable records live in Postgres).
+
+### What must be backed up
+
+| Item | Where it lives | How to back it up |
+|---|---|---|
+| **Database** — agents, hosts, projects, artifacts (metadata), deployments, tasks, secrets (encrypted), events journal, port allocations, domains, `schema_migrations` | Postgres (Supabase) | `pg_dump` (Supabase dashboard → Database → Backups, or scheduled `pg_dump -Fc`). Include the schema, not just data: `schema_migrations` tracks which migrations applied. |
+| **`DATA_ENCRYPTION_KEY`** | control-plane `.env` (`/etc/uagt/control-plane.env`) | Offline secret storage. **Losing it invalidates every stored project secret** (AES-256-GCM cannot decrypt them) — back it up once, on day one. |
+| **Artifact bytes** | `ARTIFACT_DIR` (`./data/artifacts`) | Included in the control-plane host's filesystem backup. If lost: re-upload artifacts (each upload creates a new artifact row — redeploy against the new `artifact_id`); the DB's artifact *metadata* rows survive but point at missing bytes until then. |
+| **Log chunks** | `LOG_DIR` (`./data/logs`) | Nice-to-have, not critical: task `result`/`error` summaries live in the DB. |
+| **Provisioning token** | `UAHT_PROVISIONING_TOKEN` in the control-plane env | Same secret storage as the encryption key. |
+| **Host identity** | DB `hosts` row + `WORKER_HOST_TOKEN` in the host's `/opt/agent-host/config/worker.env` (0600) | The token is shown once and stored only as a SHA-256 hash server-side — it **cannot be recovered from the DB**. After a host rebuild, re-register the host (or `POST /v1/hosts/:id/rotate-token` if you kept the old token) and write the new token to the fresh `worker.env`. |
+| **Domain/DNS state** | DB `domains` table + Cloudflare (DNS records, tunnel routes) | DB backup covers intent; DNS/tunnel routes re-provision from the `domains` rows on `POST /v1/domains` retry or removal+re-add. Tunnel tokens live in the Cloudflare dashboard, not here. |
+
+### Restore procedure (DB dump + artifact store)
+
+Validated against the code paths (each step maps to a real mechanism;
+the full drill needs a live Postgres — run it there before you need it):
+
+1. Restore the database (`pg_restore` / Supabase restore). Verify
+   `select * from schema_migrations order by name;` shows `001`…`007`.
+2. **Re-apply migration `005`** (`REVOKE TRUNCATE ON public.events FROM
+   PUBLIC`) — it is database-global and `pg_dump` schema-only dumps do
+   not capture it.
+3. Restore `ARTIFACT_DIR` from the filesystem backup. If the bytes are
+   gone, re-upload each artifact (`agent-host deploy --artifact ...`
+   creates a new artifact row) and redeploy — the DB's metadata rows
+   alone cannot rebuild missing bytes.
+4. Put the **original** `DATA_ENCRYPTION_KEY` and
+   `UAHT_PROVISIONING_TOKEN` back in the control-plane env; start the
+   API — startup runs `runMigrations`, which is a no-op when
+   `schema_migrations` already lists `001`…`007`.
+5. Reinstall/repair the host worker (`scripts/install-host.sh` with a
+   fresh host token); the worker's local `state.json` rebuilds from
+   Docker reality on first boot (`reconcile()`), and the control plane
+   already knows every deployment's desired state.
+6. For tunnel-mode domains, verify routes in the Cloudflare dashboard;
+   re-run `agent-host domains add` for any hostname that fails its
+   HTTPS probe.
+
+### What is deliberately NOT backed up
+
+- Host worker local state (`<work_dir>/deployments/*/state.json`,
+  `DeploymentStore` monotonic `seq` counters) — rebuilt from Docker +
+  the control plane on boot; `seq` is a per-store ordering aid, not a
+  global truth.
+- The `uag_events` LISTEN channel state — ephemeral by design; the
+  journal itself is in the DB.
+- Bearer tokens (agent keys, host tokens) — one-way SHA-256 hashes only.
+  Rotate, don't restore.
+
+## 10. Troubleshooting
 
 See [`troubleshooting.md`](troubleshooting.md) for the symptom → cause →
 fix table. The two fastest checks:
@@ -348,7 +452,7 @@ curl -s https://control-plane.example.com/v1/health
 agent-host hosts   # status online, last_seen fresh
 ```
 
-## 10. Production checklist
+## 11. Production checklist
 
 - [ ] Postgres (Supabase) with migrations 001–007 applied; 001 (pgcrypto)
       applied as superuser on a fresh database.
@@ -363,3 +467,7 @@ agent-host hosts   # status online, last_seen fresh
 - [ ] Dashboard approvers know: Approve/Reject need `approve_deployments`.
 - [ ] Sweeper thresholds (`HEARTBEAT_*_S`, `TASK_*_S`) fit your network.
 - [ ] First deploy + manual-mode approval + rollback exercised end to end.
+- [ ] Backups: scheduled `pg_dump` of the database (incl. `schema_migrations`
+      table), `DATA_ENCRYPTION_KEY` + `UAHT_PROVISIONING_TOKEN` in offline
+      secret storage, `ARTIFACT_DIR` covered by the control-plane host's
+      filesystem backup. Migration `005` re-applied after any DB restore.
