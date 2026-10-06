@@ -80,12 +80,55 @@ const text = await client.getLogs({ deploymentId: "dep-uuid" });
 for await (const chunk of await client.getLogs({ taskId: "task-uuid", follow: true })) {
   process.stdout.write(chunk);
 }
+
+// Async generator of chunks, no final text:
+for await (const chunk of client.tailLogs({ deploymentId: "dep-uuid" })) {
+  process.stdout.write(chunk);
+}
+```
+
+## Domains & key rotation
+
+```js
+await client.addDomain(deploymentId, "api.example.com", "tunnel"); // 'tunnel'|'direct', omit for server default
+await client.listDomains(deploymentId);
+await client.removeDomain(deploymentId, "api.example.com");
+const { api_key } = await client.rotateKey(); // new key shown once, client adopts it
 ```
 
 ## Error shape
 
 Every failure throws `UahtError` with `{ code, message, status, body }`,
 mirroring the protocol error shape `{ error: { code, message } }`.
+
+## Registration & token rotation
+
+```js
+// Register a new agent: the control plane gates this on the provisioning
+// token (X-Provisioning-Token header) — no agent key needed yet.
+const bootstrap = new UahtClient({ baseUrl: process.env.UAHT_BASE_URL });
+const reg = await bootstrap.registerAgent({
+  name: "ci-bot",
+  type: "ci",
+  permissions: { deploy: true, read_status: true },
+  provisioningToken: process.env.UAHT_PROVISIONING_TOKEN,
+});
+const apiKey = reg.api_key; // shown once — store it, it is never returned again
+
+// Rotate your own agent key (the client adopts the new key automatically).
+await client.rotateKey();
+
+// Register a host (provisioning token, or a deploy-permission agent key).
+const host = await client.registerHost({
+  name: "edge-01",
+  provisioningToken: process.env.UAHT_PROVISIONING_TOKEN,
+});
+const hostToken = host.host_token; // shown once
+
+// Rotate a host's token (auth is the host token itself; the client adopts it).
+const hostClient = new UahtClient({ baseUrl: process.env.UAHT_BASE_URL, apiKey: hostToken });
+await hostClient.rotateHostToken(host.host.id, { graceSeconds: 300 });
+```
 
 ## Tests
 
