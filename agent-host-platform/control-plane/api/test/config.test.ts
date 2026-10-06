@@ -115,3 +115,117 @@ describe('isDevelopment', () => {
     expect(isDevelopment({ NODE_ENV: 'test' })).toBe(false);
   });
 });
+
+describe('validateStartupConfig — Cloudflare / tunnel / numerics (W-C hardening)', () => {
+  const TUNNEL_ID = '11111111-2222-4333-8444-555555555555';
+  const TUNNEL_HOST = `${TUNNEL_ID}.cfargotunnel.com`;
+  const fullTunnel = (overrides: EnvLike = {}): EnvLike =>
+    env({
+      TUNNEL_INGRESS_HOSTNAME: TUNNEL_HOST,
+      CLOUDFLARE_TUNNEL_API_TOKEN: 'tunnel-token',
+      CLOUDFLARE_ACCOUNT_ID: 'account-id',
+      ...overrides,
+    });
+
+  it('accepts a fully-configured tunnel ingress', () => {
+    const { warnings } = validateStartupConfig(fullTunnel());
+    expect(warnings).toEqual([]);
+  });
+
+  it('rejects a malformed TUNNEL_INGRESS_HOSTNAME (invalid tunnel config)', () => {
+    expect(() => validateStartupConfig(fullTunnel({ TUNNEL_INGRESS_HOSTNAME: 'not-a-tunnel-host' }))).toThrow(
+      /TUNNEL_INGRESS_HOSTNAME must be shaped like/,
+    );
+  });
+
+  it('names the missing tunnel credentials when ingress is enabled without them', () => {
+    let message = '';
+    try {
+      validateStartupConfig(env({ TUNNEL_INGRESS_HOSTNAME: TUNNEL_HOST }));
+    } catch (err) {
+      message = String(err);
+    }
+    expect(message).toContain('CLOUDFLARE_TUNNEL_API_TOKEN');
+    expect(message).toContain('CLOUDFLARE_ACCOUNT_ID');
+  });
+
+  it('falls back to CLOUDFLARE_API_TOKEN for the tunnel credential', () => {
+    // CLOUDFLARE_API_TOKEN doubles as the tunnel credential here, so the
+    // zone must travel with it (DNS half-config check).
+    const e = fullTunnel({
+      CLOUDFLARE_TUNNEL_API_TOKEN: undefined,
+      CLOUDFLARE_API_TOKEN: 'dns-token',
+      CLOUDFLARE_ZONE_ID: 'zone-id',
+    });
+    expect(() => validateStartupConfig(e)).not.toThrow();
+  });
+
+  it('rejects a half-configured Cloudflare DNS (token without zone)', () => {
+    expect(() => validateStartupConfig(env({ CLOUDFLARE_API_TOKEN: 'tok' }))).toThrow(
+      /CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID must be set together/,
+    );
+    expect(() => validateStartupConfig(env({ CLOUDFLARE_ZONE_ID: 'zone' }))).toThrow(
+      /CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID must be set together/,
+    );
+  });
+
+  it('warns (not fails) when DNS credentials have no ingress target', () => {
+    const { warnings } = validateStartupConfig(
+      env({ CLOUDFLARE_API_TOKEN: 'tok', CLOUDFLARE_ZONE_ID: 'zone' }),
+    );
+    expect(warnings.some((w) => w.includes('dns_pending'))).toBe(true);
+  });
+
+  it('rejects an invalid PUBLIC_INGRESS_HOSTNAME', () => {
+    expect(() => validateStartupConfig(env({ PUBLIC_INGRESS_HOSTNAME: 'not a hostname!' }))).toThrow(
+      /PUBLIC_INGRESS_HOSTNAME is not a valid hostname/,
+    );
+  });
+
+  it('rejects invalid numerics (PORT, rate limits)', () => {
+    expect(() => validateStartupConfig(env({ PORT: 'notaport' }))).toThrow(/PORT must be an integer/);
+    expect(() => validateStartupConfig(env({ PORT: '70000' }))).toThrow(/PORT must be an integer/);
+    expect(() => validateStartupConfig(env({ RATE_LIMIT_AGENT_PER_MIN: '0' }))).toThrow(
+      /RATE_LIMIT_AGENT_PER_MIN must be a positive integer/,
+    );
+    expect(() => validateStartupConfig(env({ UAHT_ROTATE_RATE_PER_MIN: '-3' }))).toThrow(
+      /UAHT_ROTATE_RATE_PER_MIN must be a positive integer/,
+    );
+  });
+
+  it('rejects conflicting heartbeat thresholds (degraded >= offline)', () => {
+    expect(() =>
+      validateStartupConfig(env({ HEARTBEAT_DEGRADED_AFTER_S: '300', HEARTBEAT_OFFLINE_AFTER_S: '300' })),
+    ).toThrow(/conflicting heartbeat thresholds/);
+  });
+
+  it('warns on LOG_LEVEL=debug in production (unsafe debug mode)', () => {
+    const { warnings } = validateStartupConfig(env({ LOG_LEVEL: 'debug' }));
+    expect(warnings.some((w) => w.includes('LOG_LEVEL=debug'))).toBe(true);
+  });
+
+  it('never prints secret values in error messages', () => {
+    const secretValue = 's3cr3t-tunnel-token-value';
+    let message = '';
+    try {
+      validateStartupConfig(
+        env({ TUNNEL_INGRESS_HOSTNAME: TUNNEL_HOST, CLOUDFLARE_TUNNEL_API_TOKEN: secretValue }),
+      );
+    } catch {
+      // configured fine — force a different failure instead
+    }
+    try {
+      validateStartupConfig(
+        env({
+          TUNNEL_INGRESS_HOSTNAME: TUNNEL_HOST,
+          CLOUDFLARE_ACCOUNT_ID: 'x',
+          DATA_ENCRYPTION_KEY: secretValue,
+        }),
+      );
+    } catch (err) {
+      message = String(err);
+    }
+    expect(message).not.toContain(secretValue);
+    expect(message).toContain('DATA_ENCRYPTION_KEY');
+  });
+});
