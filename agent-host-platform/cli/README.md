@@ -15,15 +15,19 @@ pip install -e .                     # this CLI (provides the `agent-host` comma
 ```sh
 export UAHT_BASE_URL="https://cp.example.com"   # control plane base URL
 export UAHT_API_KEY="<your agent API key>"      # never commit this anywhere
+# export UAHT_PROVISIONING_TOKEN="<token>"      # only for agents/hosts registration
 ```
 
-The `--base-url` / `--api-key` flags override the environment.
+The `--base-url` / `--api-key` / `--provisioning-token` flags override the
+environment. `agents register` and `hosts register` use the provisioning
+token (`X-Provisioning-Token` header) — no agent key needed; `hosts register`
+also accepts an agent key with the `deploy` permission.
 
 ## Usage
 
 ```sh
-agent-host hosts                          # list persistent hosts
-agent-host apps                           # list running services
+agent-host hosts [list|register|get]        # register needs --name (+ --provisioning-token or a deploy key)
+agent-host apps [--host <name|id>]      # list running services (name resolves to the host id)
 agent-host deploy --project my-api --version 1.2.0 --host host-01
 agent-host deploy --project my-api --version 1.2.0 --artifact ./dist/app.tar.gz
 agent-host deploy --project my-api --version 1.2.0 --mode manual   # needs approval
@@ -33,12 +37,22 @@ agent-host stop --deployment <id>
 agent-host start --deployment <id>
 agent-host status --deployment <id>
 agent-host rollback --deployment <id>
-agent-host tasks [--status running]
+agent-host tasks [list|status] [--status running]   # status needs --task <id>
 agent-host events [--follow]              # --follow streams live SSE events
+agent-host agents register|me|rotate      # register needs --provisioning-token (or UAHT_PROVISIONING_TOKEN)
+agent-host projects create|list|get|update
+agent-host deployments list               # --project, --host, --status filters
+agent-host approve|reject --task <id>     # manual-mode gate (needs approve_deployments)
+agent-host cancel --task <id>             # needs deploy or creatorship
+agent-host secrets set|list|delete --project <name>   # names only are ever listed
 agent-host domains list --deployment <id>
-agent-host domains add --deployment <id> --hostname api.example.com
+agent-host domains get --hostname api.example.com
+agent-host domains add --deployment <id> --hostname api.example.com [--ingress tunnel|direct]
 agent-host domains rm --deployment <id> --hostname api.example.com
 ```
+
+19 subcommands (see `agent-host --help`); every one emits valid JSON
+under `--json` (verified by `test/smoke_help.py`).
 
 Append `--json` to any command for machine-readable output; otherwise a
 human-readable table is printed.
