@@ -46,6 +46,10 @@ Content-Type: `application/json` everywhere unless noted.
     active | failed`, `removing → removed` on detach (migration 007 supersedes
     the Phase 7 `dns_pending`/`error` names); added
     `GET /v1/domains/:hostname`.
+- **2026-10-06 — WS-H2 (SDK/CLI/dashboard audit).**
+  - **Events:** canonical list corrected 41 → the 46 types the server actually
+    emits (the W15 audit missed `auth.failed`, `host.worker_outdated`,
+    `domain.degraded`, `domain.recovered`, `domain.reconcile`).
 - **2026-10-05 — Phase 9 (end-to-end testing).**
   - **Additive (backwards compatible):** `POST /v1/deployments` now injects
     `artifact_checksum` + `artifact_size` into the `type=deploy` task payload
@@ -525,10 +529,13 @@ Event object:
  "payload": {...}, "created_at": "..."}
 ```
 
-Canonical event types (41 — every type the server emits, verified against
-`routes/` + `lib/` 2026-10-05):
+Canonical event types (46 — every type the server emits, verified against
+`routes/` + `lib/` + `middleware/` 2026-10-06; the earlier "41" under-counted
+— the W15 audit missed `auth.failed`, `host.worker_outdated`,
+`domain.degraded`, `domain.recovered`, and `domain.reconcile`):
 
 - Agents: `agent.connected`, `agent.key_rotated`
+- Auth: `auth.failed` (bad provisioning token at a registration gate)
 - Tasks: `task.created`, `task.claimed`, `task.started`, `task.retrying`,
   `task.awaiting_approval`, `task.approved`, `task.rejected`,
   `task.completed`, `task.failed`, `task.cancelled`, `task.requeued`
@@ -540,10 +547,13 @@ Canonical event types (41 — every type the server emits, verified against
 - Services: `service.started`, `service.stopped`, `service.restarted`,
   `service.removed`, `service.crash_loop`
 - Hosts: `host.registered`, `host.online`, `host.offline`, `host.degraded`,
-  `host.token_rotated`
+  `host.token_rotated`, `host.worker_outdated` (heartbeat from a worker below
+  the minimum supported version)
 - Secrets: `secret.changed`, `secret.deleted`
-- Domains: `domain.requested`, `domain.active`, `domain.failed`,
-  `domain.removed`, `domain.remove_failed`
+- Domains: `domain.requested`, `domain.active`, `domain.degraded` (route no
+  longer verifies — reconciler retries), `domain.recovered` (degraded route
+  verifies again), `domain.failed`, `domain.removed`, `domain.remove_failed`,
+  `domain.reconcile` (periodic reconciler pass summary)
 
 ### 3.9 Misc
 
