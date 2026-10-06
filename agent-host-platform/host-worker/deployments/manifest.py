@@ -7,7 +7,7 @@ Rules enforced:
   * runtime: required, one of docker | docker-compose | static
   * service.port: optional, integer 1..65535
   * service.healthcheck: optional, string starting with "/"
-  * resources.memory: optional, like 256m | 1g (regex ^\\d+[mMgG]$)
+  * resources.memory: optional, like 256m | 512Mi | 1g (regex ^\\d{1,6}[mMgG][iI]?$)
   * resources.cpu: optional, positive number
   * restart: optional, one of no | always | unless-stopped | on-failure
   * build.dockerfile / build.context: optional non-empty strings
@@ -32,7 +32,10 @@ RESTART_POLICIES = ("no", "always", "unless-stopped", "on-failure")
 # W16 audit: digit run capped at 6 — a 5000-digit "memory" passed the old
 # ^\d+$ shape and then blew up int() (Python 3.11+ caps str->int at 4300
 # digits) deep in the deploy pipeline. 999999m/999999g is already absurd.
-MEMORY_RE = re.compile(r"^\d{1,6}[mMgG]$")
+# Part 1B: the optional "i"/"I" suffix ("512Mi", "1Gi") is accepted so the
+# single authoritative resource parser below and validate_manifest agree on
+# exactly one memory grammar.
+MEMORY_RE = re.compile(r"^\d{1,6}[mMgG][iI]?$")
 
 
 def _is_num(value: Any) -> bool:
@@ -115,7 +118,7 @@ def validate_manifest(data: Any,
                 not isinstance(memory, str) or not MEMORY_RE.match(memory)
             ):
                 errors.append(
-                    "resources.memory: must look like '256m' or '1g', "
+                    "resources.memory: must look like '256m', '512Mi' or '1g', "
                     f"got {memory!r}"
                 )
             cpu = resources.get("cpu")
@@ -172,14 +175,55 @@ def validate_manifest(data: Any,
 
 
 def parse_memory_mb(memory: str) -> int:
-    """'256m' -> 256, '1g' -> 1024, '2G' -> 2048. Raises ValueError if invalid."""
+    """'256m' -> 256, '512Mi' -> 512, '1g' -> 1024, '2G' -> 2048.
+
+    Raises ValueError if invalid.
+    """
     if not isinstance(memory, str) or not MEMORY_RE.match(memory):
         raise ValueError(f"invalid memory spec: {memory!r}")
+    spec = memory[:-1] if memory[-1] in ("i", "I") else memory
     try:
-        amount = int(memory[:-1])
+        amount = int(spec[:-1])
     except ValueError:
         # Defensive: the regex above already bounds the digit run, but a
         # direct caller could pass a hostile string on an interpreter with
         # different int-conversion limits.
         raise ValueError(f"invalid memory spec: {memory!r}")
-    return amount * 1024 if memory[-1].lower() == "g" else amount
+    return amount * 1024 if spec[-1].lower() == "g" else amount
+
+
+def normalize_resources(resources: Any) -> dict:
+    """Single authoritative resource parser (Part 1B).
+
+    ``{"resources": {"cpu": 1.5, "memory": "512Mi"}}`` ->>
+    ``{"cpu": 1.5, "ram_mb": 512}``.
+
+    One parsing rule used by both the worker admission path and the
+    control-plane scheduler (whose TypeScript twin, normalizeResources in
+    lib/scheduler.ts, implements byte-identical semantics):
+
+      * cpu: int/float (never bool), finite, > 0 -> float(cpu); else None.
+      * memory: string matching ^\\d{1,6}[mMgG][iI]?$ ("256m", "512Mi",
+        "1g", "2Gi") -> int megabytes; else None.
+
+    Never raises: malformed/absent fields normalize to None so a bad
+    manifest can never crash scheduling or admission — validation
+    (validate_manifest) is the separate gate that rejects bad shapes.
+    """
+    cpu: Optional[float] = None
+    ram_mb: Optional[int] = None
+    if isinstance(resources, dict):
+        raw_cpu = resources.get("cpu")
+        if (
+            _is_num(raw_cpu)
+            and math.isfinite(raw_cpu)
+            and raw_cpu > 0
+        ):
+            cpu = float(raw_cpu)
+        raw_mem = resources.get("memory")
+        if isinstance(raw_mem, str) and MEMORY_RE.match(raw_mem):
+            try:
+                ram_mb = parse_memory_mb(raw_mem)
+            except ValueError:
+                ram_mb = None
+    return {"cpu": cpu, "ram_mb": ram_mb}
