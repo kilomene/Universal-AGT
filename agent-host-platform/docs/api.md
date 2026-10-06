@@ -12,6 +12,9 @@ That document is authoritative; this page is a quick map. Base URL is
 | POST | `/v1/agents/register` | `X-Provisioning-Token` header (or bootstrap: first agent only, when `UAHT_PROVISIONING_TOKEN` is unset) | Register an agent; returns `api_key` **once** |
 | GET | `/v1/agents/me` | agent key | Caller's own agent row (no secrets) |
 | POST | `/v1/agents/me/rotate` | agent key | Rotate the caller's API key; returns the **new** key once |
+| POST | `/v1/agents/:id/suspend` | **operator** (`admin` permission or provisioning token) | `active → suspended`; the key is rejected immediately; self-suspend → 403 |
+| POST | `/v1/agents/:id/resume` | **operator** | `suspended → active` (revoked agents cannot be resumed) |
+| POST | `/v1/agents/:id/revoke` | **operator** | `→ revoked`; key hash replaced with an unmatchable random value — permanent; self-revoke → 403 |
 
 ## Tasks — durable work queue
 
@@ -70,10 +73,14 @@ A host token can never call agent endpoints and vice versa.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/v1/projects` | agent key (`deploy`) | Create a project |
-| GET | `/v1/projects` | agent key (`read_status`) | List projects |
+| POST | `/v1/projects` | agent key (`deploy`) | Create a project (the caller becomes `owner_agent_id`) |
+| GET | `/v1/projects` | agent key (`read_status`) | List projects (only ones the agent may access) |
 | GET | `/v1/projects/:id` | agent key (`read_status`) | One project |
 | PUT | `/v1/projects/:id` | agent key (`deploy`) | Update `configuration` / `repository` / `runtime` (validated manifest) |
+| GET | `/v1/projects/:id/members` | agent key (`read_status`) | Project ACL membership |
+| POST | `/v1/projects/:id/members` | agent key (`deploy`) | Grant an agent access (`{agent_id}`) |
+| DELETE | `/v1/projects/:id/members/:agent_id` | agent key (`deploy`) | Revoke an agent's access |
+| POST | `/v1/projects/:id/owner` | **operator** (`admin` permission or provisioning token) | Assign/reassign `owner_agent_id` (`{agent_id}`) |
 | POST | `/v1/artifacts/init` | agent key (`deploy`) | Start an upload; returns `upload_url` |
 | PUT | `/v1/artifacts/:id/content` | agent key (`deploy`) | Upload bytes (`application/octet-stream`); server verifies size + SHA-256 |
 | GET | `/v1/artifacts/:id` | agent key (`read_status`) | Artifact metadata |
@@ -84,7 +91,7 @@ A host token can never call agent endpoints and vice versa.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | `/v1/deployments` | agent key (`deploy`) | Deploy; creates deployment row + task; accepts `idempotency_key`, optional `host_port` |
+| POST | `/v1/deployments` | agent key (`deploy`) | Deploy; creates deployment row + task; accepts `idempotency_key`, optional `host_port`; `host_id: null` = control plane selects the host (online, not draining, capabilities, CPU/RAM headroom, host ACL, atomic via row locks); 503 `no_capacity` when no host is eligible |
 | GET | `/v1/deployments?project_id=&host_id=&status=&limit=` | agent key (`read_status`) | List deployments |
 | GET | `/v1/deployments/:id` | agent key (`read_status`) | Deployment (+ its task) |
 | POST | `/v1/deployments/:id/rollback` | agent key (`deploy`) | Roll back to previous healthy version |
@@ -95,7 +102,9 @@ A host token can never call agent endpoints and vice versa.
 | POST | `/v1/services/:id/start` | agent key (`restart`) | Start a service |
 
 Deployment statuses: `requested`, `approved`, `building`, `starting`,
-`healthcheck`, `running`, `failed`, `rolled_back`, `stopped`, `stopping`.
+`healthcheck`, `running`, `failed`, `rolled_back`, `rollback_failed`
+(a failed rollback — terminal and non-routable, persisted honestly rather
+than recorded as `rolled_back`), `stopped`, `stopping`.
 
 ## Domains
 
@@ -133,10 +142,12 @@ statement — DNS alone cannot reach an outbound-only host.
 | GET | `/v1/events?type=&since=&limit=&cursor=` | agent key (`read_status`) | Paginated event history |
 | GET | `/v1/events/stream` | agent key (`read_status`) | SSE live stream, `data: {event}\n\n` per event |
 
-Canonical event types (46 — every type the server emits, verified by
+Canonical event types (49 — every type the server emits, verified by
 extracting all event literals from `control-plane/api/src/routes/` +
-`lib/` + `middleware/` 2026-10-06):
-`agent.connected`, `agent.key_rotated`, `auth.failed`,
+`lib/` + `middleware/` 2026-10-06; the "46" count predates the agent
+lifecycle events):
+`agent.connected`, `agent.key_rotated`, `agent.suspended`,
+`agent.resumed`, `agent.revoked`, `auth.failed`,
 `task.created/claimed/started/retrying/awaiting_approval/approved/rejected/completed/failed/cancelled`,
 `task.requeued`,
 `artifact.created`, `artifact.upload_failed`,
@@ -170,4 +181,5 @@ All failures return `{ "error": { "code": "...", "message": "..." } }`.
 Codes: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`
 (idempotency key reused with a different payload), `unprocessable`
 (manifest/validation failure), `payload_too_large` (413 — artifact over
-`ARTIFACT_MAX_BYTES`), `rate_limited`.
+`ARTIFACT_MAX_BYTES`), `no_capacity` (503 — `POST /v1/deployments` with
+`host_id: null` and no eligible host), `rate_limited`.
