@@ -356,7 +356,8 @@ def test_auto_rollback_settle_failure_is_recorded_not_silent(tmp_path,
                                                              monkeypatch):
     """A settle failure never fails the rollback — it is logged and
     recorded on the failed deployment's row (and surfaced in the
-    DeployError), never silently claimed as success."""
+    DeployError), never silently claimed as success. Spec §6: the row
+    persists rollback_failed (partially_reconciled), not "rolled_back"."""
     prev_port = _free_port()
     docker = FakeDocker()
     docker.containers["uaht-my-api-1.0.0"] = {"image": "img:1.0.0",
@@ -371,8 +372,11 @@ def test_auto_rollback_settle_failure_is_recorded_not_silent(tmp_path,
         pipeline.deploy(ctx, _deploy_task())
 
     assert "rolled back to deployment dep-v1" in str(excinfo.value)
+    assert "PARTIALLY RECONCILED" in str(excinfo.value)
     v2_state = ctx.deployment_store.load("dep-v2")
-    assert v2_state["status"] == "rolled_back"
+    assert v2_state["status"] == "rollback_failed"
+    assert v2_state["rollback_status"] == "partially_reconciled"
+    assert "control plane down" in v2_state["rollback_error"]
     assert v2_state["port_settle"]["settled"] is False
     assert "control plane down" in v2_state["port_settle"]["reason"]
     assert any("non-fatal" in line for _, line in ctx.logged)
@@ -536,3 +540,370 @@ def test_explicit_rollback_refuses_unrestorable_target(tmp_path):
     assert docker.rm_calls == []
     assert docker.containers["c-current"]["running"] is True
     assert ctx.deployment_store.load("dep-cur")["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# Spec §§5-7 regression tests: same-port rollback, durable rollback
+# failure, repeated rollback, rollback-then-deploy, host restart.
+# ---------------------------------------------------------------------------
+class SamePortDocker(FakeDocker):
+    """Reports every container's published port (with docker State) in
+    ps(), so the OS-bind probe genuinely fails during verify — the
+    same-port rollback must still succeed via the free-after-teardown
+    excuse for the deployment being replaced."""
+
+    def __init__(self, port):
+        super().__init__()
+        self._port = port
+        self.ops = []
+
+    def ps(self, all=False):
+        rows = []
+        for name, info in self.containers.items():
+            running = bool(info.get("running"))
+            rows.append({"Names": "/" + name,
+                         "State": "running" if running else "exited",
+                         "Ports": f"0.0.0.0:{self._port}->3000/tcp"})
+        return rows
+
+    def stop(self, name, timeout_secs=10, timeout=120):
+        self.ops.append(("stop", name))
+        super().stop(name, timeout_secs=timeout_secs, timeout=timeout)
+
+    def rm(self, name, force=False, timeout=120):
+        self.ops.append(("rm", name))
+        super().rm(name, force=force, timeout=timeout)
+
+    def start(self, name, timeout=120):
+        self.ops.append(("start", name))
+        super().start(name, timeout=timeout)
+
+
+def _hold_port():
+    """A real listening socket: makes the OS-bind probe genuinely fail."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", 0))
+    sock.listen(1)
+    return sock, sock.getsockname()[1]
+
+
+def _seed_pair(ctx, port_v1, port_v2):
+    ctx.deployment_store.save({
+        "deployment_id": "dep-v1", "task_id": "t0", "project_id": "proj-1",
+        "project_name": "my-api", "version": "1.0.0",
+        "container_name": "c-v1", "image": "img:x", "runtime": "docker",
+        "host_port": port_v1, "container_port": 3000,
+        "ports": {str(port_v1): 3000}, "healthcheck_path": "/health",
+        "status": "superseded", "health_status": "unknown",
+        "created_at": "2026-09-01T00:00:00Z",
+    })
+    ctx.deployment_store.save({
+        "deployment_id": "dep-v2", "task_id": "t0", "project_id": "proj-1",
+        "project_name": "my-api", "version": "2.0.0",
+        "container_name": "c-v2", "image": "img:x", "runtime": "docker",
+        "host_port": port_v2, "container_port": 3000,
+        "ports": {str(port_v2): 3000}, "healthcheck_path": "/health",
+        "status": "running", "health_status": "healthy",
+        "created_at": "2026-10-01T00:00:00Z",
+    })
+
+
+def _rollback_task(dep_id, target_id):
+    return {"id": "t1", "type": "rollback",
+            "payload": {"deployment_id": dep_id,
+                        "target_deployment_id": target_id}}
+
+
+def test_explicit_rollback_same_port(tmp_path, monkeypatch):
+    """Spec §5/§7: V1 -> port P (stopped), V2 -> port P (same port,
+    running). V2's port claim is expected — it is torn down before the
+    restore — so the rollback must succeed, and two physical containers
+    must never claim P at once (teardown strictly before start)."""
+    from health import checker as health_checker
+    squat, port = _hold_port()
+    try:
+        docker = SamePortDocker(port)
+        docker.containers["c-v1"] = {"running": False}
+        docker.containers["c-v2"] = {"running": True}
+        session = FakeSession()
+        ctx = FakeCtx(tmp_path, docker, FakeAPI(session))
+        _seed_pair(ctx, port, port)
+        monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                            lambda *a, **k: True)
+
+        result = handlers.handle_rollback(ctx, _rollback_task("dep-v2",
+                                                              "dep-v1"))
+
+        assert result["status"] == "rolled_back"
+        assert result["rollback_status"] == "succeeded"
+        assert result["rolled_back_to"] == "dep-v1"
+        # safe sequence: V2 fully torn down BEFORE V1 started
+        assert docker.ops.index(("rm", "c-v2")) < \
+            docker.ops.index(("start", "c-v1"))
+        assert ("stop", "c-v2") in docker.ops
+        assert docker.containers["c-v1"]["running"] is True
+        assert "c-v2" not in docker.containers
+        # Docker/OS state == deployment state == registry: P -> V1, and
+        # P is never still attributed to V2
+        assert ctx.deployment_store.used_host_ports() == {port}
+        assert ctx.deployment_store.load("dep-v1")["health_status"] == "healthy"
+        assert ctx.deployment_store.load("dep-v2")["status"] == "rolled_back"
+        assert session.posts[0]["json"] == {"target_deployment_id": "dep-v1"}
+        assert any("free-after-teardown" in line for _, line in ctx.logged)
+    finally:
+        squat.close()
+
+
+def test_explicit_rollback_same_port_refuses_foreign_squat(tmp_path,
+                                                             monkeypatch):
+    """Spec §5: same-port rollback where a THIRD party squats the port —
+    refused loudly before the current deployment is touched (the
+    free-after-teardown excuse covers ONLY the deployment being
+    replaced)."""
+    from health import checker as health_checker
+    _squat, port = _hold_port()
+    try:
+        docker = SamePortDocker(port)
+        docker.containers["c-v1"] = {"running": False}
+        docker.containers["c-v2"] = {"running": True}
+        docker.containers["c-squat"] = {"running": True}
+        ctx = FakeCtx(tmp_path, docker)
+        _seed_pair(ctx, port, port)
+        monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                            lambda *a, **k: True)
+
+        with pytest.raises(handlers.HandlerError, match="not free"):
+            handlers.handle_rollback(ctx, _rollback_task("dep-v2", "dep-v1"))
+
+        assert docker.ops == []
+        assert docker.containers["c-v2"]["running"] is True
+        assert ctx.deployment_store.load("dep-v2")["status"] == "running"
+        # the failed attempt is recorded durably (spec §6)
+        cur = ctx.deployment_store.load("dep-v2")
+        assert cur["rollback_status"] == "failed"
+    finally:
+        _squat.close()
+
+
+def test_auto_rollback_unhealthy_target_persists_rollback_failed(
+        tmp_path, monkeypatch):
+    """Spec §6: automatic rollback restores the target but its health
+    check fails — the failed deployment persists rollback_failed (NOT
+    "rolled_back"), with enough state for reconciliation/retry."""
+    prev_port = _free_port()
+    docker = FakeDocker()
+    docker.containers["uaht-my-api-1.0.0"] = {"image": "img:1.0.0",
+                                              "running": True}
+    session = FakeSession()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(session))
+    _seed_previous(ctx, port=prev_port)
+    _hc_fake(monkeypatch, set())  # everything unhealthy, incl. the target
+
+    with pytest.raises(pipeline.DeployError, match="rollback FAILED"):
+        pipeline.deploy(ctx, _deploy_task())
+
+    v2 = ctx.deployment_store.load("dep-v2")
+    assert v2["status"] == "rollback_failed"
+    assert v2["rollback_status"] == "failed"
+    assert v2["rollback_of"] == "dep-v1"
+    assert "health check failed" in v2["rollback_error"]
+    # the target row is honest: running (it IS up) but unhealthy
+    v1 = ctx.deployment_store.load("dep-v1")
+    assert v1["status"] == "running"
+    assert v1["health_status"] == "unhealthy"
+    assert v1["rollback_status"] == "failed"
+
+
+def test_explicit_rollback_verify_failure_records_failed_phase(tmp_path):
+    """Spec §6: verify fails -> HandlerError, the current deployment is
+    untouched and still honestly "running", but the failed attempt is
+    recorded durably (requested -> failed) for reconciliation/retry."""
+    docker = FakeDocker()
+    docker.containers["c-current"] = {"running": True}
+    ctx = FakeCtx(tmp_path, docker)
+    ctx.deployment_store.save({
+        "deployment_id": "dep-cur", "task_id": "t0", "project_id": "proj-1",
+        "project_name": "my-api", "version": "2.0.0",
+        "container_name": "c-current", "image": "img:x", "runtime": "docker",
+        "status": "running", "health_status": "healthy",
+        "created_at": "2026-10-01T00:00:00Z",
+    })
+    ctx.deployment_store.save({
+        "deployment_id": "dep-old", "task_id": "t0", "project_id": "proj-1",
+        "project_name": "my-api", "version": "1.0.0",
+        "container_name": "c-gone", "image": "img:gone",
+        "runtime": "docker", "status": "superseded",
+        "created_at": "2026-09-01T00:00:00Z",
+    })
+
+    with pytest.raises(handlers.HandlerError, match="cannot be restored"):
+        handlers.handle_rollback(ctx, _rollback_task("dep-cur", "dep-old"))
+
+    assert docker.stop_calls == []
+    assert docker.rm_calls == []
+    cur = ctx.deployment_store.load("dep-cur")
+    assert cur["status"] == "running"  # untouched — still the truth
+    assert cur["rollback_status"] == "failed"
+    assert cur["rollback_target_deployment_id"] == "dep-old"
+    assert "cannot be restored" in cur["rollback_error"]
+
+
+def test_repeated_rollback(tmp_path, monkeypatch):
+    """Spec §7: rollback V2->V1, then rollback V1->V2 again. The second
+    rollback rebuilds V2 from its persisted contract (its container was
+    removed by the first rollback's teardown) and the registry
+    converges on V2's port."""
+    from health import checker as health_checker
+    p1, p2 = _free_port(), _free_port()
+    docker = FakeDocker()
+    docker.images.add("img:x")
+    docker.containers["c-v1"] = {"running": False}
+    docker.containers["c-v2"] = {"running": True}
+    session = FakeSession()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(session))
+    _seed_pair(ctx, p1, p2)
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+
+    r1 = handlers.handle_rollback(ctx, _rollback_task("dep-v2", "dep-v1"))
+    assert r1["status"] == "rolled_back"
+    assert "c-v2" not in docker.containers  # teardown removed it
+
+    r2 = handlers.handle_rollback(ctx, _rollback_task("dep-v1", "dep-v2"))
+    assert r2["status"] == "rolled_back"
+    assert r2["rollback_status"] == "succeeded"
+    assert r2["rolled_back_to"] == "dep-v2"
+    assert docker.containers["c-v2"]["running"] is True
+    assert "c-v1" not in docker.containers  # torn down by the 2nd rollback
+    assert ctx.deployment_store.load("dep-v2")["status"] == "running"
+    assert ctx.deployment_store.load("dep-v1")["status"] == "rolled_back"
+    assert ctx.deployment_store.used_host_ports() == {p2}
+    assert len(session.posts) == 2
+    assert session.posts[1]["json"] == {"target_deployment_id": "dep-v2"}
+
+
+def test_rollback_followed_by_deploy(tmp_path, monkeypatch):
+    """Spec §7: after rollback V2->V1, a fresh deploy V3 builds on the
+    restored generation — V1 becomes the rollback target (previous),
+    V1 is superseded on success, and the registry converges on V3."""
+    from health import checker as health_checker
+    p1, p2 = _free_port(), _free_port()
+    docker = FakeDocker()
+    docker.containers["c-v1"] = {"running": False}
+    docker.containers["c-v2"] = {"running": True}
+    session = FakeSession()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(session))
+    _seed_pair(ctx, p1, p2)
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+
+    r = handlers.handle_rollback(ctx, _rollback_task("dep-v2", "dep-v1"))
+    assert r["status"] == "rolled_back"
+
+    result = pipeline.deploy(
+        ctx, _deploy_task(version="3.0.0", deployment_id="dep-v3",
+                          image="img:3.0.0"))
+    assert result["status"] == "running"
+    v3 = ctx.deployment_store.load("dep-v3")
+    assert v3["status"] == "running"
+    assert v3["health_status"] == "healthy"
+    assert v3["previous_deployment_id"] == "dep-v1"
+    v1 = ctx.deployment_store.load("dep-v1")
+    assert v1["status"] == "superseded"
+    # §4.16: the successful deploy GC'd the oldest generation's container
+    # (keep=2) — collection happens only after successful settlement
+    assert "c-v1" not in docker.containers
+    assert ctx.deployment_store.load("dep-v2")["status"] == "rolled_back"
+    assert ctx.deployment_store.used_host_ports() == {v3["host_port"]}
+
+
+class PsDocker(FakeDocker):
+    """ps() honors the all flag with docker State, like the real client."""
+
+    def ps(self, all=False):
+        rows = []
+        for name, info in self.containers.items():
+            running = bool(info.get("running"))
+            if all or running:
+                rows.append({"Names": "/" + name,
+                             "State": "running" if running else "exited",
+                             "Ports": ""})
+        return rows
+
+
+def test_host_restart_after_rollback(tmp_path, monkeypatch):
+    """Spec §7: worker restarts after a completed rollback — reconcile
+    converges: the restored target is already running, the rolled-back
+    generation is skipped, and the registry matches physical state."""
+    from deployments import reconcile as reconcile_mod
+    from health import checker as health_checker
+    p1, p2 = _free_port(), _free_port()
+    docker = FakeDocker()
+    docker.containers["c-v1"] = {"running": False}
+    docker.containers["c-v2"] = {"running": True}
+    session = FakeSession()
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(session))
+    _seed_pair(ctx, p1, p2)
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+
+    r = handlers.handle_rollback(ctx, _rollback_task("dep-v2", "dep-v1"))
+    assert r["status"] == "rolled_back"
+
+    # simulate the restart: post-restart docker view + a fresh store
+    # handle over the same state dir
+    docker2 = PsDocker()
+    docker2.containers["c-v1"] = {"running": True}
+    ctx2 = FakeCtx(tmp_path, docker2)
+    summary = reconcile_mod.reconcile(ctx2)
+
+    assert summary["already_running"] == 1
+    assert summary["missing"] == 0
+    assert summary["unexpected"] == []
+    assert ctx2.deployment_store.load("dep-v1")["status"] == "running"
+    assert ctx2.deployment_store.load("dep-v1")["health_status"] == "healthy"
+    assert ctx2.deployment_store.load("dep-v2")["status"] == "rolled_back"
+    assert ctx2.deployment_store.used_host_ports() == {p1}
+
+
+def test_interrupted_rollback_marked_failed_on_restart(tmp_path):
+    """Spec §6: the worker restarts mid-rollback (a transient phase was
+    recorded) — reconcile marks the operation failed loudly and does NOT
+    resurrect the torn-down source deployment."""
+    from deployments import reconcile as reconcile_mod
+    docker = PsDocker()
+    docker.containers["c-target"] = {"running": False}
+    ctx = FakeCtx(tmp_path, docker)
+    # rollback source: teardown already happened (container gone), the
+    # worker died before the restore
+    ctx.deployment_store.save({
+        "deployment_id": "dep-cur", "task_id": "t0", "project_id": "proj-1",
+        "project_name": "my-api", "version": "2.0.0",
+        "container_name": "c-current", "image": "img:x", "runtime": "docker",
+        "host_port": 18002, "ports": {"18002": 3000},
+        "status": "running", "health_status": "healthy",
+        "rollback_status": "restoring",
+        "rollback_target_deployment_id": "dep-target",
+        "created_at": "2026-10-01T00:00:00Z",
+    })
+    ctx.deployment_store.save({
+        "deployment_id": "dep-target", "task_id": "t0", "project_id": "proj-1",
+        "project_name": "my-api", "version": "1.0.0",
+        "container_name": "c-target", "image": "img:x", "runtime": "docker",
+        "host_port": 18001, "ports": {"18001": 3000},
+        "status": "superseded", "health_status": "unknown",
+        "rollback_status": "restoring",
+        "created_at": "2026-09-01T00:00:00Z",
+    })
+
+    summary = reconcile_mod.reconcile(ctx)
+
+    cur = ctx.deployment_store.load("dep-cur")
+    assert cur["status"] == "rollback_failed"  # DB no longer claims running
+    assert cur["rollback_status"] == "failed"
+    assert "c-current" not in docker.containers  # NOT resurrected
+    assert docker.run_calls == []
+    tgt = ctx.deployment_store.load("dep-target")
+    assert tgt["rollback_status"] == "failed"
+    assert any("interrupted" in a for a in summary["actions"])
