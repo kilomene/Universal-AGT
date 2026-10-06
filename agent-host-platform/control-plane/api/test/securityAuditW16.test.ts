@@ -31,6 +31,63 @@ vi.mock('../src/db/pool', () => ({
   closePool: async () => {},
 }));
 
+// §5 SSRF hardening: the HTTPS probe resolves DNS itself and dials via
+// node:https with a pinned lookup — mock both (no real DNS/network).
+const dnsMock = vi.hoisted(() => {
+  let v4: string[] = ['93.184.216.34'];
+  let v6: string[] = [];
+  return {
+    resolve4: vi.fn(async (): Promise<string[]> => v4),
+    resolve6: vi.fn(async (): Promise<string[]> => v6),
+    set: (a: string[], aaaa: string[]) => {
+      v4 = a;
+      v6 = aaaa;
+    },
+  };
+});
+vi.mock('node:dns/promises', () => ({
+  resolve4: dnsMock.resolve4,
+  resolve6: dnsMock.resolve6,
+}));
+
+const httpsMock = vi.hoisted(() => {
+  let respond: number | 'throw' = 200;
+  const calls: Array<{ url: string; opts: any }> = [];
+  const get = vi.fn((url: string, opts: any, cb: (res: any) => void) => {
+    calls.push({ url, opts });
+    const listeners: Record<string, Array<() => void>> = {};
+    const req = {
+      on: (ev: string, fn: () => void) => {
+        (listeners[ev] ??= []).push(fn);
+        return req;
+      },
+      destroy: vi.fn(),
+    };
+    if (respond === 'throw') {
+      queueMicrotask(() => (listeners['error'] ?? []).forEach((fn) => fn()));
+    } else {
+      queueMicrotask(() => cb({ statusCode: respond, resume: () => {} }));
+    }
+    return req;
+  });
+  return {
+    calls,
+    get,
+    setRespond: (r: number | 'throw') => {
+      respond = r;
+    },
+    reset: () => {
+      calls.length = 0;
+      respond = 200;
+      get.mockClear();
+    },
+  };
+});
+vi.mock('node:https', () => ({
+  default: { get: httpsMock.get },
+  get: httpsMock.get,
+}));
+
 import { createApp } from '../src/index';
 import { generateAgentKey, generateHostToken, sha256Hex } from '../src/lib/tokens';
 import { probeHttps } from '../src/routes/domains';
@@ -273,6 +330,10 @@ beforeEach(async () => {
   resetRateLimitBucketsForTests();
   setCfEnv();
   stubFetch(200);
+  // Probe transport: public DNS answer + answering origin (per-test override
+  // via dnsMock.set / httpsMock.setRespond).
+  dnsMock.set(['93.184.216.34'], []);
+  httpsMock.reset();
 });
 
 afterEach(() => {
@@ -404,13 +465,45 @@ describe('F2: tunnel route hijack attack', () => {
 // ---------------------------------------------------------------------------
 describe('F3: HTTPS reachability probe', () => {
   it('does not follow redirects (SSRF hardening)', async () => {
-    const stub = stubFetch(302);
+    dnsMock.set(['93.184.216.34'], []);
+    httpsMock.setRespond(302);
     const result = await probeHttps('some.example.com');
     expect(result).toEqual({ reachable: true, status: 302 });
-    const probeCalls = stub.mock.calls.filter((c) => String(c[0]).startsWith('https://'));
-    // Exactly one request — the 302 was recorded, never followed.
-    expect(probeCalls).toHaveLength(1);
-    expect((probeCalls[0][1] as RequestInit).redirect).toBe('manual');
+    // Exactly one request — the 302 was recorded, never followed
+    // (node:https does not follow redirects).
+    expect(httpsMock.get).toHaveBeenCalledTimes(1);
+    const [url, opts] = httpsMock.get.mock.calls[0];
+    expect(url).toBe('https://some.example.com/');
+    // DNS-rebinding pin: the socket dials the validated public IP, never
+    // whatever the hostname resolves to at connect time.
+    const pinned = await new Promise<{ address: string; family: number }>(
+      (resolve, reject) => {
+        opts.lookup(
+          'some.example.com',
+          {},
+          (err: unknown, address: string, family: number) =>
+            err ? reject(err) : resolve({ address, family }),
+        );
+      },
+    );
+    expect(pinned).toEqual({ address: '93.184.216.34', family: 4 });
+  });
+
+  it('refuses to probe a hostname that resolves to an internal address', async () => {
+    for (const addrs of [
+      { v4: ['127.0.0.1'], v6: [] },
+      { v4: ['169.254.169.254'], v6: [] },
+      { v4: ['10.0.0.5'], v6: [] },
+      { v4: [], v6: ['::1'] },
+      { v4: [], v6: ['fd00::1'] },
+    ]) {
+      dnsMock.set(addrs.v4, addrs.v6);
+      httpsMock.reset();
+      const result = await probeHttps('evil.example.com');
+      expect(result).toEqual({ reachable: false, status: null });
+      // No outbound connection was even attempted.
+      expect(httpsMock.get).not.toHaveBeenCalled();
+    }
   });
 
   it('makes no outbound call at all when Cloudflare is unconfigured', async () => {
