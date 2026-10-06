@@ -250,9 +250,35 @@ update endpoint — and are cursor-paginated, so an auditor can replay the
 full history of who did what, when, from which actor.
 
 `UPDATE`/`DELETE` are blocked by the `trg_events_no_update_delete` row
-trigger, and `TRUNCATE` is blocked by the `trg_no_truncate_events` event
-trigger (migration `005_events_truncate_block.sql`; needs superuser to
-install — row-level triggers cannot intercept `TRUNCATE`).
+trigger. `TRUNCATE` bypasses row triggers, and PostgreSQL event triggers do
+not support `TRUNCATE` at all (verified on PG 16), so there is no
+trigger-based block: migration `005_events_truncate_block.sql` applies
+defense-in-depth (`REVOKE TRUNCATE ON events FROM PUBLIC`, stopping every
+non-owner role). Complete protection needs the table owned by a dedicated
+role distinct from the application role — see "events table ownership"
+below.
+
+### Events table ownership (complete TRUNCATE protection)
+
+The migration-level `REVOKE TRUNCATE` stops non-owner roles, but the table
+owner can always `TRUNCATE` regardless of `REVOKE`. For installations where
+the audit journal must survive even a compromised application credential,
+transfer ownership to a dedicated role (as superuser, e.g. the Supabase SQL
+editor):
+
+```sql
+CREATE ROLE uagt_events_owner NOLOGIN;
+ALTER TABLE public.events OWNER TO uagt_events_owner;
+REVOKE ALL ON public.events FROM PUBLIC, <app_role>;
+GRANT INSERT, SELECT ON public.events TO <app_role>;
+GRANT USAGE, SELECT ON SEQUENCE public.events_id_seq TO <app_role>;
+```
+
+After this, the application role can append to and read the journal but
+cannot `TRUNCATE`, `UPDATE`, or `DELETE` it under any circumstance. The
+row-level `trg_events_no_update_delete` trigger remains as a second layer.
+This step is optional and operator-owned; the migration chain does not do
+it automatically because the application role name varies by deployment.
 
 ## Operational checklist
 
