@@ -483,6 +483,20 @@ describe("domains (§3.10)", () => {
     assert.equal(out.domain.status, "active");
     assert.equal(out.domain.tunnel_configured, true);
   });
+
+  it("getDomain URL-encodes the hostname segment (JS/Python parity)", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "<redacted>",
+      fetch: mockFetch(jsonResponse(200, {
+        domain: { hostname: "idn space.example.com", status: "active" },
+      })),
+    });
+    await client.getDomain("idn space.example.com");
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/domains/idn%20space.example.com");
+    assert.equal(opts.method, "GET");
+  });
 });
 
 describe("getLogs", () => {
@@ -631,7 +645,7 @@ describe("JS/Python parity (Phase 8)", () => {
     "registerAgent", "me", "rotateKey",
     "createTask", "getTask", "listTasks", "cancelTask", "approveTask", "rejectTask",
     "getLogs", "tailLogs",
-    "listHosts", "getHost",
+    "listHosts", "getHost", "registerHost", "rotateHostToken",
     "createProject", "listProjects", "getProject", "updateProject",
     "listArtifacts", "getArtifact", "initArtifact", "uploadArtifact", "downloadArtifact",
     "createDeployment", "getDeployment", "listDeployments", "rollbackDeployment",
@@ -726,5 +740,80 @@ describe("rotateKey error paths", () => {
       assert.equal(err.message, "missing permission: deploy");
       return true;
     });
+  });
+});
+
+describe("registration & host token rotation", () => {
+  it("registerAgent sends the provisioning token as X-Provisioning-Token", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      fetch: mockFetch(jsonResponse(201, { agent: { id: "a1" }, api_key: "fresh" })),
+    });
+    const res = await client.registerAgent({
+      name: "ci-bot",
+      type: "ci",
+      provisioningToken: "prov-123",
+    });
+    assert.equal(calls.length, 1);
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/agents/register");
+    assert.equal(opts.method, "POST");
+    assert.equal(opts.headers["X-Provisioning-Token"], "prov-123");
+    // no agent key exists before registration: no Authorization header
+    assert.ok(!("Authorization" in opts.headers));
+    assert.equal(res.api_key, "fresh");
+  });
+
+  it("registerHost posts to /v1/hosts/register with the provisioning header", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "k",
+      fetch: mockFetch(jsonResponse(201, { host: { id: "h1" }, host_token: "uagh_fresh" })),
+    });
+    const res = await client.registerHost({
+      name: "edge-01",
+      provisioningToken: "prov-123",
+    });
+    assert.equal(calls.length, 1);
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/hosts/register");
+    assert.equal(opts.method, "POST");
+    assert.equal(opts.headers["X-Provisioning-Token"], "prov-123");
+    assert.equal(res.host_token, "uagh_fresh");
+  });
+
+  it("rotateHostToken posts grace_seconds and adopts the new host token", async () => {
+    const client = new UahtClient({
+      baseUrl: "https://cp.example.com",
+      apiKey: "uagh_old",
+      fetch: mockFetch(jsonResponse(200, { host_token: "uagh_new" })),
+    });
+    const res = await client.rotateHostToken("h1", { graceSeconds: 300 });
+    assert.equal(calls.length, 1);
+    const { url, opts } = calls[0];
+    assert.equal(url, "https://cp.example.com/v1/hosts/h1/rotate-token");
+    assert.equal(opts.method, "POST");
+    assert.equal(opts.headers.Authorization, `Bearer ${"uagh" + "_old"}`);
+    assert.deepEqual(JSON.parse(opts.body), { grace_seconds: 300 });
+    assert.equal(res.host_token, "uagh_new");
+    // the client must adopt the new token or later host calls break
+    assert.equal(client.apiKey, "uagh_new");
+  });
+});
+
+describe("version coherence (§61)", () => {
+  it("SDK_VERSION matches package.json and feeds the default User-Agent", async () => {
+    const { createRequire } = await import("node:module");
+    const require = createRequire(import.meta.url);
+    const pkg = require("../package.json");
+    const { SDK_VERSION, UahtClient: C } = await import("../src/index.js");
+    assert.equal(SDK_VERSION, pkg.version);
+    const client = new C({
+      baseUrl: "https://cp.example.com",
+      apiKey: "sekret",
+      fetch: mockFetch(jsonResponse(200, { agent: { name: "a" } })),
+    });
+    await client.me();
+    assert.equal(calls[0].opts.headers["User-Agent"], `uaht-sdk/${pkg.version}`);
   });
 });
