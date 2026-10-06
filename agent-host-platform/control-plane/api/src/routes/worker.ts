@@ -468,11 +468,15 @@ async function mirrorDeploymentState(
         // unconditionally lied about the deployment's state; persist the
         // failure honestly instead.
         //
-        // Part 2: a rollback succeeds ONLY when the target was proven
-        // healthy. The target_health_status check is the backstop — a
-        // report of 'rolled_back' (or a legacy report without a status)
-        // with an unverified/unhealthy target is recorded as a failure,
-        // never as a success.
+        // Fix #2 (strict rollback success contract): the control plane is
+        // the trust boundary — the worker is untrusted input here. A
+        // rollback is successful ONLY when the report proves ALL THREE:
+        //   status = 'rolled_back'
+        //   AND target_health_status = 'healthy'
+        //   AND rollback_status = 'succeeded'
+        // Anything missing or contradictory (including a legacy
+        // {"status":"ok"} report) persists rollback_failed. Success is
+        // never inferred from missing fields.
         const reported = (reportedResult ?? {}) as Record<string, unknown>;
         const reportedHealth =
           typeof reported.target_health_status === 'string'
@@ -482,11 +486,23 @@ async function mirrorDeploymentState(
           typeof reported.rollback_status === 'string'
             ? reported.rollback_status
             : 'failed';
-        const rollbackFailed =
-          reported.status === 'rollback_failed' ||
-          (reportedHealth !== null && reportedHealth !== 'healthy');
-        depStatus = rollbackFailed ? 'rollback_failed' : 'rolled_back';
-        depEvent = rollbackFailed
+        const rollbackSucceeded =
+          reported.status === 'rolled_back' &&
+          reportedHealth === 'healthy' &&
+          reportedRollbackStatus === 'succeeded';
+        depStatus = rollbackSucceeded ? 'rolled_back' : 'rollback_failed';
+        const rollbackReason = !rollbackSucceeded
+          ? reportedHealth === 'unhealthy'
+            ? 'target health check failed'
+            : reportedHealth !== 'healthy'
+              ? 'target health could not be verified'
+              : reportedRollbackStatus === 'partially_reconciled'
+                ? 'port-registry settle failed after healthy restore'
+                : reported.status !== 'rolled_back'
+                  ? `worker did not report status 'rolled_back' (got ${JSON.stringify(reported.status ?? null)})`
+                  : `rollback_status was not 'succeeded' (got ${JSON.stringify(reportedRollbackStatus)})`
+          : null;
+        depEvent = !rollbackSucceeded
           ? {
               type: 'deployment.rollback_failed',
               // Part 2C: the failure event carries the health verdict and
@@ -495,12 +511,7 @@ async function mirrorDeploymentState(
                 version: deployment.version,
                 target_health_status: reportedHealth ?? 'unknown',
                 rollback_status: reportedRollbackStatus,
-                reason:
-                  reportedHealth === 'unhealthy'
-                    ? 'target health check failed'
-                    : reportedRollbackStatus === 'partially_reconciled'
-                      ? 'port-registry settle failed after healthy restore'
-                      : 'target health could not be verified',
+                reason: rollbackReason,
               },
             }
           : {
