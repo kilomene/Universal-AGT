@@ -3,8 +3,14 @@
 Date: 2026-10-05/06. Scope: control-plane API (`control-plane/api`) and host
 worker (`host-worker`), per spec §54–§57. Method: attack-first — for each
 area an exploit was attempted with a failing test BEFORE any fix; only
-demonstrated vulnerabilities were fixed. Local runs are the verification
-signal (GitHub Actions cannot acquire hosted runners).
+demonstrated vulnerabilities were fixed.
+
+> **Note 2026-10-06 (WS-J):** the line below about GitHub Actions is stale.
+> CI (`.github/workflows/ci.yml`, 12 jobs) now runs on hosted runners and
+> is green — the security suites run both locally and in the `security`
+> CI job, and the full migration chain + API smoke run against a real
+> PostgreSQL 16 service container in the `e2e` job. The findings below
+> stand as written.
 
 ## Results at a glance
 
