@@ -265,17 +265,21 @@ export interface CollectedRoutes {
 }
 
 /**
- * Every ACTIVE tunnel-mode domain on a routable deployment, with the
- * origin port each route must terminate at. `extra` lets a caller include
- * a domain that is mid-provisioning (status 'configuring') so a single
- * reconcile both adds it and heals the rest of the table.
+ * Every ACTIVE or DEGRADED tunnel-mode domain on a routable deployment,
+ * with the origin port each route must terminate at. 'degraded' rows are
+ * included deliberately: a degraded row is a should-be-routed row whose
+ * route could not be verified — dropping its remote rule while it is
+ * degraded would turn a verification gap into a real outage. `extra` lets
+ * a caller include a domain that is mid-provisioning (status
+ * 'configuring') so a single reconcile both adds it and heals the rest
+ * of the table.
  */
 export async function collectDesiredRoutes(db: DbLike, extra?: DesiredRoute): Promise<CollectedRoutes> {
   const { rows } = await db.query(
     `SELECT d.hostname, d.deployment_id
      FROM domains d
      JOIN deployments dep ON dep.id = d.deployment_id
-     WHERE d.status = 'active'
+     WHERE d.status IN ('active', 'degraded')
        AND d.ingress = 'tunnel'
        AND NOT (dep.status = ANY($1))`,
     [Array.from(NON_ROUTABLE_DEPLOYMENT_STATUSES)],
@@ -318,10 +322,11 @@ export async function collectDesiredRoutes(db: DbLike, extra?: DesiredRoute): Pr
 }
 
 /**
- * Control-plane canonical tunnel sync: every ACTIVE tunnel-mode domain on
- * a routable deployment becomes a remote ingress rule; anything else
- * (removed domains, dead deployments) drops out of the desired set and is
- * therefore removed from the remote table. Idempotent.
+ * Control-plane canonical tunnel sync: every ACTIVE or DEGRADED
+ * tunnel-mode domain on a routable deployment becomes a remote ingress
+ * rule; anything else (removed domains, failed domains, dead deployments)
+ * drops out of the desired set and is therefore removed from the remote
+ * table. Idempotent.
  */
 export async function reconcileTunnelRoutes(db: DbLike): Promise<ReconcileResult> {
   const cfg = getTunnelApiConfig();
