@@ -286,6 +286,50 @@ class TestArchiveTraversal:
 
 
 # ---------------------------------------------------------------------------
+# Python floor: tar extraction needs tarfile.data_filter (3.12+)
+# ---------------------------------------------------------------------------
+
+class TestDataFilterFloor:
+    """The symlink/hardlink protection in extract_archive() is
+    tarfile.data_filter (PEP 706, Python 3.12+). The installer enforces
+    python3 >= 3.12; these tests pin the fail-closed behavior when the
+    capability is absent (stale interpreter): a clear DeployError, never
+    an unhandled TypeError from extractall(filter=...), and never an
+    unprotected extraction."""
+
+    def test_tar_refused_without_data_filter(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pipeline, "_HAS_DATA_FILTER", False)
+        arch = tmp_path / "ok.tar.gz"
+        _make_tar(str(arch), [("app/main.py", "file")])
+        with pytest.raises(pipeline.DeployError, match="3.12"):
+            pipeline.extract_archive(str(arch), str(tmp_path / "out"))
+        # Nothing extracted at all.
+        assert not (tmp_path / "out" / "app" / "main.py").exists()
+
+    def test_tar_evil_member_still_refused_without_data_filter(
+        self, tmp_path, monkeypatch
+    ):
+        """Even without data_filter, a traversal member must not extract —
+        the refusal happens before any tarfile call."""
+        monkeypatch.setattr(pipeline, "_HAS_DATA_FILTER", False)
+        arch = tmp_path / "evil.tar.gz"
+        _make_tar(str(arch), [("../evil.txt", "file")])
+        with pytest.raises(pipeline.DeployError):
+            pipeline.extract_archive(str(arch), str(tmp_path / "out"))
+        assert not (tmp_path / "evil.txt").exists()
+
+    def test_zip_unaffected_by_data_filter_floor(self, tmp_path, monkeypatch):
+        """The floor guard is tar-scoped: zip extraction (which always
+        materializes regular files) keeps working."""
+        monkeypatch.setattr(pipeline, "_HAS_DATA_FILTER", False)
+        arch = tmp_path / "ok.zip"
+        _make_zip(str(arch), ["app/main.py"])
+        out = tmp_path / "out"
+        pipeline.extract_archive(str(arch), str(out))
+        assert (out / "app" / "main.py").exists()
+
+
+# ---------------------------------------------------------------------------
 # Docker argv construction: no shell, no flag smuggling
 # ---------------------------------------------------------------------------
 
