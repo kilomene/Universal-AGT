@@ -892,10 +892,32 @@ def deploy(ctx, task: dict) -> dict:
     resource_reserved = False
     if resources.get("memory") or resources.get("cpu"):
         # Part 1B: the single authoritative resource parser — the same rule
-        # the control-plane scheduler applies to project configuration.
+        # the control-plane scheduler applies to the artifact manifest.
         normalized = normalize_resources(resources)
         need_mb = normalized["ram_mb"] or 0.0
         need_cpu = normalized["cpu"] or 0.0
+        # Fix #1: the worker must never deploy more than the control plane
+        # reserved. The tarball manifest is authoritative for WHAT runs, but
+        # the task payload's reserved contract (from the artifact's
+        # validated manifest at the control plane) is authoritative for HOW
+        # MUCH it may consume. A tarball that demands more than reserved
+        # fails loudly here — never silently over-commits the host. Absent
+        # reservation fields (legacy control plane) skip the check.
+        payload_reserved_cpu = payload.get("reserved_cpu")
+        payload_reserved_ram = payload.get("reserved_ram_mb")
+        if payload_reserved_cpu is not None or payload_reserved_ram is not None:
+            try:
+                r_cpu = float(payload_reserved_cpu) if payload_reserved_cpu is not None else 0.0
+                r_ram = float(payload_reserved_ram) if payload_reserved_ram is not None else 0.0
+            except (TypeError, ValueError):
+                r_cpu, r_ram = 0.0, 0.0
+            if need_cpu > r_cpu + 1e-9 or need_mb > r_ram + 1e-9:
+                raise DeployError(
+                    f"artifact manifest demands more resources than the "
+                    f"control plane reserved: needs cpu={need_cpu}, "
+                    f"ram_mb={need_mb} but reserved cpu={r_cpu}, "
+                    f"ram_mb={r_ram}; re-upload the artifact with an honest "
+                    f"agent.deploy.json manifest")
         reserve_resources(deployment_id, need_cpu, need_mb, store, log=log)
         resource_reserved = True
 
