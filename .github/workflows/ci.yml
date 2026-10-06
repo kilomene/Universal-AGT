@@ -263,26 +263,60 @@ jobs:
           failures = []
           js = DASH.read_text(); index_src = INDEX_TS.read_text()
 
+          def norm(p):
+              # '/v1/tasks/' and '/v1/tasks' are the same route for matching
+              return p.rstrip("/") or "/"
+
           routes = set()
           for m, p in re.findall(r"app\.(get|post|put|delete|patch)\(\s*'([^']+)'", index_src):
-              routes.add((m.upper(), p))
+              routes.add((m.upper(), norm(p)))
           for prefix, var in re.findall(r"v1\.use\('([^']+)',\s*(\w+)\)", index_src):
               fname = ROUTER_FILES.get(var)
               if not fname:
                   print("note: no route file mapping for %s; skipping" % var); continue
+              # nested mounts: projectsRouter.use('/:id/secrets', secretsRouter)
               src = (ROUTES_DIR / fname).read_text()
               for m, p in re.findall(r"\w+\.(get|post|put|delete|patch)\(\s*['\"`]([^'\"`]+)['\"`]", src):
-                  routes.add((m.upper(), "/v1" + prefix + ("" if p == "/" else p)))
+                  base = "/v1" + prefix
+                  routes.add((m.upper(), norm(base + ("" if p == "/" else p))))
+          # nested routers: resolve their mount from the parent file
+          for fname in ROUTER_FILES.values():
+              src = (ROUTES_DIR / fname).read_text()
+              for parent, sub, child in re.findall(r"(\w+)\.use\('([^']+)',\s*(\w+)\)", src):
+                  child_file = ROUTER_FILES.get(child)
+                  if not child_file:
+                      continue
+                  # find the parent's own mount prefix
+                  parent_prefix = None
+                  for prefix, var in re.findall(r"v1\.use\('([^']+)',\s*(\w+)\)", index_src):
+                      if var == parent:
+                          parent_prefix = prefix
+                  if parent_prefix is None:
+                      continue
+                  csrc = (ROUTES_DIR / child_file).read_text()
+                  for m, p in re.findall(r"\w+\.(get|post|put|delete|patch)\(\s*['\"`]([^'\"`]+)['\"`]", csrc):
+                      routes.add((m.upper(), norm("/v1" + parent_prefix + sub + ("" if p == "/" else p))))
           hsrc = (ROUTES_DIR / "health.ts").read_text()
           for m, p in re.findall(r"\w+\.(get|post|put|delete|patch)\(\s*['\"`]([^'\"`]+)['\"`]", hsrc):
-              routes.add((m.upper(), "/v1/health" + ("" if p == "/" else p)))
+              routes.add((m.upper(), norm("/v1/health" + ("" if p == "/" else p))))
 
           calls = set()
           for line in js.splitlines():
               s = line.strip()
               mg = re.match(r"(?:return\s+)?api\(\s*'([^']*)'", s)
               if mg:
-                  calls.add(("GET", "/v1" + mg.group(1).split("?")[0])); continue
+                  calls.add(("GET", norm("/v1" + mg.group(1).split("?")[0]))); continue
+              # the dossier get('<path>', key) helper also performs api(path)
+              mg2 = re.search(r"\bget\(([^)]*)\)", s)
+              if mg2:
+                  expr = mg2.group(1).split(",", 1)[0]
+                  tmpl = ""
+                  for tok in expr.split("+"):
+                      tok = tok.strip()
+                      m2 = re.match(r"'([^']*)'", tok)
+                      tmpl += m2.group(1) if m2 else ":p"
+                  if tmpl.startswith("/"):
+                      calls.add(("GET", norm("/v1" + tmpl.split("?")[0]))); continue
               mw = re.match(r"apiWrite\(\s*'([A-Z]+)'\s*,\s*(.+)$", s)
               if mw:
                   tmpl = ""
@@ -290,10 +324,13 @@ jobs:
                       tok = tok.strip()
                       m2 = re.match(r"'([^']*)'", tok)
                       tmpl += m2.group(1) if m2 else ":p"
-                  calls.add((mw.group(1), "/v1" + tmpl.split("?")[0])); continue
+                  calls.add((mw.group(1), norm("/v1" + tmpl.split("?")[0]))); continue
               mp = re.match(r"\{\s*id:\s*'[^']+'\s*,\s*path:\s*'([^']+)'", s)
               if mp:
-                  calls.add(("GET", "/v1" + mp.group(1).split("?")[0]))
+                  calls.add(("GET", norm("/v1" + mp.group(1).split("?")[0]))); continue
+              ms = re.search(r"'(/events/stream[^']*)'", s)
+              if ms:
+                  calls.add(("GET", norm("/v1" + ms.group(1).split("?")[0]))); continue
 
           for method, tmpl in sorted(calls):
               rx = re.compile("^" + tmpl.replace(":p", "[^/]+") + "$")
@@ -353,7 +390,7 @@ jobs:
         run: bash scripts/secrets-sweep.sh
 
   dist-drift-guard:
-    name: No committed build output + clean source build
+    name: Build consistency (no committed output, clean source build, version coherence)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -368,6 +405,12 @@ jobs:
             echo "ERROR: generated build output is tracked in git:"; echo "$tracked"; exit 1
           fi
           echo "no tracked generated output"
+      - name: Version + build consistency (§1, §61)
+        # scripts/check-build-consistency.sh is the single source of truth
+        # for version coherence (each component's runtime version constant
+        # vs its packaging metadata) and .gitignore coverage; it is also
+        # runnable locally (see the WS-A hardening report).
+        run: bash scripts/check-build-consistency.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -383,6 +426,20 @@ jobs:
           npm run build
           test -f dist/index.js || { echo "ERROR: build did not produce dist/index.js"; exit 1; }
           echo "clean source build OK"
+      - name: npm start rebuilds from source (no stale dist execution)
+        # §1: `npm start` must only execute a build matching current source.
+        # Proof: delete dist/, run `npm start` with a PORT that fails fast,
+        # and confirm dist/ was rebuilt before node executed.
+        working-directory: agent-host-platform/control-plane/api
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          test ! -e dist/index.js
+          # PORT=1 fails at listen() immediately, but only AFTER the build
+          # step recreates dist/ — proving start rebuilds from source.
+          PORT=1 npm start > /tmp/uagt-start.log 2>&1 || true
+          test -f dist/index.js || { echo "ERROR: npm start did not rebuild dist/ from source"; tail -20 /tmp/uagt-start.log; exit 1; }
+          echo "npm start rebuilds dist/ from source OK"
 
   e2e:
     name: E2E smoke (API + real PostgreSQL)
