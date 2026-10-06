@@ -92,6 +92,13 @@ async function sweepOnce(pool: Pool, _cfg: TaskSweeperConfig): Promise<void> {
     if (decision.action === 'none') continue;
 
     const target = decision.action === 'requeue' ? 'queued' : 'failed';
+    // Compare-and-swap (§74): re-check the status AND the lease expiry in
+    // the UPDATE itself. Between the SELECT above and this UPDATE the
+    // owning worker may have reported progress (refreshing the lease),
+    // completed the task, or another sweeper replica may have swept it
+    // first — in all of those cases the row no longer matches and this
+    // UPDATE touches zero rows, so we skip it instead of double-counting
+    // an attempt or emitting a duplicate event.
     const updated = (
       await pool.query(
         `UPDATE tasks SET
@@ -100,10 +107,14 @@ async function sweepOnce(pool: Pool, _cfg: TaskSweeperConfig): Promise<void> {
            claimed_by = CASE WHEN $2 = 'queued' THEN NULL ELSE claimed_by END,
            lease_expires_at = CASE WHEN $2 = 'queued' THEN NULL ELSE lease_expires_at END,
            completed_at = CASE WHEN $2 = 'failed' THEN now() ELSE completed_at END
-         WHERE id = $1 RETURNING attempts`,
-        [row.id, target, decision.incrementAttempts ? 1 : 0],
+         WHERE id = $1
+           AND status = $4
+           AND ($4 = 'retrying' OR lease_expires_at <= now())
+         RETURNING attempts`,
+        [row.id, target, decision.incrementAttempts ? 1 : 0, row.status],
       )
     ).rows[0];
+    if (!updated) continue; // lost the race: someone else moved the task
 
     const attemptsAfter: number = updated?.attempts ?? row.attempts;
     if (decision.action === 'requeue') {
