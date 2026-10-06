@@ -36,9 +36,16 @@ import { logger } from './log';
  * These are the repo's ACTUAL deployment states (deployments.status CHECK):
  * every non-terminal state consumes. Terminal states — failed, rolled_back,
  * rollback_failed, stopped — release the reservation automatically because
- * the reservation query only sums these states. ('removed' is not a
+ * the reservation query only sums the states below. ('removed' is not a
  * control-plane deployment state; it exists only as a worker-local GC
  * generation label.)
+ *
+ * `superseded` (migration 015) is deliberately NOT in this list: when a
+ * newer deployment of the same project+host becomes healthy, the previous
+ * deployment's row moves to `superseded` and its reservation is released —
+ * the host is no longer double-charged. The row is preserved (not deleted)
+ * so it remains a valid rollback target; a successful rollback restores
+ * it to `running`.
  */
 export const CONSUMING_DEPLOYMENT_STATUSES = [
   'requested',
