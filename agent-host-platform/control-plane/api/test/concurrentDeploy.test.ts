@@ -56,7 +56,9 @@ function setupDb() {
       status TEXT NOT NULL DEFAULT 'online',
       token_hash TEXT NOT NULL,
       idempotency_key TEXT,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL,
       owner TEXT, owner_agent_id TEXT, runtime TEXT, configuration JSONB);
@@ -84,7 +86,8 @@ function setupDb() {
       artifact_id TEXT, mode TEXT NOT NULL DEFAULT 'automatic',
       status TEXT NOT NULL DEFAULT 'requested',
       task_id TEXT, ports JSONB,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE port_allocations (
       host_id TEXT NOT NULL, port INT NOT NULL, deployment_id TEXT NOT NULL,
