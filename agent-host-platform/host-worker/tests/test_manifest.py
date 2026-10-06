@@ -190,3 +190,46 @@ def test_parse_memory_mb():
         parse_memory_mb("1.5g")
     with pytest.raises(ValueError):
         parse_memory_mb("nope")
+
+
+# ---------------------------------------------------------------------------
+# Spec §6 (WS3): manifest-level `volumes` is explicitly REJECTED — the
+# docker runtime never mounts host paths, so accepting it would be
+# persisted-but-inert partial support. Compose deployments carry their
+# volumes in the compose file (validated by compose_validate.py).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("volumes", [
+    ["data:/data"],
+    ["contract-data:/data", "logs:/var/log/app"],
+    {"data": "/host/path"},
+    "/host/data:/data",
+    [],
+])
+def test_manifest_volumes_rejected(volumes):
+    m = valid_manifest()
+    m["volumes"] = volumes
+    ok, errors = validate_manifest(m)
+    assert not ok
+    assert any("volumes" in e for e in errors)
+    # the error points at the supported alternative
+    assert any("docker-compose" in e for e in errors)
+
+
+def test_manifest_volumes_absent_or_null_ok():
+    m = valid_manifest()
+    ok, errors = validate_manifest(m)
+    assert ok, errors
+    m["volumes"] = None  # null == absent
+    ok, errors = validate_manifest(m)
+    assert ok, errors
+
+
+def test_manifest_volumes_rejected_for_compose_runtime_too():
+    # Even compose deployments must not carry manifest-level volumes: the
+    # compose file is the single source of truth for compose volumes.
+    m = valid_manifest()
+    m["runtime"] = "docker-compose"
+    m["volumes"] = ["data:/data"]
+    ok, errors = validate_manifest(m)
+    assert not ok
+    assert any("volumes" in e for e in errors)
