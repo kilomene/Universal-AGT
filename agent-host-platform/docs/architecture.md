@@ -260,11 +260,23 @@ deployment's own recorded resources — never by name-prefix matching:
 - **Resource limits** from the manifest (memory/cpu) are passed to
   `docker run`.
 
-**Compose rollback.** On healthcheck failure the worker tears down the new
-unhealthy stack (`compose down`) and restores the previous one
-(`compose up` with the compose file recorded in the previous deployment's
-state). The `rollback` task handler restores compose targets the same way;
-container targets are still restored with `docker start`.
+**Unified rollback (2026-10-06).** Both rollback paths — automatic (a new
+deployment failing its healthcheck inside the deploy pipeline) and
+explicit (a `type=rollback` task naming a previous deployment) — run
+through the single implementation in `host-worker/deployments/rollback.py`.
+Phases, in order: verify-target (restorable container or compose stack,
+recorded host ports free) → optional teardown hook → restore → **real**
+health check on the restored target (`health.checker.wait_for_healthcheck`,
+same semantics as a normal deployment — an unhealthy target is recorded
+`"unhealthy"`, never assumed healthy) → commit state. Container targets
+restore with `docker start`; compose targets restore with `compose up`
+from the compose file persisted in the deployment's state. Verify runs
+**before** anything is torn down (a bad target fails the rollback while
+the current deployment keeps serving — this also covers targets past the
+`DEPLOY_KEEP_GENERATIONS=2` GC window, restored from the persisted
+deployment contract). Port-reservation reconciliation rides on the
+existing `POST /v1/deployments/:id/settle-rollback-ports` on both paths
+(a settle failure is recorded, never fatal to the rollback).
 
 **Garbage collection.** After every successful deploy (never during one)
 the worker keeps `DEPLOY_KEEP_GENERATIONS` (default 2) newest generations
