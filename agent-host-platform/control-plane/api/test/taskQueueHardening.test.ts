@@ -107,7 +107,8 @@ function setupDb() {
       status TEXT NOT NULL DEFAULT 'requested',
       health_status TEXT, task_id TEXT,
       ports JSONB, domains JSONB,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE port_allocations (
       host_id TEXT NOT NULL, port INT NOT NULL, deployment_id TEXT NOT NULL,
