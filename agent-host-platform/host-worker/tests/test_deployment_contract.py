@@ -297,3 +297,66 @@ def test_run_spec_from_state_falls_back_for_pre_contract_states():
     spec = pipeline.run_spec_from_state({})
     assert spec == {"image": None, "ports": None, "memory": None,
                     "cpus": None, "restart": "unless-stopped"}
+
+
+# ---------------------------------------------------------------------------
+# Spec §14: env updates must not silently change restart policy, CPU,
+# memory, port, volumes, image, healthcheck, domain, ingress or identity.
+# The spec's explicit case: restart=always survives an env update.
+# ---------------------------------------------------------------------------
+def test_environment_update_preserves_restart_always(tmp_path, monkeypatch):
+    """Deploy restart=always -> update env -> container recreated ->
+    restart still always (spec §14's explicit case)."""
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    manifest = dict(CONTRACT_MANIFEST)
+    manifest["restart"] = "always"  # the spec's explicit non-default case
+    task = _deploy_task()
+    task["payload"]["manifest"] = manifest
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    result = pipeline.deploy(ctx, task)
+    assert result["status"] == "running"
+    assert docker.run_calls[0]["restart"] == "always"
+    state = ctx.deployment_store.load("dep-contract-1")
+    assert state["restart"] == "always"
+    host_port = next(iter(docker.run_calls[0]["ports"]))
+
+    handlers.handle_environment_update(ctx, {
+        "id": "task-env-always", "type": "environment-update",
+        "payload": {"deployment_id": "dep-contract-1",
+                    "env": {"NEW_KEY": "new-value"}},
+    })
+
+    assert len(docker.run_calls) == 2
+    rebuilt = docker.run_calls[1]
+    assert rebuilt["restart"] == "always"  # not silently reset to unless-stopped
+    assert rebuilt["memory"] == "1g"
+    assert rebuilt["cpus"] == "2"
+    assert rebuilt["image"] == "registry.example.com/contract-app:3.1.0"
+    assert rebuilt["ports"] == {host_port: 8080}  # same host port, not re-picked
+    assert rebuilt["env"]["NEW_KEY"] == "new-value"
+    reloaded = ctx.deployment_store.load("dep-contract-1")
+    assert reloaded["restart"] == "always"
+    assert reloaded["resources"] == {"cpu": 2, "memory": "1g"}
+
+
+def test_deploy_persists_artifact_id(tmp_path, monkeypatch):
+    """Spec §13: the artifact reference is part of the persisted contract."""
+    import hashlib
+    docker = FakeDockerClient()
+    ctx = FakeCtx(tmp_path, docker)
+    task = _deploy_task()
+    task["payload"]["artifact_id"] = "art-123"
+    task["payload"]["artifact_checksum"] = (
+        "sha256:" + hashlib.sha256(b"").hexdigest())
+    # the contract test's FakeAPI "downloads" empty bytes; skip real
+    # extraction (artifact security is WS-F's area)
+    monkeypatch.setattr(pipeline, "extract_archive",
+                        lambda archive_path, dest_dir: dest_dir)
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: True)
+    result = pipeline.deploy(ctx, task)
+    assert result["status"] == "running"
+    state = ctx.deployment_store.load("dep-contract-1")
+    assert state["artifact_id"] == "art-123"
