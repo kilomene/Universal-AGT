@@ -1,0 +1,304 @@
+# Universal-AGT — Final Production Report (§81)
+
+**Date:** 2026-10-06
+**Branch:** `main` (public repo `kilomene/Universal-AGT`)
+**Scope:** the 81-section "Final Production Completion, Hardening & Validation Specification"
+**Method:** 10 specialist workstreams audited the actual code (never the docs alone), fixed concrete defects with the smallest possible change, added regression tests, and ran the full local suites. The coordinator fixed cross-cutting gaps and performed final verification.
+
+**Headline test results (local, this pass):**
+| Suite | Result |
+|---|---|
+| Host worker pytest | 634 passed, 2 skipped |
+| Control Plane API vitest | 394 passed (29 files) |
+| `tsc --noEmit` | clean |
+| JS SDK (`node --test`) | 44 passed |
+| Python SDK pytest | 43 passed |
+| CLI smoke (`smoke_help.py`) | OK — 20 help invocations, 19 subcommands, 37 commands valid JSON |
+| Installer validator (`test-install.sh`) | 42 passed |
+| Dashboard static check (`check.py`) | pass |
+| Secrets sweep | clean |
+| Build-consistency check | 9/9 pass |
+
+---
+
+## 1. Every file changed (111 files this pass)
+
+### Database (4)
+- `agent-host-platform/database/migrations/008_task_queue_hardening.sql` *(new)*
+- `agent-host-platform/database/migrations/009_heartbeat_enrichment.sql` *(new)*
+- `agent-host-platform/database/migrations/010_registration_idempotency.sql` *(new)*
+- `agent-host-platform/database/schema/schema.sql`
+
+### Control Plane API — src (11)
+- `agent-host-platform/control-plane/api/src/lib/cloudflare-tunnel.ts`
+- `agent-host-platform/control-plane/api/src/lib/config.ts`
+- `agent-host-platform/control-plane/api/src/lib/domainReconciler.ts` *(new)*
+- `agent-host-platform/control-plane/api/src/lib/errors.ts`
+- `agent-host-platform/control-plane/api/src/lib/events.ts`
+- `agent-host-platform/control-plane/api/src/lib/hostSweeper.ts`
+- `agent-host-platform/control-plane/api/src/lib/idempotency.ts`
+- `agent-host-platform/control-plane/api/src/lib/taskSweeper.ts`
+- `agent-host-platform/control-plane/api/src/middleware/auth.ts`
+- `agent-host-platform/control-plane/api/src/routes/agents.ts`
+- `agent-host-platform/control-plane/api/src/routes/deployments.ts`
+- `agent-host-platform/control-plane/api/src/routes/domains.ts`
+- `agent-host-platform/control-plane/api/src/routes/hosts.ts`
+- `agent-host-platform/control-plane/api/src/routes/tasks.ts`
+- `agent-host-platform/control-plane/api/src/routes/worker.ts`
+- `agent-host-platform/control-plane/api/src/index.ts`
+
+### Control Plane API — tests (17)
+- `test/cloudflareTunnel.test.ts`, `test/concurrentDeploy.test.ts`, `test/config.test.ts`,
+  `test/configConsistency.test.ts`, `test/domainReconcile.test.ts` *(new)*,
+  `test/domains.test.ts`, `test/e2eFlows.test.ts`, `test/recoveryCloudflare.test.ts`,
+  `test/recoveryDb.test.ts`, `test/recoveryLeases.test.ts`,
+  `test/registrationIdempotency.test.ts` *(new)*, `test/secretsRoutes.test.ts`,
+  `test/security.test.ts`, `test/securityAuditW16.test.ts`,
+  `test/taskQueueHardening.test.ts` *(new)*, `test/workerVersions.test.ts`
+  (+ `test/migrations.test.ts` schema coverage where touched)
+
+### Host worker — src (9)
+- `agent-host-platform/host-worker/agent/config.py`
+- `agent-host-platform/host-worker/agent/main.py`
+- `agent-host-platform/host-worker/agent/api.py`
+- `agent-host-platform/host-worker/deployments/pipeline.py`
+- `agent-host-platform/host-worker/deployments/compose_validate.py`
+- `agent-host-platform/host-worker/docker/client.py`
+- `agent-host-platform/host-worker/health/checker.py`
+- `agent-host-platform/host-worker/ingress/cloudflared.py`
+- `agent-host-platform/host-worker/ingress/__init__.py`
+- `agent-host-platform/host-worker/logs/store.py`
+- `agent-host-platform/host-worker/.env.example`
+
+### Host worker — tests (15)
+- `tests/test_drain.py` *(new)*, `tests/test_ws_f_hardening.py` *(new)*,
+  `tests/test_log_retention.py` *(new)*, `tests/test_tunnel_token.py` *(new)*,
+  `tests/test_resilience_agent_gone.py` *(new)*, `tests/test_resilience_concurrent.py` *(new)*,
+  `tests/test_resilience_cp_outage.py` *(new)*, `tests/test_resilience_failure_matrix.py` *(new)*,
+  `tests/test_resilience_network.py` *(new)*, `tests/test_resilience_worker_crash.py` *(new)*,
+  `tests/test_deployment_contract.py` *(new)*, `tests/test_handlers_rollback.py` *(new)*,
+  `tests/test_reconcile.py` *(new)*, `tests/test_rollback_gc_window.py` *(new)*,
+  `tests/test_self_update.py` *(new)*
+- modified: `test_ingress.py`, `test_phase4.py`, `test_resources.py`,
+  `test_compose_security.py`, `test_config_env.py`
+
+### SDKs / CLI / dashboard (10)
+- `agent-host-platform/agent-sdk/javascript/test/client.test.js`
+- `agent-host-platform/agent-sdk/javascript/README.md`
+- `agent-host-platform/agent-sdk/python/src/uaht_sdk/client.py`
+- `agent-host-platform/agent-sdk/python/test/test_client.py`
+- `agent-host-platform/agent-sdk/python/README.md`
+- `agent-host-platform/agent-sdk/protocol/PROTOCOL.md`
+- `agent-host-platform/cli/src/agent_host_cli/main.py`
+- `agent-host-platform/cli/test/smoke_help.py`
+- `agent-host-platform/cli/README.md`
+- `agent-host-platform/dashboard/check.py`, `dashboard/index.html`,
+  `dashboard/js/app.js`, `dashboard/css/style.css`
+
+### Installer / CI / repo root (5)
+- `agent-host-platform/scripts/install-host.sh`
+- `agent-host-platform/scripts/test-install.sh`
+- `.github/workflows/ci.yml`
+- `scripts/check-build-consistency.sh` *(new)*
+- `README.md`
+
+### Docs (12)
+- `agent-host-platform/docs/implementation-status.md` (full §65 rewrite)
+- `agent-host-platform/docs/deployment.md` (new §9 Backup & restore)
+- `agent-host-platform/docs/security.md`, `docs/CONFIG.md` *(new canonical-config doc)*,
+  `docs/api.md`, `docs/agent-integration.md`, `docs/agent-guide.md`,
+  `docs/cloudflare.md`, `docs/contract-audit.md`, `docs/e2e-live-checklist.md`,
+  `docs/host-install.md`, `docs/security-audit.md`
+- `agent-host-platform/control-plane/api/README.md`
+- this file: `agent-host-platform/docs/final-production-report.md` *(new)*
+
+---
+
+## 2. Every production issue fixed
+
+### Task queue, leases, idempotency (WS-D)
+- **D1 — Task transitions lacked compare-and-swap.** Cancel, approve/reject, progress-report, and the lease sweeper all did read-then-UPDATE with no status guard: a worker completing a task between the route's read and its UPDATE got the completed task rewritten to `cancelled`; a concurrent cancel+approve resurrected a cancelled task to `queued`; a delayed progress report moved `completed → running`; the sweeper double-counted attempts. All four now use `WHERE id=$1 AND status=$2` (409 on mismatch); the sweeper rechecks lease expiry in the UPDATE.
+- **D2 — Deployment mirror corrupted by non-lifecycle tasks.** A failed `logs`/`status`/`healthcheck`/`build`/`ingress-sync` task flipped its deployment to `failed`. Now only deployment-owning task types (`deploy, rollback, restart, stop, start, remove, environment-update`) move `deployments.status`; the mirror runs under `SELECT … FOR UPDATE` in one transaction; Cloudflare-touching hooks run after commit; events fire only on actual status change; failed restart/stop now emits `deployment.failed` instead of flipping silently.
+- **D3 — Cancel of a pre-running deploy leaked its port reservation forever.** New `compensateCancelledDeploy` releases `port_allocations` and fails attached domains (deployment status left `requested` per the e2eFlows contract — the suite caught an initial over-correction).
+- **WS-B#1 (§37) — Draining hosts could still claim.** Claim handler 409s when `hosts.status='draining'` (or `worker_draining`); `tryClaim` carries an atomic `EXISTS` guard so a host that starts draining mid-wait can't slip through.
+- **WS-B#2 — Heartbeat dropped worker-reported fields.** UPDATE now persists `capabilities`, `worker_draining`, `worker_status`, `ingress` (jsonb), `reported_host_name` (migration 009).
+- **WS-C#3 (§31) — `worker.updated` never emitted** though docs promised it. Heartbeat now selects the previous `worker_version` and emits `worker.updated` on actual change.
+
+### Secrets, auth, config, events (WS-C)
+- **§59 — Startup validator was dangerously narrow** (only checked 3 vars). Now rejects: malformed `TUNNEL_INGRESS_HOSTNAME`; tunnel ingress without Cloudflare tunnel credentials (names the exact missing var); half-configured DNS (token xor zone); invalid `PUBLIC_INGRESS_HOSTNAME`/`PORT`; non-positive rate limits; conflicting heartbeat thresholds (`degraded ≥ offline`); warns on `LOG_LEVEL=debug` in production and DNS creds with no ingress target. Never prints secret values.
+- **§31 — No audit events for auth failures.** `auth.failed` events (endpoint, reason, credential channel — never the value) now emitted for wrong provisioning tokens on both register routes; journal-flood bounded by the 10/min/IP unauth limiter.
+- **§31 — Sweeper could diverge state from audit history.** `hostSweeper.sweepOnce` was UPDATE-then-appendEvent non-atomically. `events.ts` refactored to `insertEvent(client)` + post-commit `publishEvent`; sweep is now BEGIN → UPDATE → INSERT → COMMIT → publish, ROLLBACK on failure.
+- **§33 — No request correlation IDs.** `X-Request-Id` honored (validated or UUID), logged as `req_id`, echoed as response header; activates the `request_id` field in `sendError` (§70).
+- **§3 — Canonical names missing from `.env.example`/CONFIG.md** (`CLOUDFLARE_TUNNEL_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `RATE_LIMIT_UNAUTH_PER_MIN`, `UAHT_ROTATE_RATE_PER_MIN`, `CLOUDFLARE_API_BASE` added; `configConsistency.test.ts` enforces coverage).
+
+### Installer & host lifecycle (WS-B)
+- **D1 — Import-coverage gate was a dead branch.** `python3 … <<EOF || true` forced exit 0, so the "new package forgotten from installer" check always passed (proved with a scratch package). Replaced with `if python3 …` (`set -e`-exempt condition); validator now genuinely fails (exit 1) on a forgotten package. Suite is 42/42.
+- **D2 — Installer crashed on the documented default path.** `WORKER_TUNNEL_TOKEN=$UAHT_TUNNEL_TOKEN` under `set -u` with no default → `unbound variable` abort on every plain install. Defaulted `UAHT_TUNNEL_TOKEN=""`, `UAHT_INGRESS_ENABLED="0"`.
+- **D3 — Reinstall minted a duplicate host and blanked the tunnel secret.** New `reuse_existing_credentials()` (reuses stored id/token; loud WARNING on control-plane URL mismatch) and `preserve_tunnel_token()` (never blanks a stored tunnel token; explicit input wins). 5 new validator scenarios.
+- **D4 — Provisioning failure was an unhandled traceback.** Now `fail "host provisioning failed (POST …/v1/hosts/register)"`.
+- **D5 — Provisioning omitted the ingress capability.** Capabilities now append `"ingress"` when `UAHT_INGRESS_ENABLED=1`.
+- **D6 (§37) — Worker ignored operator-set draining.** New `apply_server_state()` latches `ctx.draining` from the heartbeat's `host.status`; `claims_paused()` (server latch OR sticky `WORKER_DRAINING=true`); `claim_loop` skips claiming while draining; heartbeats continue; in-flight work drains via pool shutdown.
+- **D7 (§9) — Heartbeat payload missing §9 fields.** New `enrich_heartbeat_payload()`: `host_name`, `worker_version`, `worker_status`, `draining`, `capabilities`, `ingress` (no tokens; test asserts no secrets). `WORKER_DRAINING` added to generated `worker.env` and `.env.example`.
+
+### Deployment pipeline, resources, ports (WS-E)
+- **D1 (§11) — Resource admission was check-then-act.** New transactional `reserve_resources()`: a process-wide lock combines persisted reservations (from deployments in reserving states) with in-flight reservations from concurrent deploys; raises `DeployError` when the request doesn't fit; reservations released on persist or any failure path. Two simultaneous deployments can no longer consume the same capacity.
+- **§34 — Task logs unbounded.** `logs/store.py`: bounded retention for `LOG_DIR/<task_id>.log` (rotation/cleanup for terminal tasks).
+
+### Artifact & Docker security (WS-F)
+- **D1 (§16) — No decompression-bomb protection.** `extract_archive()` now enforces `MAX_EXTRACT_BYTES = 8 GiB` (absolute, not ratio — a ratio cap was verified to break legitimate artifacts) and `MAX_ARCHIVE_MEMBERS = 100_000`, with an incremental tar header scan so a bomb's payload is never even streamed.
+- **D2 (§16) — `artifact_id` used unvalidated as a filesystem path** (agent-controlled; `makedirs()` ran before the server's UUID check → arbitrary directory creation). New `validate_artifact_id()` (`^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$`) enforced at all 4 construction sites.
+- **D3 (§16) — `verify_checksum` raised unhandled `TypeError`** on non-hex digest input. Strict 64-hex check → clean `DeployError`.
+- **D4 (§17) — `DockerClient.run()` image positional.** Dash-led/empty image values rejected (defense-in-depth against flag injection).
+- **D5 (§17) — Compose validator gaps.** `runtime:` (custom OCI runtime) and `userns_mode: host` now denied.
+- **D6 (§18) — Compose project names not isolated.** `uaht-{safe_project}` let "My App" and "my-app" share a stack. Now `uaht-{safe_project}-{project_id[:8]}`; legacy stacks torn down on redeploy.
+- **D7 (§19) — Health checker followed HTTP redirects** (SSRF oracle: 302 to arbitrary URL, boolean leaked reachability). Now `allow_redirects=False`; only exact 200 counts as healthy.
+- **D8 (§34) — `cloudflared.log` grew forever.** 10 MiB rotation, 1 generation, same policy as `logs/store.py`.
+
+### Cloudflare & domains (WS-G)
+- **D1 (§25) — Tunnel token on the process command line** (`cloudflared tunnel --token <secret> run` — world-readable via `ps`). Token now passed via the `TUNNEL_TOKEN` environment variable (natively supported); argv carries no secret.
+- **D2 (§24/§26/§51) — No `degraded` state; no reconciliation; DB could permanently claim `active` while the route was gone.** New `domainReconciler` (interval driver, default 300s): `verifyTunnelRoutes()` re-reads the authoritative remote config; unverifiable routes → `degraded` + `domain.degraded`; healed rows → `active` + `domain.recovered`; degraded rows retried via `provisionDomain` (skipped when remote state couldn't be confirmed, so outages don't flap rows to `failed`). `collectDesiredRoutes()` keeps `degraded` rows routed.
+- **D3 (§24) — `requested → failed` transition missing**: `failDomainsForDeployment` 409'd mid-loop, stranding sibling domains. Fixed.
+- **D4 (§24) — `setDomainStatus` check-then-act race.** Optimistic `AND status = $from` guard; loser gets 409.
+- **D5 (§26) — `removeDomain` skipped DNS teardown** when the CF DNS API was unconfigured, marking `removed` while a live CNAME stayed orphaned. Now refuses with 502 (stays `removing`).
+- **D6 (§27) — Worker `_check_route` accepted `target_host="localhost"`** (can resolve to `::1`). Tightened to exact `127.0.0.1`.
+
+### SDKs / CLI / dashboard (WS-H/H2)
+- Python SDK test fixture tripped the secrets sweep (`client.api_key = "uagh_old"` → renamed to the filtered placeholder `uagh_old_not_real`).
+- 4 further client-surface defects fixed and tested (endpoint/contract mismatches across SDK, CLI, dashboard); agent-neutrality verified end-to-end (no Muse-only paths; Instinct uses the identical contract).
+- SDK READMEs gained `tailLogs`/`tail_logs`, domain methods, `rotateKey`/`rotate_agent_key`; CLI README lists all 19 commands.
+
+### Registration idempotency (coordinator, §7)
+- **Gap: `POST /v1/hosts/register` and `POST /v1/agents/register` were not idempotent.** A retried register after a lost response 409'd with no credential recovery path. Both routes now accept an optional `idempotency_key` (migration 010): same key + equal params → 200 replay with a **fresh** credential (original is hash-only and unrecoverable; host replay uses a 300s rotation grace, agent replay matches `/me/rotate` immediate semantics) + `idempotent_replay: true`; same key + different params → 409; no key → unchanged behavior. 7 new tests.
+
+### Worker version visibility (coordinator, from WS-A audit)
+- **Worker heartbeat never sent `worker_version`** — after a self-update the plane's stored version went stale and `worker_outdated` detection used the old value. `enrich_heartbeat_payload` now includes it.
+- **Worker ignored the `worker_outdated` signal.** `apply_server_state` now logs a loud once-per-occurrence warning when the plane flags the worker outdated.
+
+### Docs (WS-J)
+- `implementation-status.md` fully rewritten to the §65 three-category format (the old 451-line doc had five disagreeing status tables).
+- `deployment.md` gained §9 Backup & restore (§35).
+- Corrected: permission registry (7 enforced names — `read_logs`/`remove` grant nothing), event list (46 emitted, was "41"), migration list (001…007), CI job count (12), domain lifecycle (`degraded`), `UAGT_API_KEY` → `UAHT_API_KEY` typo in two guides, stale "runners unavailable" note.
+
+---
+
+## 3. Every new feature implemented
+- Registration idempotency (`idempotency_key` on host/agent register + replay-via-rotation).
+- Domain `degraded` lifecycle state + periodic reconciler (`domainReconciler`, 300s default).
+- Host `draining` state: worker-side claim pause + server-side claim refusal.
+- `worker.updated` event emission on version change.
+- `auth.failed` audit events.
+- Request correlation IDs (`X-Request-Id` → `req_id` → `x-request-id` response header).
+- Transactional resource reservation with in-flight tracking.
+- Decompression-bomb and member-count caps on archive extraction.
+- Tunnel token via environment (never argv).
+- Build-consistency gate (`scripts/check-build-consistency.sh`, 9 checks).
+- Production config validator extended (tunnel/DNS/rate-limit/heartbeat/log-level checks).
+- Backup & restore procedure (documented, code-path-validated).
+
+## 4. Every migration added/changed
+- **008_task_queue_hardening** *(new)*: `degraded` added to `domains.status` CHECK (fixes C1 — the code's reconciler transitions to it but 007's CHECK omitted it; pg-mem doesn't enforce CHECKs so suites stayed green while real PG would 500); `domains.idempotency_key` unique (§7); `tasks.type` 18-type CHECK + `attempts>=0` + `max_attempts>=1` (§5/§49); `deployments.health_status` CHECK; 3 hot-path indexes (§73: `idx_tasks_claimable` partial matching claim ORDER BY, `idx_tasks_claimed_by`, `idx_tasks_payload_deployment_id`).
+- **009_heartbeat_enrichment** *(new)*: `worker_draining`, `worker_status`, `ingress` (jsonb), `reported_host_name` columns for the enriched heartbeat (`capabilities` already existed).
+- **010_registration_idempotency** *(new)*: nullable `idempotency_key` on `hosts`/`agents` + partial unique indexes.
+- **005** unchanged (REVOKE TRUNCATE — the event-trigger approach is impossible on PostgreSQL; must never be reintroduced).
+- `schema.sql` synced with 008/009/010 (canonical-schema contract).
+
+## 5. Every security issue addressed
+- Tunnel token removed from process argv (env only); never logged/returned/stored in git (verified).
+- Decompression bombs, archive path traversal, symlink/hardlink/device escapes, `artifact_id` path injection — all rejected with tests (40-test malicious-archive suite).
+- Docker flag injection surface closed: dash-led images rejected; compose `runtime:`/`userns_mode: host` denied; compose project-name isolation; bind mounts confined.
+- Health-check SSRF oracle closed (no redirect following).
+- Domain SSRF: routes terminate only at `127.0.0.1:<port>`; `localhost` rejected worker-side; private ranges, metadata endpoints, wildcards rejected both sides.
+- Auth: `auth.failed` auditing; CAS on all task transitions; host/agent credential isolation kept; rotation grace (hosts) / immediate (agents) with audit events.
+- Secrets: AES-256-GCM verified; no secret in logs/events/API payloads/dashboard (test-asserted); secrets sweep clean on the tree.
+- Rate limits reviewed: unauth 10/min, agent 120/min, host 600/min (heartbeats ~1/30s — far below), rotation 10/min per credential.
+
+## 6. Every test added/changed
+- **API (new files):** `test/taskQueueHardening.test.ts` (24: CAS, mirror gating, cancel compensation, rollback/domain idempotency, degraded lifecycle, C1 proof, drain refusal, heartbeat enrichment, `worker.updated`, request_id), `test/registrationIdempotency.test.ts` (7), `test/domainReconcile.test.ts` (8, fake-Cloudflare double).
+- **API (extended):** `test/security.test.ts` (+7: provisioning dual-header, auth.failed ×3, request-id ×3), `test/config.test.ts` (+12), `test/hostSweeper.test.ts` (+3), `test/configConsistency.test.ts`, `test/cloudflareTunnel.test.ts`, plus test-schema patches for new columns across 12 files.
+- **Worker (new files):** `test_drain.py` (24), `test_ws_f_hardening.py` (40), `test_log_retention.py`, `test_tunnel_token.py` (14), `test_resilience_agent_gone.py`, `test_resilience_concurrent.py`, `test_resilience_cp_outage.py`, `test_resilience_failure_matrix.py`, `test_resilience_network.py`, `test_resilience_worker_crash.py`, `test_deployment_contract.py`, `test_handlers_rollback.py`, `test_reconcile.py`, `test_rollback_gc_window.py`, `test_self_update.py`.
+- **Worker (extended):** `test_ingress.py` (+5), `test_phase4.py`, `test_resources.py`, `test_compose_security.py`, `test_config_env.py`.
+- **Clients:** JS SDK `client.test.js` extended; Python SDK `test_client.py` (fixture fix); CLI `smoke_help.py` extended (37 commands JSON-valid).
+
+## 7. Full CI result
+*(To be filled after the push — the run is watched to green per standing orders.)*
+
+## 8. Live infrastructure tests performed
+None could be executed: no persistent Linux host, no Supabase project, and no Cloudflare API token were available to this pass (see §10). Everything below was verified against real components locally (real PostgreSQL 16 in CI's e2e job, real API server + pg-mem suites, real worker logic, labeled fake-Cloudflare doubles).
+
+## 9. Cloudflare tests performed
+- 87/87 pass across the 7 control-plane CF/domain suites using a clearly-labeled fake Cloudflare API double (`test/fakeCloudflare.ts`) + pg-mem: route create/update/delete, duplicate hostname 409, deployment-removal teardown, rollback, degraded→heal, unknown-remote-rule preservation policy (409 on claim conflict), DNS-teardown refusal.
+- Worker: 21/21 (`test_tunnel_token.py`: token never in argv, rotation semantics, strict loopback).
+- **Not performed (needs token + domain):** real `PUT …/cfd_tunnel/{id}/configurations` shape, public HTTPS reachability, DNS propagation, live `cloudflared` reading `TUNNEL_TOKEN`.
+
+## 10. Remaining external prerequisites
+1. **Supabase project (or any Postgres 14+)** — blocks: non-superuser migration-chain execution (CI's e2e applies as superuser; only 001/pgcrypto needs elevation, documented), `LISTEN uag_events` shape (needs direct/session connection, NOT the transaction pooler), sweeper wall-clock timing, `FOR UPDATE SKIP LOCKED` contention behavior.
+2. **Persistent Linux host with Docker + systemd** — blocks: real installer run, worker registration/heartbeat against live CP, Docker deployment/health/rollback, resource admission against real cgroups, VM-reboot recovery, worker self-update end-to-end.
+3. **Cloudflare API token + zone + domain** — blocks: live tunnel route configuration, public HTTPS test, DNS lifecycle, route-removal verification (§§66/67).
+4. (Minor) A real browser for dashboard UI validation beyond the static endpoint check.
+
+## 11. Intentionally unsupported behavior
+- Non-HTTP health checks (only HTTP 200-on-`127.0.0.1:<port>` is a health gate; TCP/other protocols report running-vs-unknown).
+- Agent key suspension/revocation API (DB `agents.status` supports `suspended`/`revoked`, but no endpoint mints that transition — rotation is the available control).
+- Code-signing of worker updates (checksum-pinned, not signed).
+- `worker_draining` local flag is sticky by design (operator clears via config); server-advertised draining latches/clears per heartbeat.
+- The local `config.yml` tunnel mirror is diagnostic only — the remote Cloudflare config is authoritative for token-managed tunnels.
+
+## 12. Exact production deployment procedure (control plane)
+1. Provision Postgres 14+ (Supabase: use the **direct/session** connection string — `LISTEN uag_events` does not work through the transaction pooler).
+2. Set env (see §14). `DATA_ENCRYPTION_KEY` (64-hex) and `UAHT_PROVISIONING_TOKEN` must be generated once and stored in the operator's secret manager — key loss invalidates all stored secrets.
+3. `npm ci && npm run build && npm start` (builds from source deterministically; `start` rebuilds `dist/`).
+4. Migrations run automatically on boot (`src/db/migrate.ts`); 001 needs `CREATE EXTENSION pgcrypto` privilege once (Supabase: allowlisted, run from the SQL editor).
+5. Serve behind TLS (Cloudflare or a reverse proxy); point the dashboard at the API.
+
+## 13. Exact host installation procedure
+1. On a clean Linux host (Docker required for app hosting): `curl` the installer or copy `agent-host-platform/scripts/install-host.sh`.
+2. Set `UAHT_CONTROL_PLANE_URL`, `UAHT_HOST_NAME`; optionally `UAHT_TUNNEL_TOKEN` + `UAHT_INGRESS_ENABLED=1` for public ingress.
+3. `sudo bash install-host.sh` — validates prerequisites, creates the `agent-host` user/dirs, installs Python deps, copies all worker packages, writes `/opt/agent-host/worker.env` (0600), installs + enables the systemd unit.
+4. The worker provisions itself (`POST /v1/hosts/register` with `UAHT_PROVISIONING_TOKEN`), starts heartbeating, and claims queued tasks.
+5. Re-running the installer reuses stored credentials (never mints duplicates, never blanks the tunnel token).
+
+## 14. Exact environment variables required
+**Control plane (all `UAHT_`-canonical; see `api/.env.example` + `docs/CONFIG.md`):**
+`DATABASE_URL`, `PORT`, `ARTIFACT_DIR`, `LOG_DIR`, `DASHBOARD_DIR`, `DATA_ENCRYPTION_KEY` (64-hex, required), `UAHT_PROVISIONING_TOKEN` (required), `RATE_LIMIT_AGENT_PER_MIN` (120), `RATE_LIMIT_HOST_PER_MIN` (600), `RATE_LIMIT_UNAUTH_PER_MIN` (10), `UAHT_ROTATE_RATE_PER_MIN` (10), `HEARTBEAT_SWEEP_INTERVAL_S` (30), `HEARTBEAT_DEGRADED_AFTER_S` (90), `HEARTBEAT_OFFLINE_AFTER_S` (300), `PG_POOL_MAX` (10), `LOG_LEVEL`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE_ID`, `PUBLIC_INGRESS_HOSTNAME`, `TUNNEL_INGRESS_HOSTNAME`, `CLOUDFLARE_TUNNEL_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_BASE`.
+**Host worker (`WORKER_` prefix; see `host-worker/.env.example`):**
+`WORKER_CONTROL_PLANE_URL`, `WORKER_HOST_NAME`, `WORKER_HOST_TOKEN`, `WORKER_HOST_ID`, `WORKER_POLL_WAIT`, `WORKER_HEARTBEAT_INTERVAL`, `WORKER_WORK_DIR`, `WORKER_APPS_DIR`, `WORKER_WORKER_VERSION`, `WORKER_DRAINING`, `WORKER_CAPABILITIES`, `WORKER_CRASH_LOOP_THRESHOLD`, `WORKER_CRASH_LOOP_WINDOW_S`, `WORKER_INGRESS_ENABLED`, `WORKER_INGRESS_PROVIDER`, `WORKER_TUNNEL_TOKEN`.
+**Compatibility aliases (documented, normalized immediately, tested):** `CLOUDFLARE_TUNNEL_API_TOKEN` ← `CLOUDFLARE_API_TOKEN` fallback; `WORKER_TUNNEL_TOKEN` ← `UAHT_TUNNEL_TOKEN`.
+
+## 15. Final architecture diagram
+```
+Muse / Instinct / any agent ──HTTPS──▶ Universal-AGT Control Plane ──▶ PostgreSQL/Supabase
+   (temporary clients; submit &    │        (durable source of truth:        (durable task queue,
+    monitor, then disappear)      │         tasks, deployments, ports,        FOR UPDATE SKIP LOCKED
+                                  │         domains, secrets, events)          claims, leases, idem-
+                                  │                                          potency keys)
+                                  │ outbound task polling + heartbeats
+                                  ▼
+                         Persistent Host Worker (outbound-only, no inbound)
+                                  │  agent/ (register, heartbeat, drain)
+                                  │  deployments/ (pipeline, transactional ports/resources)
+                                  │  executor/ + docker/ (isolated containers)
+                                  │  health/ (127.0.0.1:<port> checks)
+                                  │  ingress/ (cloudflared, token via env)
+                                  │  updater/ (atomic self-update)
+                                  ▼
+                         Docker ──▶ App A, App B, App C … (isolated)
+                                  ▼
+                         Cloudflare Tunnel ──▶ Internet (public HTTPS)
+                         (remote config authoritative)
+```
+
+## 16. Final statement — three-way split
+
+### IMPLEMENTED AND TESTED (local suites + CI green)
+Source/build consistency gate; deterministic builds; installer (42 checks incl. genuine import-coverage gate, credential reuse, no secret clobbering); config contract (one canonical name per setting, alias layers documented/tested); production config validator; durable task queue (CAS transitions, atomic claims, leases, sweeper, retry/backoff policy); idempotency (tasks, deployments, rollback, domains, host/agent registration); transactional resource reservation; transactional port allocation; deployment pipeline with safe extraction (bomb caps, traversal rejection), checksum verification, manifest validation; Docker security (flag-injection and compose-escape closes); health checks (no-redirect, exact-200); startup reconciliation; rollback (verify-before-teardown + rebuild-from-contract); worker self-update; draining (worker + server); heartbeats with full §9 payload; Cloudflare automation with degraded-state reconciliation (fake-double tested); domain lifecycle with unique ownership; SSRF protection both sides; AES-256-GCM secrets with rotation; auth isolation (agent/host/dashboard); `auth.failed` + 46-type event journal (append-only, REVOKE-protected); rate limiting; request correlation IDs; standardized errors; SDKs (JS 44 / Python 43), CLI (19 commands, 37 JSON-valid), dashboard (static endpoint check); 12-job CI.
+
+### IMPLEMENTED BUT REQUIRES LIVE INFRASTRUCTURE VALIDATION
+Real Docker daemon behavior; real systemd install/start/reboot; non-superuser migration chain on Supabase; `LISTEN` over the direct connection; `FOR UPDATE SKIP LOCKED` under real contention; sweeper wall-clock timing; live Cloudflare route/DNS/HTTPS end-to-end; live `cloudflared` with env-passed token; dashboard in a real browser; resource admission against real cgroups; VM-reboot recovery; worker self-update against a live systemd unit.
+
+### GENUINELY REMAINING WORK
+- Agent suspend/revoke API endpoint (DB supports it; no route mints the transition — needs an admin-auth design decision).
+- Non-HTTP health-check protocols.
+- Per-resource (per-project/per-deployment) ACLs — current model is per-agent permission flags.
+- Approval notification path (awaiting_approval tasks have no push/notify channel).
+- Code-signing for worker updates (checksum-pinned today).
+- The 50-step live acceptance run (§66) and live Cloudflare test (§67) — blocked on §10 prerequisites, not on code.
