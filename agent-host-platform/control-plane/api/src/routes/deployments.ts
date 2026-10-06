@@ -493,7 +493,7 @@ deploymentsRouter.post('/:id/rollback', requireAgent, requirePermission('deploy'
     const candidates = (
       await pool.query(
         `SELECT * FROM deployments
-         WHERE project_id = $1 AND host_id = $2 AND id <> $3 AND status = 'running'`,
+         WHERE project_id = $1 AND host_id = $2 AND id <> $3 AND status IN ('running','superseded')`,
         [current.project_id, current.host_id, current.id],
       )
     ).rows;
