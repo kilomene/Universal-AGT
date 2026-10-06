@@ -136,6 +136,8 @@ create table projects (
     id                uuid primary key default gen_random_uuid(),
     name              text not null unique,
     owner             text,                                   -- agent name that owns it
+    owner_agent_id    uuid references agents(id) on delete set null,  -- explicit owner (migration 011);
+                                                             -- null = legacy-open: accessible to all agents
     repository        text,                                   -- optional source repo URL
     artifact_location text,
     runtime           text not null default 'docker',         -- 'docker' | 'docker-compose' | 'static'
@@ -143,6 +145,52 @@ create table projects (
     created_at        timestamptz not null default now(),
     updated_at        timestamptz not null default now()
 );
+create index idx_projects_owner_agent on projects(owner_agent_id);
+
+-- ----------------------------------------------------------------------------
+-- project_members: project ACL (migration 011). Grants a non-owner agent
+-- access to a project. The agent's own permission map still gates which
+-- actions it may take — membership is about *which* projects, not *what*
+-- actions.
+-- ----------------------------------------------------------------------------
+create table project_members (
+    project_id uuid not null references projects(id) on delete cascade,
+    agent_id   uuid not null references agents(id) on delete cascade,
+    created_at timestamptz not null default now(),
+    primary key (project_id, agent_id)
+);
+create index idx_project_members_agent on project_members(agent_id);
+
+-- ----------------------------------------------------------------------------
+-- agent_host_access: per-host targeting ACL for agents (migration 011).
+-- An agent may explicitly target a host (POST /v1/deployments host_id)
+-- only when a row exists for the agent+host pair — or, for backwards
+-- compatibility, when the host has NO access rows at all (the first row
+-- for a host switches it to strict mode).
+-- ----------------------------------------------------------------------------
+create table agent_host_access (
+    agent_id    uuid not null references agents(id) on delete cascade,
+    host_id     uuid not null references hosts(id) on delete cascade,
+    permissions jsonb not null default '{}'::jsonb,
+    created_at  timestamptz not null default now(),
+    primary key (agent_id, host_id)
+);
+create index idx_agent_host_access_host on agent_host_access(host_id);
+
+-- ----------------------------------------------------------------------------
+-- migration_reports: durable record of migration outcomes (migration 011).
+-- Every project whose legacy owner name could not be resolved to an agent
+-- is recorded here (never silently assigned).
+-- ----------------------------------------------------------------------------
+create table migration_reports (
+    id          bigserial primary key,
+    migration   text not null,
+    project_id  uuid references projects(id) on delete set null,
+    detail      jsonb not null default '{}'::jsonb,
+    created_at  timestamptz not null default now(),
+    unique (migration, project_id)
+);
+create index idx_migration_reports_migration on migration_reports(migration);
 
 -- ----------------------------------------------------------------------------
 -- artifacts: immutable build outputs, content-addressed by SHA-256.
@@ -178,7 +226,7 @@ create table deployments (
     status         text not null default 'requested'
                    check (status in ('requested','approved','building','starting',
                                      'healthcheck','running','failed','rolled_back',
-                                     'stopped','stopping')),
+                                     'rollback_failed','stopped','stopping')),
     container_ids  jsonb not null default '[]'::jsonb,
     ports          jsonb not null default '{}'::jsonb,        -- written from the deploy task's
                                                              -- result.ports on completion
