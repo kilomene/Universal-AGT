@@ -15,9 +15,16 @@ DEFAULT_INTERVAL_SECS = 2
 
 
 def check_once(url: str, timeout: int = 5) -> bool:
-    """Single GET; True only on HTTP 200."""
+    """Single GET; True only on HTTP 200.
+
+    Redirects are NEVER followed (§19): a 3xx is not a healthy app, and
+    following a Location header would turn the health checker into an
+    SSRF oracle — a malicious app could 302 to an arbitrary URL (e.g.
+    cloud metadata) and learn from the boolean result whether it
+    returned 200.
+    """
     try:
-        resp = requests.get(url, timeout=timeout)
+        resp = requests.get(url, timeout=timeout, allow_redirects=False)
         return resp.status_code == 200
     except requests.RequestException:
         return False
