@@ -305,27 +305,11 @@ end $$;
 
 -- ----------------------------------------------------------------------------
 -- events TRUNCATE block (see migrations/005_events_truncate_block.sql).
--- A row-level trigger cannot block TRUNCATE, so an event trigger aborts
--- any TRUNCATE touching public.events. NOTE: CREATE EVENT TRIGGER needs
--- superuser; if this schema is applied as a non-superuser, run this block
--- separately as superuser.
+-- A row-level trigger cannot block TRUNCATE, and PostgreSQL event
+-- triggers do not support TRUNCATE at all (verified on PG 16), so there
+-- is no trigger-based block. Defense in depth: revoke TRUNCATE from
+-- PUBLIC (stops every non-owner role). Full protection needs the table
+-- owned by a dedicated role distinct from the application role — see
+-- docs/security.md "events table ownership".
 -- ----------------------------------------------------------------------------
-create or replace function forbid_events_truncate() returns event_trigger as $$
-declare
-    obj record;
-begin
-    for obj in select * from pg_event_trigger_ddl_commands() loop
-        if obj.command_tag = 'TRUNCATE TABLE'
-           and obj.object_identity ilike 'public.events%' then
-            raise exception 'events table is append-only: TRUNCATE not allowed';
-        end if;
-    end loop;
-end;
-$$ language plpgsql;
-
-drop event trigger if exists trg_no_truncate_events;
-
-create event trigger trg_no_truncate_events
-    on ddl_command_end
-    when tag in ('TRUNCATE TABLE')
-    execute function forbid_events_truncate();
+revoke truncate on public.events from public;
