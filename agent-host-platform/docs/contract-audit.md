@@ -133,13 +133,14 @@ elevated-privilege requirements (superuser / service_role).
 
 ## Privilege findings (§46)
 
-- **005 `005_events_truncate_block.sql`** — needs **superuser** (`CREATE
-  EVENT TRIGGER`; row triggers cannot block `TRUNCATE`). Documented in the
-  migration header and `docs/deployment.md`. Safe path: run the file in the
-  Supabase SQL editor (runs as superuser), then
-  `INSERT INTO schema_migrations (name) VALUES ('005_events_truncate_block.sql')`,
-  then restart the API. Re-apply after any restore (event triggers are
-  not captured by schema-only dumps).
+- **005 `005_events_truncate_block.sql`** — **corrected 2026-10-06:** the
+  earlier revision installed an event trigger to block `TRUNCATE`; that
+  approach is impossible (PostgreSQL does not support event triggers on
+  `TRUNCATE` — the migration failed on real PG 16). It is now a plain
+  `REVOKE TRUNCATE ... FROM PUBLIC` (table owner can run it; no superuser
+  needed). Full protection requires separate table ownership — documented
+  in the migration header and `docs/security.md` ("events table
+  ownership").
 - **001 `001_initial.sql`** — needs **superuser** on a fresh database for
   `CREATE EXTENSION "pgcrypto"` (the migration header does not say so;
   migrations are never edited, so the note lives in
