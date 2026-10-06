@@ -43,6 +43,12 @@ export interface AuthContext {
 //   manage_secrets:        create/list/delete project secrets (plaintext
 //                          values are never returned by the list endpoint)
 //   manage_domains:        create/list/delete deployment domain entries
+//   admin:                 operator-grade actions: agent lifecycle
+//                          (suspend/resume/revoke), project owner assignment
+//                          and membership management. The UAHT_PROVISIONING_TOKEN
+//                          bearer is accepted as operator auth wherever
+//                          requireOperator is used, so a deployment without
+//                          any admin agent still has an operator path.
 //
 // "Host admin" lifecycle (register/rotate) is deliberately NOT a
 // permission: host registration requires the UAHT_PROVISIONING_TOKEN
@@ -57,6 +63,7 @@ export const PERMISSIONS = [
   'stop',
   'manage_secrets',
   'manage_domains',
+  'admin',
 ] as const;
 export type PermissionName = (typeof PERMISSIONS)[number];
 
@@ -200,7 +207,7 @@ export async function auditAuthFailure(
 // X-Provisioning-Token header. The documented agent-integration convention is
 // the X-Provisioning-Token header (docs/agent-integration.md); the Bearer
 // form is kept for backward compatibility. Both carry the same credential.
-function provisioningTokenFrom(req: Request): string | null {
+export function provisioningTokenFrom(req: Request): string | null {
   const header = req.header('x-provisioning-token');
   if (header && header.length > 0) return header;
   return parseBearer(req);
@@ -226,6 +233,49 @@ export function provisioningOrDeploy(req: Request, _res: Response, next: NextFun
     token ? 'bad_provisioning_token' : 'insufficient_permission',
   );
   return next(new HttpError(403, 'forbidden', 'host registration requires a provisioning token or the deploy permission'));
+}
+
+// Operator authentication for admin-grade endpoints (agent lifecycle,
+// project owner assignment, membership management). Accepts EITHER the
+// UAHT_PROVISIONING_TOKEN (X-Provisioning-Token header or bearer — the
+// documented operator credential) OR an agent token carrying the `admin`
+// permission. Standalone: do NOT stack requireAgent in front of it, or the
+// provisioning-token operator path would 401 before it is evaluated.
+export function requireOperator(req: Request, _res: Response, next: NextFunction): void {
+  const expected = process.env.UAHT_PROVISIONING_TOKEN;
+  // 1. Explicit operator credential: the X-Provisioning-Token header. A
+  //    wrong value is a failed authentication (401), not a forbidden one.
+  const headerPresented = req.header('x-provisioning-token');
+  if (headerPresented) {
+    if (expected && verifyToken(headerPresented, sha256Hex(expected))) return next();
+    return next(new HttpError(401, 'unauthorized', 'invalid provisioning token'));
+  }
+  // 2. No authenticated identity: a bearer token here can only be the
+  //    provisioning token (an agent/host bearer would have authenticated
+  //    via attachAuth and landed in branch 3).
+  if (!req.auth) {
+    const bearer = parseBearer(req);
+    if (bearer) {
+      if (expected && verifyToken(bearer, sha256Hex(expected))) return next();
+      return next(new HttpError(401, 'unauthorized', 'invalid provisioning token'));
+    }
+    return next(
+      new HttpError(
+        401,
+        'unauthorized',
+        'operator authentication required (provisioning token or agent with the admin permission)',
+      ),
+    );
+  }
+  // 3. Authenticated caller: needs the admin permission.
+  if (req.auth.kind === 'agent' && hasPermission(req.auth, 'admin')) return next();
+  return next(
+    new HttpError(
+      403,
+      'forbidden',
+      'operator authentication required (provisioning token or agent with the admin permission)',
+    ),
+  );
 }
 
 export function apiErrorHandler(
