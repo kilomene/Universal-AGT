@@ -227,7 +227,11 @@ create table deployments (
     status         text not null default 'requested'
                    check (status in ('requested','approved','building','starting',
                                      'healthcheck','running','failed','rolled_back',
-                                     'rollback_failed','stopped','stopping')),
+                                     'rollback_failed','stopped','stopping',
+                                     'superseded')),  -- 'superseded' added by migration 015:
+                                                      -- previous deployment of the same
+                                                      -- project+host; reservation released,
+                                                      -- kept as a rollback target
     container_ids  jsonb not null default '[]'::jsonb,
     ports          jsonb not null default '{}'::jsonb,        -- written from the deploy task's
                                                              -- result.ports on completion
