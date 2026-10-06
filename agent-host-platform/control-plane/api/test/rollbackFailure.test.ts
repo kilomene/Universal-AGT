@@ -245,9 +245,16 @@ describe('§6 rollback failure durability', () => {
     });
     expect(running.status).toBe(200);
 
+    // Fix #2: success requires the COMPLETE contract — status,
+    // target_health_status AND rollback_status. The old {"status":"ok"}
+    // report no longer counts.
     const res = await req('POST', `/v1/worker/tasks/${taskId}/progress`, host.token, {
       status: 'completed',
-      result: { status: 'ok' },
+      result: {
+        status: 'rolled_back',
+        target_health_status: 'healthy',
+        rollback_status: 'succeeded',
+      },
     });
     expect(res.status).toBe(200);
 
@@ -255,6 +262,36 @@ describe('§6 rollback failure durability', () => {
     const types = await eventTypes(depId);
     expect(types).toContain('deployment.rolled_back');
     expect(types).not.toContain('deployment.rollback_failed');
+  });
+
+  it.each([
+    ['legacy ok report', { status: 'ok' }],
+    ['rolled_back without health', { status: 'rolled_back' }],
+    ['rolled_back without rollback_status', { status: 'rolled_back', target_health_status: 'healthy' }],
+    ['unknown health', { status: 'rolled_back', target_health_status: 'unknown', rollback_status: 'succeeded' }],
+    ['unhealthy target', { status: 'rolled_back', target_health_status: 'unhealthy', rollback_status: 'succeeded' }],
+    ['failed rollback_status', { status: 'rolled_back', target_health_status: 'healthy', rollback_status: 'failed' }],
+    ['contradictory: rolled_back + rollback_failed', { status: 'rollback_failed', target_health_status: 'healthy', rollback_status: 'succeeded' }],
+    ['empty report', {}],
+  ])('incomplete/contradictory rollback report persists rollback_failed (%s)', async (_name, result) => {
+    const { host, depId, taskId } = await seedRollbackScenario();
+
+    const running = await req('POST', `/v1/worker/tasks/${taskId}/progress`, host.token, {
+      status: 'running',
+    });
+    expect(running.status).toBe(200);
+
+    const res = await req('POST', `/v1/worker/tasks/${taskId}/progress`, host.token, {
+      status: 'completed',
+      result,
+    });
+    expect(res.status).toBe(200);
+
+    // Fix #2: success is never inferred from missing fields.
+    expect(await deploymentStatus(depId)).toBe('rollback_failed');
+    const types = await eventTypes(depId);
+    expect(types).toContain('deployment.rollback_failed');
+    expect(types).not.toContain('deployment.rolled_back');
   });
 
   it('rollback_failed is non-routable for Cloudflare/tunnel failover', () => {
