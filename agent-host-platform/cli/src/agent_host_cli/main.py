@@ -132,6 +132,53 @@ def cmd_apps(args):
                   "health": s.get("health_status")} for s in rows])
 
 
+def _read_manifest_from_artifact(path: str) -> dict | None:
+    """Extract agent.deploy.json from a tarball/zip without extracting it.
+
+    Fix #1 wiring: the CLI reads the manifest client-side and passes it to
+    artifact init, so the control plane can validate it and the scheduler
+    reserves from the exact definition the worker will deploy. Returns None
+    when the archive has no readable manifest (the server accepts a
+    manifest-less init; the worker still validates at deploy time).
+    Only the single manifest file's bytes are ever read — nothing is
+    written to disk and no archive member is executed.
+    """
+    import tarfile
+    import zipfile
+
+    try:
+        if tarfile.is_tarfile(path):
+            with tarfile.open(path, "r") as tf:
+                for member in tf.getmembers():
+                    # Archive-root only: strip leading "./" segments, then
+                    # require the bare filename. A member named
+                    # "../../agent.deploy.json" must NOT match.
+                    name = member.name
+                    while name.startswith("./"):
+                        name = name[2:]
+                    if name == "agent.deploy.json" and member.isfile():
+                        fh = tf.extractfile(member)
+                        if fh is None:
+                            return None
+                        with fh:
+                            data = fh.read(1_000_000)
+                        return json.loads(data.decode("utf-8"))
+            return None
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as zf:
+                for name in zf.namelist():
+                    clean = name
+                    while clean.startswith("./"):
+                        clean = clean[2:]
+                    if clean == "agent.deploy.json":
+                        with zf.open(name) as fh:
+                            return json.loads(fh.read(1_000_000).decode("utf-8"))
+            return None
+    except (OSError, ValueError, KeyError, tarfile.TarError, zipfile.BadZipFile):
+        return None
+    return None
+
+
 def cmd_deploy(args):
     c = _client(args)
     artifact_id = None
@@ -141,7 +188,10 @@ def cmd_deploy(args):
         if not os.path.isfile(args.artifact):
             raise SystemExit(f"error: artifact file not found: {args.artifact}")
         print(f"uploading artifact {args.artifact} ...", file=sys.stderr)
-        info = c.init_artifact(project_id, args.artifact, version=args.version)
+        manifest = _read_manifest_from_artifact(args.artifact)
+        if manifest is not None:
+            print("agent.deploy.json found in artifact; registering its manifest", file=sys.stderr)
+        info = c.init_artifact(project_id, args.artifact, version=args.version, manifest=manifest)
         c.upload_artifact(info["upload_url"], args.artifact)
         artifact_id = info["artifact"]["id"]
         print(f"artifact uploaded: {artifact_id}", file=sys.stderr)
