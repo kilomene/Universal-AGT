@@ -3,7 +3,8 @@
 # Universal AGT — persistent host installer (one command)
 #
 # Installs the host worker on a Debian/Ubuntu persistent Linux host:
-#   * fails unless running on Linux, as root, with python3 >= 3.10
+#   * fails unless running on Linux, as root, with python3 >= 3.12
+#     (the worker extracts tarballs with tarfile.data_filter, 3.12+)
 #   * installs python3 + python3-requests + docker.io if missing (apt);
 #     falls back to `pip install -r host-worker/requirements.txt` when the
 #     requests module is still not importable
@@ -146,9 +147,9 @@ else
   log "UAHT_SKIP_APT=1: skipping apt installs"
 fi
 command -v python3 >/dev/null || fail "python3 still missing after install step"
-python3 - <<'EOF' || fail "python3 >= 3.10 is required (worker uses 3.10+ syntax)"
+python3 - <<'EOF' || fail "python3 >= 3.12 is required (worker uses tarfile.data_filter, 3.12+)"
 import sys
-sys.exit(0 if sys.version_info >= (3, 10) else 1)
+sys.exit(0 if sys.version_info >= (3, 12) else 1)
 EOF
 log "python3 version OK: $(python3 -c 'import sys; print(sys.version.split()[0])')"
 
