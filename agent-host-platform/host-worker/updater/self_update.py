@@ -207,16 +207,22 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
 
     if log:
         log(f"downloading worker update {version} from {url}")
-    if download_fn is None:
-        import requests
-        with requests.get(url, stream=True, timeout=120) as resp:
-            resp.raise_for_status()
-            with open(tarball, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 256):
-                    if chunk:
-                        fh.write(chunk)
-    else:
-        download_fn(url, str(tarball))
+    try:
+        if download_fn is None:
+            import requests
+            with requests.get(url, stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                with open(tarball, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            fh.write(chunk)
+        else:
+            download_fn(url, str(tarball))
+    except Exception as exc:
+        tarball.unlink(missing_ok=True)
+        raise UpdateError(
+            f"update {version} download failed: {exc}; "
+            "current version untouched") from exc
 
     actual_sha = _sha256_file(tarball)
     if not hmac.compare_digest(actual_sha, expected_sha):
@@ -228,10 +234,18 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
     if release_dir.exists():
         shutil.rmtree(release_dir)
     release_dir.mkdir(parents=True)
-    with tarfile.open(tarball, "r:gz") as tf:
-        # tarfile.data_filter (3.12+) blocks absolute paths, ".." escapes,
-        # and symlink/hardlink members resolving outside release_dir.
-        tf.extractall(release_dir, filter="data")
+    try:
+        with tarfile.open(tarball, "r:gz") as tf:
+            # tarfile.data_filter (3.12+) blocks absolute paths, ".." escapes,
+            # and symlink/hardlink members resolving outside release_dir.
+            tf.extractall(release_dir, filter="data")
+    except Exception as exc:
+        # Corrupt/truncated archive: never leave a half-extracted release
+        # behind, and never proceed to the health check with it.
+        shutil.rmtree(release_dir, ignore_errors=True)
+        raise UpdateError(
+            f"update {version} archive is corrupt ({exc}); "
+            "aborted, current version untouched") from exc
 
     current_link = work / "current"
     previous_target = None
@@ -269,15 +283,18 @@ def apply_update(update_info: dict, work_dir: str, current_version: str,
     if not wait_for_healthy(str(work), version, pre_ts,
                             timeout_s=HEALTH_TIMEOUT_S, log=log):
         _rollback_symlink(work, previous_target)
-        subprocess.run(
+        rb_proc = subprocess.run(
             ["systemctl", "restart", SERVICE_NAME],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             timeout=120,
         )
+        rb_note = ("and restarted it" if rb_proc.returncode == 0
+                   else f"but restarting it ALSO failed: "
+                        f"{rb_proc.stderr[-2000:]}")
         raise UpdateError(
             f"update {version} did not come up healthy within "
             f"{HEALTH_TIMEOUT_S}s of restart; rolled back to previous "
-            "release and restarted it")
+            f"release {rb_note}")
     return "updated"
 
 
