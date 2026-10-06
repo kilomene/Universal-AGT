@@ -636,6 +636,16 @@ Validation rules: `name` required (must match project name); `runtime` in
 like `256m|1g`; `resources.cpu` positive number; `restart` in
 `no|always|unless-stopped|on-failure`.
 
+`volumes` is **rejected** in `agent.deploy.json` (spec §6 — no partial
+support): the `docker` runtime never mounts host paths, so a manifest-level
+`volumes` field would be accepted-but-inert and silently misleading. A
+manifest carrying `volumes` fails validation fast with a clear error before
+any build. Persistent storage is available via `runtime: docker-compose`
+with named volumes, tmpfs mounts, or workspace-relative bind mounts (the
+compose file is security-validated before `compose up`: privileged mode,
+host namespaces, devices, added capabilities, and bind mounts escaping the
+deployment workspace are denied).
+
 ---
 
 ## 5. Task payloads by type
