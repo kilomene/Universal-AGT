@@ -205,6 +205,7 @@ create table artifacts (
     size         bigint not null check (size >= 0),
     version      text not null,
     created_at   timestamptz not null default now(),
+    manifest     jsonb,                                       -- validated agent.deploy.json (migration 014); NULL for legacy artifacts
     unique (project_id, version)
 );
 create index idx_artifacts_project on artifacts(project_id);
