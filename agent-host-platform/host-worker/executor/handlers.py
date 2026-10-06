@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from deployments import pipeline as deploy_pipeline
+from deployments import rollback as rollback_mod
 from ingress import sync as ingress_sync
 
 
@@ -68,187 +69,8 @@ def _deployment_state(ctx, deployment_id: str) -> dict:
 
 def _restorable(state: dict) -> bool:
     """A deployment can be restored by rollback when it has a container or
-    a compose stack recorded."""
-    return bool(state.get("container_name") or state.get("compose_project"))
-
-
-def _restore_deployment(ctx, docker, state: dict) -> None:
-    """Bring a rollback target back up: `docker start` for container
-    deployments, `docker compose up` with the stored compose file for
-    compose deployments. Scoped strictly to the target's own recorded
-    names — never by project-prefix matching.
-
-    If the target's container was garbage-collected (older than the
-    DEPLOY_KEEP_GENERATIONS window), fall back to rebuilding it from the
-    persisted deployment contract, exactly like reconcile does. Callers
-    must run _verify_target_restorable() BEFORE tearing down the current
-    deployment so a failed rollback never leaves the project down.
-    """
-    from deployments.pipeline import run_spec_from_state
-    task_id = "rollback"
-    if state.get("container_name"):
-        name = state["container_name"]
-        if docker.container_exists(name):
-            docker.start(name)
-            return
-        # GC'd generation: rebuild from the stored contract.
-        spec = run_spec_from_state(state)
-        image = spec["image"]
-        if not image or not docker.image_exists(image):
-            raise HandlerError(
-                f"rollback target {state.get('deployment_id')} container "
-                f"{name} is gone and its image {image!r} is unavailable; "
-                f"redeploy required"
-            )
-        env = dict(state.get("env") or {})  # non-secret env only, as in reconcile
-        docker.run(name, image, ports=spec["ports"], env=env or None,
-                   memory=spec["memory"], cpus=spec["cpus"],
-                   restart=spec["restart"])
-        ctx.log(task_id,
-                f"rollback target container {name} was GC'd; rebuilt from "
-                f"image {image} (non-secret env only)")
-    elif state.get("compose_project"):
-        compose_file = state.get("compose_file")
-        if not compose_file or not Path(compose_file).is_file():
-            raise HandlerError(
-                f"rollback target {state.get('deployment_id')} is a compose "
-                f"deployment but its compose file {compose_file!r} is "
-                f"missing; redeploy required"
-            )
-        docker.compose_up(compose_file,
-                          project_name=state["compose_project"], build=True)
-    else:  # pragma: no cover — callers check _restorable first
-        raise HandlerError(
-            f"rollback target {state.get('deployment_id')} has nothing to restore"
-        )
-
-
-def _docker_status(docker, name):
-    """Container status or None; tolerant of doubles without the method."""
-    fn = getattr(docker, "container_status", None)
-    if fn is None:
-        return None
-    try:
-        return fn(name)
-    except Exception:
-        return None
-
-
-def _verify_target_restorable(ctx, docker, target: dict) -> None:
-    """Fail fast (before the current deployment is touched) when the
-    rollback target cannot be brought back up.
-
-    A container target is restorable when its container still exists, or
-    when it can be rebuilt from the persisted contract (image recorded and
-    present). A compose target needs its compose file. In both cases the
-    target's recorded host ports must be free (spec §21: host availability
-    verified) — a port squatted by another container would make the restore
-    fail AFTER the healthy current deployment was destroyed, so the
-    rollback is refused loudly instead. The target's own (stopped)
-    container/stack is excluded from the collision check: `docker start`
-    reuses its existing port mapping.
-    """
-    from deployments.pipeline import run_spec_from_state
-    target_id = target.get("deployment_id")
-    if target.get("container_name"):
-        name = target["container_name"]
-        if docker.container_exists(name):
-            # A target whose container is already running needs no port
-            # check: `docker start` is a no-op and the port is legitimately
-            # held by the target itself.
-            if _docker_status(docker, name) != "running":
-                _verify_target_ports_free(ctx, docker, target, target_id)
-            return
-        spec = run_spec_from_state(target)
-        image = spec["image"]
-        if image and docker.image_exists(image):
-            _verify_target_ports_free(ctx, docker, target, target_id)
-            return
-        raise HandlerError(
-            f"rollback target {target_id} cannot be restored: container "
-            f"{name} is gone (beyond the GC window) and image {image!r} is "
-            f"unavailable; redeploy required"
-        )
-    if target.get("compose_project"):
-        compose_file = target.get("compose_file")
-        if not (compose_file and Path(compose_file).is_file()):
-            raise HandlerError(
-                f"rollback target {target_id} cannot be restored: compose file "
-                f"{compose_file!r} is missing; redeploy required"
-            )
-        _verify_target_compose_ports_free(ctx, docker, target, target_id)
-        return
-    raise HandlerError(  # pragma: no cover — callers check _restorable first
-        f"rollback target {target_id} has nothing to restore"
-    )
-
-
-def _verify_target_ports_free(ctx, docker, target: dict, target_id) -> None:
-    """The target's recorded host ports must be free before teardown."""
-    from deployments.pipeline import run_spec_from_state, verify_host_port_free
-    spec = run_spec_from_state(target)
-    own = {target["container_name"]} if target.get("container_name") else set()
-    for host_port in (spec.get("ports") or {}):
-        try:
-            verify_host_port_free(docker, int(host_port),
-                                  exclude_names=own)
-        except Exception as exc:
-            raise HandlerError(
-                f"rollback target {target_id} cannot be restored: host port "
-                f"{host_port} is not free ({exc}); refusing to tear down "
-                f"the current deployment"
-            ) from exc
-
-
-def _verify_target_compose_ports_free(ctx, docker, target: dict,
-                                      target_id) -> None:
-    """The target compose stack's declared ports must be free before teardown."""
-    from deployments.pipeline import verify_compose_ports_free
-    ports = []
-    for p in target.get("compose_ports") or []:
-        try:
-            ports.append(int(p))
-        except (TypeError, ValueError):
-            continue
-    try:
-        verify_compose_ports_free(
-            docker, target["compose_project"], ports,
-            registry_used=ctx.deployment_store.used_host_ports())
-    except Exception as exc:
-        raise HandlerError(
-            f"rollback target {target_id} cannot be restored: {exc}; "
-            f"refusing to tear down the current deployment"
-        ) from exc
-
-
-def _healthcheck_restored_target(ctx, docker, target: dict, payload: dict,
-                                 task_id: str):
-    """Health-check the rollback target after it is restored (spec §21).
-
-    Returns True (healthy), False (unhealthy) or None (no host port
-    recorded — nothing to check against). Never raises: the restore
-    already happened, so an unhealthy target is reported honestly via its
-    health_status rather than hidden behind a task failure.
-    """
-    from health import checker as health_checker
-    host_port = target.get("host_port")
-    if not host_port:
-        return None
-    path = target.get("healthcheck_path") or "/"
-    timeout = int(payload.get("healthcheck_timeout", 60))
-    ctx.log(task_id,
-            f"rollback healthcheck: GET :{host_port}{path} "
-            f"(timeout {timeout}s)")
-    try:
-        ok = health_checker.wait_for_healthcheck(
-            int(host_port), path, timeout_secs=timeout,
-            log=lambda line: ctx.log(task_id, line))
-    except Exception as exc:
-        ctx.log(task_id, f"rollback target healthcheck error: {exc}")
-        return False
-    ctx.log(task_id,
-            f"rollback target health: {'healthy' if ok else 'UNHEALTHY'}")
-    return ok
+    a compose stack recorded (see deployments.rollback.is_restorable)."""
+    return rollback_mod.is_restorable(state)
 
 
 def _teardown_current(ctx, docker, state: dict) -> None:
@@ -273,6 +95,18 @@ def _container_name(ctx, deployment_id: str) -> str:
             f"(status={state.get('status')})"
         )
     return name
+
+
+def _compose_deployment(ctx, deployment_id: str):
+    """(state, compose_project) for compose-runtime deployments.
+
+    Returns (state, None) for single-container deployments. Lifecycle and
+    introspection handlers branch on this so docker-compose deployments
+    get the same restart/stop/start/logs/status coverage as docker ones
+    (compose vs docker-run parity, spec §9).
+    """
+    state = _deployment_state(ctx, deployment_id)
+    return state, state.get("compose_project")
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +144,18 @@ def handle_restart(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
     docker = ctx.require_docker()
-    name = _container_name(ctx, payload["deployment_id"])
+    state, project = _compose_deployment(ctx, payload["deployment_id"])
+    if project:
+        ctx.log(_task_id(task), f"restarting compose project {project}")
+        docker.compose_restart(project)
+        return {"deployment_id": payload["deployment_id"],
+                "compose_project": project, "status": "restarted"}
+    name = state.get("container_name")
+    if not name:
+        raise HandlerError(
+            f"deployment {payload['deployment_id']} has no container "
+            f"(status={state.get('status')})"
+        )
     ctx.log(_task_id(task), f"restarting container {name}")
     docker.restart_container(name)
     return {"deployment_id": payload["deployment_id"], "container": name,
@@ -321,10 +166,22 @@ def handle_stop(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
     docker = ctx.require_docker()
-    name = _container_name(ctx, payload["deployment_id"])
+    state, project = _compose_deployment(ctx, payload["deployment_id"])
+    if project:
+        ctx.log(_task_id(task), f"stopping compose project {project}")
+        docker.compose_stop(project)
+        state["status"] = "stopped"
+        ctx.deployment_store.save(state)
+        return {"deployment_id": payload["deployment_id"],
+                "compose_project": project, "status": "stopped"}
+    name = state.get("container_name")
+    if not name:
+        raise HandlerError(
+            f"deployment {payload['deployment_id']} has no container "
+            f"(status={state.get('status')})"
+        )
     ctx.log(_task_id(task), f"stopping container {name}")
     docker.stop(name)
-    state = ctx.deployment_store.load(payload["deployment_id"])
     state["status"] = "stopped"
     ctx.deployment_store.save(state)
     return {"deployment_id": payload["deployment_id"], "container": name,
@@ -335,10 +192,22 @@ def handle_start(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
     docker = ctx.require_docker()
-    name = _container_name(ctx, payload["deployment_id"])
+    state, project = _compose_deployment(ctx, payload["deployment_id"])
+    if project:
+        ctx.log(_task_id(task), f"starting compose project {project}")
+        docker.compose_start(project)
+        state["status"] = "running"
+        ctx.deployment_store.save(state)
+        return {"deployment_id": payload["deployment_id"],
+                "compose_project": project, "status": "running"}
+    name = state.get("container_name")
+    if not name:
+        raise HandlerError(
+            f"deployment {payload['deployment_id']} has no container "
+            f"(status={state.get('status')})"
+        )
     ctx.log(_task_id(task), f"starting container {name}")
     docker.start(name)
-    state = ctx.deployment_store.load(payload["deployment_id"])
     state["status"] = "running"
     ctx.deployment_store.save(state)
     return {"deployment_id": payload["deployment_id"], "container": name,
@@ -426,88 +295,92 @@ def handle_rollback(ctx, task: dict) -> dict:
         target = candidates[0]  # list_all is newest-first
     ctx.log(_task_id(task),
             f"rolling back {current['deployment_id']} -> {target['deployment_id']}")
-    # Verify BEFORE teardown: a rollback must never destroy the healthy
-    # current deployment when the target cannot be restored (e.g. its
-    # container was garbage-collected beyond the keep-generations window)
-    # or when the target's host ports are no longer free.
-    _verify_target_restorable(ctx, docker, target)
-    _teardown_current(ctx, docker, current)
-    _restore_deployment(ctx, docker, target)
-    # Spec §21: the restored target is health-checked before it is
-    # promoted. An unhealthy target is reported honestly (health_status)
-    # rather than hidden behind a task failure — the restore happened.
-    target_health = _healthcheck_restored_target(
-        ctx, docker, target, payload, _task_id(task))
+    task_id = _task_id(task)
+    log = lambda line: ctx.log(task_id, line)  # noqa: E731
+    # The unified rollback (deployments.rollback): verify BEFORE teardown
+    # (a bad target fails loudly leaving the healthy current deployment
+    # untouched), then teardown of the current deployment, restore,
+    # REAL health check of the target, and state commit — with the
+    # target's health_status coming from the health check, never assumed.
+    try:
+        outcome = rollback_mod.perform_rollback(
+            ctx, docker, log=log, target=target,
+            healthcheck_timeout=int(payload.get("healthcheck_timeout", 60)),
+            before_restore=lambda: _teardown_current(ctx, docker, current))
+    except rollback_mod.RollbackError as exc:
+        raise HandlerError(str(exc)) from exc
     current["status"] = "rolled_back"
     ctx.deployment_store.save(current)
-    target["status"] = "running"
-    target["health_status"] = (
-        "healthy" if target_health else
-        "unhealthy" if target_health is False else
-        target.get("health_status", "unknown"))
-    ctx.deployment_store.save(target)
-    ports_settled = _settle_rollback_ports(
-        ctx, _task_id(task), current["deployment_id"], target["deployment_id"])
+    # Spec §3: reconcile the control-plane port registry (release the
+    # rolled-back deployment's reservations, re-reserve the target's).
+    # Never fails the rollback; a failure is logged and reported via
+    # ports_settled instead of silently claimed.
+    settle = rollback_mod.settle_rollback_ports(
+        ctx, log, current["deployment_id"], outcome["rolled_back_to"])
     return {"deployment_id": current["deployment_id"], "status": "rolled_back",
-            "rolled_back_to": target["deployment_id"],
-            "target_health_status": target["health_status"],
-            "ports_settled": ports_settled}
-
-
-def _settle_rollback_ports(ctx, task_id: str, deployment_id: str,
-                           target_deployment_id: str) -> bool:
-    """Best-effort port-registry settle after a completed rollback.
-
-    Tells the control plane to release the rolled-back deployment's port
-    reservations and re-reserve the rollback target's host ports for the
-    target deployment (its reservation was dropped when the newer
-    deployment superseded it). Uses the API client's public session and
-    base_url attributes — no new client method (agent.api is owned
-    elsewhere). Never raises: the registry is advisory and the worker's
-    physical port checks are the backstop, so a settle failure must not
-    fail an already-completed rollback.
-    """
-    api = getattr(ctx, "api", None)
-    session = getattr(api, "session", None) if api is not None else None
-    base_url = getattr(api, "base_url", None) if api is not None else None
-    if session is None or not base_url:
-        ctx.log(task_id,
-                "rollback port settle skipped: no control-plane session")
-        return False
-    url = (f"{base_url}/v1/deployments/{deployment_id}/"
-           f"settle-rollback-ports")
-    try:
-        resp = session.post(
-            url, json={"target_deployment_id": target_deployment_id},
-            timeout=30)
-    except Exception as exc:
-        ctx.log(task_id, f"rollback port settle failed (non-fatal): {exc}")
-        return False
-    if resp.status_code != 200:
-        ctx.log(task_id,
-                f"rollback port settle returned HTTP {resp.status_code} "
-                f"(non-fatal)")
-        return False
-    try:
-        body = resp.json()
-    except ValueError:
-        body = {}
-    ctx.log(task_id,
-            f"rollback ports settled: released={body.get('released')} "
-            f"restored={body.get('restored')} skipped={body.get('skipped')}")
-    return True
+            "rolled_back_to": outcome["rolled_back_to"],
+            "target_health_status": outcome["target_health_status"],
+            "ports_settled": settle["settled"]}
 
 
 # ---------------------------------------------------------------------------
 # introspection: logs | status | healthcheck | system-info
 # ---------------------------------------------------------------------------
+def _compose_logs(docker, project: str, tail: int) -> dict:
+    """Logs per container of a compose project, keyed by container name."""
+    per_container = {}
+    for rec in docker.compose_ps(project) or []:
+        cname = rec.get("Name") or rec.get("ID")
+        if not cname:
+            continue
+        per_container[cname] = docker.logs(cname, tail=tail)
+    return per_container
+
+
+def _compose_status(docker, project: str) -> dict:
+    """Aggregate + per-container status for a compose project.
+
+    Mirrors what handle_status returns for single containers: a top-level
+    status plus per-container detail with published ports.
+    """
+    containers = {}
+    for rec in docker.compose_ps(project) or []:
+        cname = rec.get("Name") or rec.get("ID") or "?"
+        ports = {}
+        for pub in rec.get("Publishers") or []:
+            try:
+                ports[str(pub.get("TargetPort"))] = str(
+                    pub.get("PublishedPort"))
+            except (TypeError, ValueError):
+                continue
+        containers[cname] = {
+            "status": (rec.get("State") or "unknown").lower(),
+            "ports": ports,
+        }
+    states = {c["status"] for c in containers.values()}
+    if not containers:
+        aggregate = "unknown"
+    elif states == {"running"}:
+        aggregate = "running"
+    elif "running" in states:
+        aggregate = "partial"
+    else:
+        aggregate = "stopped"
+    return {"containers": containers, "status": aggregate}
+
+
 def handle_logs(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
     docker = ctx.require_docker()
-    name = _container_name(ctx, payload["deployment_id"])
     tail = int(payload.get("tail", 500))
     tail = max(1, min(tail, 5000))
+    state, project = _compose_deployment(ctx, payload["deployment_id"])
+    if project:
+        logs = _compose_logs(docker, project, tail)
+        return {"deployment_id": payload["deployment_id"],
+                "compose_project": project, "logs": logs}
+    name = _container_name(ctx, payload["deployment_id"])
     logs = docker.logs(name, tail=tail)
     return {"deployment_id": payload["deployment_id"], "logs": logs}
 
@@ -516,6 +389,13 @@ def handle_status(ctx, task: dict) -> dict:
     payload = _payload(task)
     _require(payload, "deployment_id")
     docker = ctx.require_docker()
+    state, project = _compose_deployment(ctx, payload["deployment_id"])
+    if project:
+        detail = _compose_status(docker, project)
+        return {"deployment_id": payload["deployment_id"],
+                "compose_project": project,
+                "status": detail["status"],
+                "containers": detail["containers"]}
     name = _container_name(ctx, payload["deployment_id"])
     status = docker.container_status(name)
     info = docker.inspect(name)
