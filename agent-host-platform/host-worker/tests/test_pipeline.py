@@ -469,3 +469,59 @@ def test_requested_host_port_collision_fails_before_docker_run(tmp_path, monkeyp
         pipeline.deploy(ctx, _deploy_task(requested_host_port=wanted))
     # no container was ever started for the colliding port
     assert docker.run_calls == []
+
+
+def test_automatic_rollback_unknown_target_health_is_failed_not_success(
+    tmp_path, monkeypatch
+):
+    """Regression (W2 follow-up): the automatic-rollback path in
+    pipeline.deploy() must apply the same rule as the explicit path —
+    success ONLY when the target health check positively verifies
+    "healthy". An "unknown" target (e.g. no health-checkable endpoint)
+    must persist rollback_failed with "target health could not be
+    verified" (never a false "rolled_back"), and port settlement must be
+    skipped — settling the registry for an unverified target would bless a
+    broken promotion."""
+    docker = FakeDockerClient()
+    docker.containers["uaht-my-api-1.0.0"] = {"image": "img:1.0.0",
+                                             "running": True}
+    ctx = FakeCtx(tmp_path, docker, FakeAPI(b""))
+    _seed_previous(ctx)
+
+    # The new version fails its healthcheck -> automatic rollback runs.
+    monkeypatch.setattr(pipeline.health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: False)
+    # The restored target exposes no health-checkable endpoint: its health
+    # comes back UNKNOWN rather than healthy/unhealthy.
+    monkeypatch.setattr(
+        pipeline.rollback_mod,
+        "perform_rollback",
+        lambda *a, **k: {"rolled_back_to": "dep-v1",
+                         "target_health_status": "unknown",
+                         "restored_via": "started"},
+    )
+    settle_calls = []
+
+    def _spy_settle(*a, **k):
+        settle_calls.append((a, k))
+        return {"settled": True, "reason": None}
+
+    monkeypatch.setattr(pipeline.rollback_mod, "settle_rollback_ports",
+                        _spy_settle)
+
+    with pytest.raises(pipeline.DeployError, match="could not be verified"):
+        pipeline.deploy(ctx, _deploy_task())
+
+    # Port settlement must NOT run for a target whose health is unverified.
+    assert settle_calls == []
+
+    new_state = ctx.deployment_store.load("dep-v2")
+    assert new_state["status"] == "rollback_failed"
+    assert new_state["rollback_status"] == "failed"
+    assert "could not be verified" in new_state["rollback_error"]
+    assert new_state["rollback_of"] == "dep-v1"
+    # The skipped settle is recorded honestly on the row for
+    # reconciliation/retry.
+    assert new_state["port_settle"]["settled"] is False
+    assert (new_state["port_settle"]["reason"]
+            == "settle skipped: target health not verified")
