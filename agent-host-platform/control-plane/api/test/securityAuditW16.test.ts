@@ -138,8 +138,18 @@ function setupDb() {
       owner TEXT, repository TEXT, artifact_location TEXT,
       runtime TEXT NOT NULL DEFAULT 'docker',
       configuration JSONB NOT NULL DEFAULT '{}',
+      owner_agent_id TEXT,
       created_at TIMESTAMPTZ DEFAULT now(),
       updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE TABLE project_members (
+      project_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+      PRIMARY KEY (project_id, agent_id)
+    );
+    CREATE TABLE agent_host_access (
+      agent_id TEXT NOT NULL, host_id TEXT NOT NULL,
+      permissions JSONB NOT NULL DEFAULT '{}',
+      PRIMARY KEY (agent_id, host_id)
     );
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY DEFAULT gen_random_uuid(), type TEXT NOT NULL,
