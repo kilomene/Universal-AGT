@@ -115,7 +115,8 @@ function setupDb() {
     CREATE TABLE deployments (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
       host_id TEXT NOT NULL, version TEXT,
-      status TEXT NOT NULL DEFAULT 'requested'
+      status TEXT NOT NULL DEFAULT 'requested',
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE events (
       id SERIAL PRIMARY KEY, type TEXT NOT NULL,
@@ -567,7 +568,10 @@ describe('artifacts', () => {
     const token = await seedAgent(A1, 'uploader', { deploy: true });
     // The artifact row must exist so the handler reaches the streaming
     // phase (the upfront Content-Length check is skipped for chunked
-    // bodies — the per-chunk stream cap must fire instead).
+    // bodies — the per-chunk stream cap must fire instead). The project row
+    // must exist too: the upload handler is project-scoped (§10 ACL), and a
+    // dangling project_id 404s before streaming starts.
+    await state.pool.query(`INSERT INTO projects (id, name) VALUES ($1, 'p')`, [P1]);
     await state.pool.query(
       `INSERT INTO artifacts (id, project_id, filename, storage_path, checksum, size, version, status)
        VALUES ($1, $2, 'c.bin', $3, 'sha256:${'ef'.repeat(32)}', 4096, 'v1', 'pending')`,
