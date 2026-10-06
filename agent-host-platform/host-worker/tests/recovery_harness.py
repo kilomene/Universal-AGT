@@ -114,6 +114,7 @@ class RecoveryPlane:
         self.artifacts: dict = {}       # artifact_id -> bytes
         self.events: list = []
         self.claim_deliveries: dict = {}  # task_id -> times handed out by claim
+        self.settle_calls: list = []  # POST settle-rollback-ports calls
         # failure injection
         self.heartbeat_failures = 0     # next N heartbeats -> 503
         self.download_mode = "ok"       # ok | partial-once
@@ -327,6 +328,9 @@ class _PlaneHandler(BaseHTTPRequestHandler):
                 return self._progress(path.split("/")[4])
             if path == "/v1/test/artifacts":
                 return self._artifact_upload()
+            if path.startswith("/v1/deployments/") and path.endswith(
+                    "/settle-rollback-ports"):
+                return self._settle_rollback_ports(path.split("/")[3])
             self._send_json(404, {"error": {"code": "not_found", "message": path}})
         except _HttpError as exc:
             self._send_json(exc.code, {"error": {"code": exc.errcode,
@@ -519,6 +523,33 @@ class _PlaneHandler(BaseHTTPRequestHandler):
                 raise _HttpError(404, "not_found", "deployment not found")
             view = self._public_dep(dep)
         self._send_json(200, {"deployment": view})
+
+    def _settle_rollback_ports(self, dep_id):
+        """Mirror of the real control plane's POST
+        /v1/deployments/:id/settle-rollback-ports (control-plane/api/src/
+        routes/deployments.ts): releases the rolled-back deployment's
+        port reservations and re-reserves the rollback target's host
+        ports. The harness keeps no port registry, so it validates the
+        ids, records the call, and returns the success shape the worker
+        expects."""
+        host = self._host()
+        if host is None:
+            raise _HttpError(401, "unauthorized", "bad host token")
+        body = self._read_json()
+        target_id = (body or {}).get("target_deployment_id")
+        if not target_id:
+            raise _HttpError(400, "bad_request",
+                             "target_deployment_id is required")
+        with self.plane.lock:
+            if dep_id not in self.plane.deployments:
+                raise _HttpError(404, "not_found", "deployment not found")
+            if target_id not in self.plane.deployments:
+                raise _HttpError(404, "not_found",
+                                 "target deployment not found")
+            self.plane.settle_calls.append(
+                {"deployment_id": dep_id,
+                 "target_deployment_id": target_id})
+        self._send_json(200, {"released": 1, "restored": 1, "skipped": 0})
 
     def _public_dep(self, dep):
         return {k: v for k, v in dep.items()}
