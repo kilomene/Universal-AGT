@@ -60,3 +60,83 @@ describe('readSweeperConfig', () => {
     ).toEqual({ intervalS: 30, degradedAfterS: 90, offlineAfterS: 300 });
   });
 });
+
+describe('sweepOnce — state transition and audit event are atomic (W-C)', () => {
+  interface FakeClient {
+    statements: string[];
+    failInsert: boolean;
+    query(sql: string, params?: unknown[]): Promise<{ rows: any[] }>;
+    release(): void;
+  }
+  function fakePool(hosts: any[], failInsert = false) {
+    const client: FakeClient = {
+      statements: [],
+      failInsert,
+      async query(sql: string, params: unknown[] = []) {
+        const verb = sql.trim().split(/\s+/)[0].toUpperCase();
+        client.statements.push(verb === 'INSERT' ? 'INSERT events' : verb === 'UPDATE' ? 'UPDATE hosts' : verb);
+        if (verb === 'BEGIN' || verb === 'COMMIT' || verb === 'ROLLBACK') return { rows: [] };
+        if (verb === 'UPDATE') return { rows: [] };
+        if (verb === 'INSERT') {
+          if (client.failInsert) throw new Error('db down');
+          return {
+            rows: [
+              {
+                id: 7,
+                type: params[0],
+                actor_type: params[1],
+                actor_id: params[2],
+                payload: params[6],
+                created_at: new Date().toISOString(),
+              },
+            ],
+          };
+        }
+        throw new Error('unexpected client query: ' + sql);
+      },
+      release() {},
+    };
+    const pool = {
+      async query(sql: string) {
+        if (sql.includes('FROM hosts')) return { rows: hosts };
+        throw new Error('unexpected pool query: ' + sql);
+      },
+      async connect() {
+        return client;
+      },
+    };
+    return { pool: pool as any, client };
+  }
+
+  const staleHost = (overrides: any = {}) => ({
+    id: 'h1',
+    name: 'stale-box',
+    status: 'online',
+    last_seen: new Date(Date.now() - 400_000).toISOString(),
+    ...overrides,
+  });
+
+  it('commits UPDATE + event INSERT in one transaction, then publishes', async () => {
+    const { sweepOnce } = await import('../src/lib/hostSweeper');
+    const { pool, client } = fakePool([staleHost()]);
+    await sweepOnce(pool, { intervalS: 30, degradedAfterS: 90, offlineAfterS: 300 });
+    expect(client.statements).toEqual(['BEGIN', 'UPDATE hosts', 'INSERT events', 'COMMIT']);
+  });
+
+  it('rolls back the status flip when the event INSERT fails (no divergent history)', async () => {
+    const { sweepOnce } = await import('../src/lib/hostSweeper');
+    const { pool, client } = fakePool([staleHost()], true);
+    await expect(
+      sweepOnce(pool, { intervalS: 30, degradedAfterS: 90, offlineAfterS: 300 }),
+    ).rejects.toThrow('db down');
+    expect(client.statements).toEqual(['BEGIN', 'UPDATE hosts', 'INSERT events', 'ROLLBACK']);
+    expect(client.statements).not.toContain('COMMIT');
+  });
+
+  it('does not open a transaction for hosts with no transition', async () => {
+    const { sweepOnce } = await import('../src/lib/hostSweeper');
+    const { pool, client } = fakePool([staleHost({ last_seen: new Date().toISOString() })]);
+    await sweepOnce(pool, { intervalS: 30, degradedAfterS: 90, offlineAfterS: 300 });
+    expect(client.statements).toEqual([]);
+  });
+});
