@@ -165,9 +165,11 @@ Content-Type: `application/json` everywhere unless noted.
     active unit within `WORKER_UPDATE_HEALTH_TIMEOUT_S`, default 120s) and
     rolls back on failure; `agent-host-worker --self-check` runs startup
     self-checks without starting the loop.
-  - Database: migration `005_events_truncate_block.sql` adds an event
-    trigger aborting any `TRUNCATE` on the append-only `events` table
-    (row-level triggers can't block TRUNCATE; needs superuser to install).
+  - Database: migration `005_events_truncate_block.sql` revokes `TRUNCATE`
+    on the append-only `events` table from `PUBLIC` (row-level triggers
+    can't block TRUNCATE, and PostgreSQL event triggers don't support it
+    either — verified on PG 16; full protection needs separate table
+    ownership, see `docs/security.md`).
   - Accepted limitation (documented, not fixed): no replay protection on
     bearer tokens — static tokens + rotation + TLS are the mitigations;
     HMAC request signing is future work.
