@@ -126,7 +126,8 @@ describe('settleRollbackPorts against pg-mem', () => {
       CREATE TABLE deployments (
         id TEXT PRIMARY KEY,
         host_id TEXT,
-        ports JSONB
+        ports JSONB,
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
       );
       CREATE TABLE port_allocations (
         host_id TEXT NOT NULL,
