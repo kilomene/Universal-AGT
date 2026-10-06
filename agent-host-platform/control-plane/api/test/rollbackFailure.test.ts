@@ -34,13 +34,16 @@ function setupDb() {
       status TEXT NOT NULL DEFAULT 'online',
       token_hash TEXT NOT NULL,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE deployments (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, host_id TEXT,
       version TEXT, status TEXT NOT NULL DEFAULT 'requested',
       health_status TEXT, task_id TEXT, ports JSONB, domains JSONB,
-      created_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now(),
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE tasks (
       id TEXT PRIMARY KEY, type TEXT NOT NULL,
@@ -159,6 +162,31 @@ async function deploymentStatus(depId: string): Promise<string> {
   return rows[0].status;
 }
 
+async function rollbackFailedEventPayload(deploymentId: string): Promise<any> {
+  const { rows } = await state.pool.query(
+    `SELECT payload FROM events WHERE deployment_id = $1 AND type = 'deployment.rollback_failed' ORDER BY id DESC LIMIT 1`,
+    [deploymentId],
+  );
+  return rows[0]?.payload ?? null;
+}
+
+async function completeRollbackTask(
+  hostToken: string,
+  taskId: string,
+  result: Record<string, unknown>,
+) {
+  const running = await req('POST', `/v1/worker/tasks/${taskId}/progress`, hostToken, {
+    status: 'running',
+  });
+  expect(running.status).toBe(200);
+  const res = await req('POST', `/v1/worker/tasks/${taskId}/progress`, hostToken, {
+    status: 'completed',
+    result,
+  });
+  expect(res.status).toBe(200);
+  return res;
+}
+
 beforeAll(async () => {
   setupDb();
   const app = createApp();
@@ -231,5 +259,77 @@ describe('§6 rollback failure durability', () => {
 
   it('rollback_failed is non-routable for Cloudflare/tunnel failover', () => {
     expect([...NON_ROUTABLE_DEPLOYMENT_STATUSES]).toContain('rollback_failed');
+  });
+
+  it('Part 2C: unknown target health is recorded as rollback_failed with the exact event shape', async () => {
+    const { host, depId, taskId } = await seedRollbackScenario();
+    await completeRollbackTask(host.token, taskId, {
+      status: 'rolled_back', // the worker must never report success here;
+      target_health_status: 'unknown', // the backstop records the failure
+      rollback_status: 'failed',
+      rolled_back_to: 'dep-prev',
+    });
+
+    expect(await deploymentStatus(depId)).toBe('rollback_failed');
+    const types = await eventTypes(depId);
+    expect(types).toContain('deployment.rollback_failed');
+    expect(types).not.toContain('deployment.rolled_back');
+    expect(await rollbackFailedEventPayload(depId)).toEqual({
+      version: 'v2-bad',
+      target_health_status: 'unknown',
+      rollback_status: 'failed',
+      reason: 'target health could not be verified',
+    });
+  });
+
+  it('unhealthy target health records rollback_failed with the health verdict', async () => {
+    const { host, depId, taskId } = await seedRollbackScenario();
+    await completeRollbackTask(host.token, taskId, {
+      status: 'rollback_failed',
+      target_health_status: 'unhealthy',
+      rollback_status: 'failed',
+      rolled_back_to: 'dep-prev',
+    });
+
+    expect(await deploymentStatus(depId)).toBe('rollback_failed');
+    expect(await rollbackFailedEventPayload(depId)).toEqual({
+      version: 'v2-bad',
+      target_health_status: 'unhealthy',
+      rollback_status: 'failed',
+      reason: 'target health check failed',
+    });
+  });
+
+  it('proven-healthy target with a failed port settle records the partial failure honestly', async () => {
+    const { host, depId, taskId } = await seedRollbackScenario();
+    await completeRollbackTask(host.token, taskId, {
+      status: 'rollback_failed',
+      target_health_status: 'healthy',
+      rollback_status: 'partially_reconciled',
+      rolled_back_to: 'dep-prev',
+    });
+
+    expect(await deploymentStatus(depId)).toBe('rollback_failed');
+    expect(await rollbackFailedEventPayload(depId)).toEqual({
+      version: 'v2-bad',
+      target_health_status: 'healthy',
+      rollback_status: 'partially_reconciled',
+      reason: 'port-registry settle failed after healthy restore',
+    });
+  });
+
+  it('a proven-healthy rollback still records rolled_back (positive control with health fields)', async () => {
+    const { host, depId, taskId } = await seedRollbackScenario();
+    await completeRollbackTask(host.token, taskId, {
+      status: 'rolled_back',
+      target_health_status: 'healthy',
+      rollback_status: 'succeeded',
+      rolled_back_to: 'dep-prev',
+    });
+
+    expect(await deploymentStatus(depId)).toBe('rolled_back');
+    const types = await eventTypes(depId);
+    expect(types).toContain('deployment.rolled_back');
+    expect(types).not.toContain('deployment.rollback_failed');
   });
 });
