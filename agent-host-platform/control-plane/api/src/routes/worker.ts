@@ -21,6 +21,11 @@ import {
 import { requireHost } from '../middleware/auth';
 import { getDecryptedProjectSecrets } from './secrets';
 import { isUuid, publicHost } from './_helpers';
+import {
+  API_VERSION,
+  MIN_WORKER_VERSION,
+  isOutdatedWorkerVersion,
+} from '../lib/versions';
 
 export const workerRouter = Router();
 
@@ -41,6 +46,36 @@ function sleep(ms: number): Promise<void> {
 // payload keeps carrying the issue while the flag stands, but the
 // service.crash_loop event fires once per (host, deployment) per process.
 const crashLoopSeen = new Set<string>();
+
+// Same pattern for outdated workers (§61): the heartbeat keeps reporting
+// the old version, but host.worker_outdated fires once per host per process.
+const workerOutdatedSeen = new Set<string>();
+
+async function emitWorkerOutdated(
+  pool: Pool,
+  hostId: string,
+  hostName: string,
+  workerVersion: string,
+): Promise<void> {
+  if (workerOutdatedSeen.has(hostId)) return;
+  workerOutdatedSeen.add(hostId);
+  await appendEvent(pool, {
+    type: 'host.worker_outdated',
+    actor_type: 'host',
+    actor_id: hostName,
+    host_id: hostId,
+    payload: {
+      worker_version: workerVersion,
+      min_worker_version: MIN_WORKER_VERSION,
+      api_version: API_VERSION,
+    },
+  });
+  logger.warn('host worker is outdated', {
+    host: hostName,
+    worker_version: workerVersion,
+    min_worker_version: MIN_WORKER_VERSION,
+  });
+}
 
 async function emitWorkerIssues(
   pool: Pool,
@@ -94,15 +129,38 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
 
     const pool = getPool();
 
-    const current = await pool.query('SELECT status FROM hosts WHERE id = $1', [hostId]);
+    const current = await pool.query('SELECT status, worker_version FROM hosts WHERE id = $1', [hostId]);
     if (!current.rows[0]) {
       next(new HttpError(404, 'not_found', 'host not found'));
       return;
     }
     const prevStatus: string = current.rows[0].status;
+    const prevWorkerVersion: string | null =
+      typeof current.rows[0].worker_version === 'string' ? current.rows[0].worker_version : null;
     // A heartbeat revives offline/degraded hosts to online, but NEVER
     // overwrites an operator-set `draining` state.
     const revived = prevStatus === 'offline' || prevStatus === 'degraded';
+
+    // §61: the worker's reported version, for outdated-version detection
+    // below. Stored via the COALESCE update like every other heartbeat field.
+    const reportedWorkerVersion =
+      typeof body.worker_version === 'string' ? body.worker_version : null;
+
+    // WS-B heartbeat enrichment: persist the worker-reported identity
+    // fields the old UPDATE dropped — drain state, worker status,
+    // capabilities, ingress descriptor, and configured host name — so the
+    // scheduler and dashboard can use them. All are COALESCE-guarded: a
+    // heartbeat that omits a field never clears the stored value.
+    const reportedCapabilities = Array.isArray(body.capabilities) ? body.capabilities : null;
+    const reportedDraining = typeof body.draining === 'boolean' ? body.draining : null;
+    const reportedWorkerStatus =
+      typeof body.worker_status === 'string' && body.worker_status ? body.worker_status : null;
+    const reportedIngress =
+      body.ingress !== null && typeof body.ingress === 'object' && !Array.isArray(body.ingress)
+        ? body.ingress
+        : null;
+    const reportedHostName =
+      typeof body.host_name === 'string' && body.host_name.trim() ? body.host_name.trim() : null;
 
     await pool.query(
       `UPDATE hosts SET
@@ -116,6 +174,11 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
          total_cpu = COALESCE($8, total_cpu),
          total_ram_mb = COALESCE($9, total_ram_mb),
          total_disk_gb = COALESCE($10, total_disk_gb),
+         capabilities = COALESCE($11, capabilities),
+         worker_draining = COALESCE($12, worker_draining),
+         worker_status = COALESCE($13, worker_status),
+         ingress = COALESCE($14, ingress),
+         reported_host_name = COALESCE($15, reported_host_name),
          last_seen = now()
        WHERE id = $1`,
       [
@@ -125,12 +188,39 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
         numeric(body.disk_pct),
         typeof body.docker_status === 'string' ? body.docker_status : null,
         Array.isArray(body.running_apps) ? JSON.stringify(body.running_apps) : null,
-        typeof body.worker_version === 'string' ? body.worker_version : null,
+        reportedWorkerVersion,
         numeric(body.total_cpu),
         numeric(body.total_ram_mb),
         numeric(body.total_disk_gb),
+        reportedCapabilities ? JSON.stringify(reportedCapabilities) : null,
+        reportedDraining,
+        reportedWorkerStatus,
+        reportedIngress ? JSON.stringify(reportedIngress) : null,
+        reportedHostName,
       ],
     );
+
+    // §31 worker.updated: the worker self-updated (WS-B self-update flow
+    // restarts it after fetching a new release). Fires on an actual
+    // version *change*; the very first report (no previous version) is a
+    // registration, not an update.
+    if (reportedWorkerVersion && prevWorkerVersion && reportedWorkerVersion !== prevWorkerVersion) {
+      await appendEvent(pool, {
+        type: 'worker.updated',
+        actor_type: 'host',
+        actor_id: req.auth!.name,
+        host_id: hostId,
+        payload: {
+          previous_version: prevWorkerVersion,
+          worker_version: reportedWorkerVersion,
+        },
+      });
+      logger.info('host worker updated', {
+        host: req.auth!.name,
+        from: prevWorkerVersion,
+        to: reportedWorkerVersion,
+      });
+    }
 
     if (revived) {
       await appendEvent(pool, {
@@ -156,6 +246,7 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
     const hostRow = (
       await pool.query(
         `SELECT id, name, host_type, status, capabilities, worker_version,
+                worker_draining, worker_status, ingress, reported_host_name,
                 cpu_pct, ram_pct, disk_pct, docker_status, running_apps,
                 total_cpu, total_ram_mb, total_disk_gb, last_seen, metadata,
                 created_at, updated_at FROM hosts WHERE id = $1`,
@@ -163,7 +254,28 @@ workerRouter.post('/:id/heartbeat', requireHost, async (req, res, next) => {
       )
     ).rows[0];
 
-    res.json({ host: publicHost(hostRow), pending_tasks: pending.rows[0].n });
+    // §61: outdated-worker detection. The effective version is what the
+    // worker just reported, falling back to the stored row (a heartbeat
+    // that omits worker_version must not clear a previously seen one).
+    // The response carries the verdict every time so the worker itself can
+    // see it; the host.worker_outdated event fires once per host per
+    // process so operators get a single durable signal.
+    const effectiveWorkerVersion =
+      reportedWorkerVersion ??
+      (typeof hostRow.worker_version === 'string' ? hostRow.worker_version : null);
+    const workerOutdated =
+      effectiveWorkerVersion !== null && isOutdatedWorkerVersion(effectiveWorkerVersion);
+    if (workerOutdated && effectiveWorkerVersion !== null) {
+      await emitWorkerOutdated(pool, hostId, req.auth!.name, effectiveWorkerVersion);
+    }
+
+    res.json({
+      host: publicHost(hostRow),
+      pending_tasks: pending.rows[0].n,
+      api_version: API_VERSION,
+      min_worker_version: MIN_WORKER_VERSION,
+      worker_outdated: workerOutdated,
+    });
   } catch (err) {
     next(err);
   }
@@ -193,6 +305,14 @@ async function tryClaim(pool: Pool, hostId: string, leaseS: number) {
      WHERE id = (
        SELECT id FROM tasks
        WHERE status = 'queued' AND (assigned_to IS NULL OR assigned_to = $1)
+         -- §37 defense in depth: even if a draining host slips past the
+         -- handler-level gate (e.g. it started draining mid-wait), the
+         -- atomic claim itself refuses it. The worker pauses its own
+         -- claim loop on drain; this is the server-side backstop.
+         AND EXISTS (
+           SELECT 1 FROM hosts h
+           WHERE h.id = $1 AND h.status <> 'draining' AND NOT COALESCE(h.worker_draining, false)
+         )
        ORDER BY priority DESC, created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED
@@ -219,6 +339,17 @@ workerRouter.post('/tasks/claim', requireHost, async (req, res, next) => {
     wait = Math.min(Math.floor(wait), 30);
 
     const pool = getPool();
+    // §37: a draining host must not claim new work. Server-side gate —
+    // the worker pauses its own claim loop on drain (WS-B), but an
+    // old/buggy worker might not. Refuse immediately with a clear 409
+    // rather than long-polling a wait the host may never use.
+    const hostState = (
+      await pool.query('SELECT status, worker_draining FROM hosts WHERE id = $1', [hostId])
+    ).rows[0];
+    if (hostState && (hostState.status === 'draining' || hostState.worker_draining === true)) {
+      sendError(res, 409, 'conflict', 'host is draining; it cannot claim new tasks');
+      return;
+    }
     const leaseS = readTaskSweeperConfig().leaseS;
     const deadline = Date.now() + wait * 1000;
     let claimed: Record<string, unknown> | null = null;
@@ -259,6 +390,19 @@ workerRouter.post('/tasks/claim', requireHost, async (req, res, next) => {
 // ---------------------------------------------------------------------------
 const PROGRESS_STATUSES = ['claimed', 'running', 'awaiting_approval', 'completed', 'failed'] as const;
 
+// Task types that own a deployment's lifecycle status. A failed `logs`
+// probe or `ingress-sync` must never mark its deployment failed — only
+// these types mirror into deployments.status (§5).
+const DEPLOYMENT_OWNING_TASK_TYPES: ReadonlySet<string> = new Set([
+  'deploy',
+  'rollback',
+  'restart',
+  'stop',
+  'start',
+  'remove',
+  'environment-update',
+]);
+
 async function mirrorDeploymentState(
   pool: Pool,
   task: Record<string, any>,
@@ -266,130 +410,172 @@ async function mirrorDeploymentState(
   actorName: string,
   reportedResult?: Record<string, any> | null,
 ): Promise<void> {
+  // §5: read-only / auxiliary task types (logs, status, healthcheck,
+  // system-info, artifact-*, build, docker-*, ingress-sync) must not move
+  // deployments.status. Before this guard, a failed `logs` task flipped
+  // its deployment to `failed`.
+  if (!DEPLOYMENT_OWNING_TASK_TYPES.has(task.type)) return;
+
   const payload = (task.payload ?? {}) as Record<string, any>;
   const deploymentId = payload.deployment_id;
   if (typeof deploymentId !== 'string' || !isUuid(deploymentId)) return;
-
-  const { rows } = await pool.query('SELECT * FROM deployments WHERE id = $1', [deploymentId]);
-  const deployment = rows[0];
-  if (!deployment) return;
 
   const isRollbackTask = task.type === 'rollback' || (task.type === 'deploy' && payload.rollback === true);
   const serviceEvent =
     task.type === 'restart' ? 'service.restarted' : task.type === 'stop' ? 'service.stopped' : task.type === 'start' ? 'service.started' : null;
 
+  // The deployment row is locked (FOR UPDATE) for the read-decide-write
+  // below: two concurrent progress reports for different tasks of the
+  // same deployment serialize here instead of tearing each other's
+  // read-modify-write (§74). Pure-DB writes happen inside the
+  // transaction; Cloudflare-touching hooks run after commit (they are
+  // already failure-isolated) so no row lock is held across the network.
+  const client = await pool.connect();
   let depStatus: string | null = null;
-  let depEvent: string | null = null;
-  if (nextStatus === 'running') {
-    if (['requested', 'approved'].includes(deployment.status)) {
-      depStatus = task.type === 'deploy' && !isRollbackTask ? 'building' : deployment.status;
-      depEvent = task.type === 'deploy' && !isRollbackTask ? 'deployment.started' : null;
-    }
-  } else if (nextStatus === 'completed') {
-    if (isRollbackTask) {
-      depStatus = 'rolled_back';
-      depEvent = 'deployment.rolled_back';
-    } else if (task.type === 'deploy') {
-      depStatus = 'running';
-      depEvent = 'deployment.completed';
-    } else if (task.type === 'remove') {
-      depStatus = 'stopped';
-      depEvent = 'service.removed';
-    } else if (serviceEvent) {
-      depStatus = task.type === 'stop' ? 'stopped' : 'running';
-      depEvent = serviceEvent;
-    }
-  } else if (nextStatus === 'failed') {
-    if (task.type === 'rollback') {
-      // A failed rollback leaves the deployment where it was; the failure
-      // is recorded as an event, not a deployment status.
-      depEvent = 'deployment.rollback_failed';
-    } else {
-      depStatus = 'failed';
-      depEvent = task.type === 'deploy' && !isRollbackTask ? 'deployment.failed' : serviceEvent ? null : 'deployment.failed';
-    }
-  }
-
-  if (depStatus) {
-    await pool.query(
-      `UPDATE deployments SET status = $2, health_status = CASE WHEN $2 = 'running' THEN 'healthy' WHEN $2 = 'failed' THEN 'unhealthy' ELSE health_status END WHERE id = $1`,
-      [deploymentId, depStatus],
-    );
-  }
-  if (depEvent) {
-    await appendEvent(pool, {
-      type: depEvent,
-      actor_type: 'host',
-      actor_id: actorName,
-      task_id: task.id,
-      deployment_id: deploymentId,
-      host_id: task.claimed_by,
-      payload:
-        depEvent === 'deployment.rolled_back'
-          ? { version: deployment.version, rolled_back_to: payload.target_deployment_id ?? null }
-          : { version: deployment.version },
-    });
-  }
-
-  // The worker reports the real host->container port mapping in
-  // task.result.ports on a completed deploy — persist it on the deployment
-  // row (this is what the deployments.ports JSONB column is for).
-  if (
-    task.type === 'deploy' &&
-    !isRollbackTask &&
-    nextStatus === 'completed' &&
-    reportedResult &&
-    typeof reportedResult === 'object' &&
-    reportedResult.ports &&
-    typeof reportedResult.ports === 'object'
-  ) {
-    await pool.query('UPDATE deployments SET ports = $2 WHERE id = $1', [
+  let depEvent: { type: string; payload: Record<string, unknown> } | null = null;
+  let reportedPorts: Record<string, unknown> | null = null;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT * FROM deployments WHERE id = $1 FOR UPDATE', [
       deploymentId,
-      JSON.stringify(reportedResult.ports),
     ]);
-  }
+    const deployment = rows[0];
+    if (!deployment) {
+      await client.query('ROLLBACK');
+      return;
+    }
 
-  // Port registry lifecycle: release this deployment's reservations when it
-  // reaches a terminal state; when a deploy reaches `running`, older
-  // deployments of the same project+host are superseded — free their ports.
-  if (depStatus && TERMINAL_PORT_RELEASE_STATUSES.has(depStatus)) {
-    await releasePortAllocations(pool, deploymentId);
-  }
-  if (task.type === 'deploy' && !isRollbackTask && nextStatus === 'completed') {
-    await releaseSupersededPortAllocations(pool, deployment.project_id, deployment.host_id, deploymentId);
-  }
-
-  // Domain lifecycle: a domain must never silently point at a dead
-  // deployment. Terminal transitions fail attached domains (with an event
-  // each, and the dead routes are dropped from the remote tunnel table);
-  // a deployment coming back to `running` re-provisions its failed domains.
-  // These hooks must never take down progress reporting: domain
-  // bookkeeping failures are logged, not raised.
-  if (depStatus && ['failed', 'stopped', 'rolled_back'].includes(depStatus)) {
-    try {
-      const failed = await failDomainsForDeployment(pool, deploymentId, `deployment ${depStatus}`);
-      if (failed > 0) {
-        logger.info('domains failed with deployment', { deployment: deploymentId, depStatus, failed });
+    if (nextStatus === 'running') {
+      if (['requested', 'approved'].includes(deployment.status)) {
+        depStatus = task.type === 'deploy' && !isRollbackTask ? 'building' : deployment.status;
+        depEvent =
+          task.type === 'deploy' && !isRollbackTask
+            ? { type: 'deployment.started', payload: { version: deployment.version } }
+            : null;
       }
-    } catch (err) {
-      logger.warn('failDomainsForDeployment hook failed', {
-        deployment: deploymentId,
-        err: err instanceof Error ? err.message : String(err),
+    } else if (nextStatus === 'completed') {
+      if (isRollbackTask) {
+        depStatus = 'rolled_back';
+        depEvent = {
+          type: 'deployment.rolled_back',
+          payload: {
+            version: deployment.version,
+            rolled_back_to: payload.target_deployment_id ?? null,
+          },
+        };
+      } else if (task.type === 'deploy') {
+        depStatus = 'running';
+        depEvent = { type: 'deployment.completed', payload: { version: deployment.version } };
+      } else if (task.type === 'remove') {
+        depStatus = 'stopped';
+        depEvent = { type: 'service.removed', payload: { version: deployment.version } };
+      } else if (serviceEvent) {
+        depStatus = task.type === 'stop' ? 'stopped' : 'running';
+        depEvent = { type: serviceEvent, payload: { version: deployment.version } };
+      }
+      // environment-update completed: the deployment was already running
+      // and still is — no status change, no event (unchanged behavior).
+    } else if (nextStatus === 'failed') {
+      if (task.type === 'rollback') {
+        // A failed rollback leaves the deployment where it was; the failure
+        // is recorded as an event, not a deployment status.
+        depEvent = { type: 'deployment.rollback_failed', payload: { version: deployment.version } };
+      } else {
+        depStatus = 'failed';
+        // §5: a deployment moving to `failed` always gets its event. (A
+        // failed restart/stop used to flip the status silently.)
+        depEvent = { type: 'deployment.failed', payload: { version: deployment.version } };
+      }
+    }
+
+    // Only write when the status actually changes: a duplicate or stale
+    // report for an already-resolved deployment is a no-op instead of a
+    // duplicate event + duplicate hook run.
+    const changed = depStatus !== null && depStatus !== deployment.status;
+    if (changed) {
+      await client.query(
+        `UPDATE deployments SET status = $2, health_status = CASE WHEN $2 = 'running' THEN 'healthy' WHEN $2 = 'failed' THEN 'unhealthy' ELSE health_status END WHERE id = $1`,
+        [deploymentId, depStatus],
+      );
+    }
+
+    // The worker reports the real host->container port mapping in
+    // task.result.ports on a completed deploy — persist it on the deployment
+    // row (this is what the deployments.ports JSONB column is for).
+    if (
+      changed &&
+      task.type === 'deploy' &&
+      !isRollbackTask &&
+      nextStatus === 'completed' &&
+      reportedResult &&
+      typeof reportedResult === 'object' &&
+      reportedResult.ports &&
+      typeof reportedResult.ports === 'object'
+    ) {
+      reportedPorts = reportedResult.ports as Record<string, unknown>;
+      await client.query('UPDATE deployments SET ports = $2 WHERE id = $1', [
+        deploymentId,
+        JSON.stringify(reportedPorts),
+      ]);
+    }
+
+    // Port registry lifecycle, inside the same transaction as the status
+    // write so the registry can never disagree with the deployment row.
+    if (changed && depStatus && TERMINAL_PORT_RELEASE_STATUSES.has(depStatus)) {
+      await releasePortAllocations(client, deploymentId);
+    }
+    if (changed && task.type === 'deploy' && !isRollbackTask && nextStatus === 'completed') {
+      await releaseSupersededPortAllocations(client, deployment.project_id, deployment.host_id, deploymentId);
+    }
+    await client.query('COMMIT');
+
+    if (depEvent && (changed || depStatus === null)) {
+      await appendEvent(pool, {
+        type: depEvent.type,
+        actor_type: 'host',
+        actor_id: actorName,
+        task_id: task.id,
+        deployment_id: deploymentId,
+        host_id: task.claimed_by,
+        payload: depEvent.payload,
       });
     }
-  }
-  if (depStatus === 'running' && (task.type === 'deploy' || task.type === 'start')) {
-    try {
-      const healed = await reprovisionDomainsForDeployment(pool, deploymentId);
-      if (healed > 0) {
-        logger.info('domains reprovisioned with deployment', { deployment: deploymentId, healed });
+
+    // Domain lifecycle hooks run after commit (§50: a single PG transaction
+    // cannot cover the Cloudflare calls inside these hooks, and they must
+    // never take down progress reporting — failures are logged, not
+    // raised). They only run when the deployment status actually changed.
+    if (changed && depStatus && ['failed', 'stopped', 'rolled_back'].includes(depStatus)) {
+      try {
+        const failed = await failDomainsForDeployment(pool, deploymentId, `deployment ${depStatus}`);
+        if (failed > 0) {
+          logger.info('domains failed with deployment', { deployment: deploymentId, depStatus, failed });
+        }
+      } catch (err) {
+        logger.warn('failDomainsForDeployment hook failed', {
+          deployment: deploymentId,
+          err: err instanceof Error ? err.message : String(err),
+        });
       }
-    } catch (err) {
-      logger.warn('reprovisionDomainsForDeployment hook failed', {
-        deployment: deploymentId,
-        err: err instanceof Error ? err.message : String(err),
-      });
     }
+    if (changed && depStatus === 'running' && (task.type === 'deploy' || task.type === 'start')) {
+      try {
+        const healed = await reprovisionDomainsForDeployment(pool, deploymentId);
+        if (healed > 0) {
+          logger.info('domains reprovisioned with deployment', { deployment: deploymentId, healed });
+        }
+      } catch (err) {
+        logger.warn('reprovisionDomainsForDeployment hook failed', {
+          deployment: deploymentId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
@@ -458,6 +644,12 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
 
     const terminal = isTerminalTaskStatus(finalStatus);
     const leaseS = readTaskSweeperConfig().leaseS;
+    // Compare-and-swap (§5/§74): the task may have moved between the read
+    // above and this UPDATE (sweeper requeue, concurrent progress report,
+    // cancel). Without the status guard, a late/duplicate report could
+    // resurrect a terminal task (e.g. completed -> running) or clobber a
+    // requeue. Zero rows updated => the state moved on; the worker must
+    // re-read the task instead of assuming its report landed.
     const updated = (
       await pool.query(
         `UPDATE tasks SET
@@ -468,7 +660,7 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
            completed_at = CASE WHEN $5 THEN now() ELSE completed_at END,
            last_progress_at = now(),
            lease_expires_at = CASE WHEN $5 THEN NULL ELSE now() + ($6 || ' seconds')::interval END
-         WHERE id = $1 RETURNING *`,
+         WHERE id = $1 AND status = $7 RETURNING *`,
         [
           taskId,
           finalStatus,
@@ -476,9 +668,19 @@ workerRouter.post('/tasks/:id/progress', requireHost, async (req, res, next) => 
           error !== undefined ? error : null,
           terminal,
           leaseS,
+          task.status,
         ],
       )
     ).rows[0];
+    if (!updated) {
+      sendError(
+        res,
+        409,
+        'conflict',
+        `task changed state concurrently (was ${task.status}); re-read the task before reporting again`,
+      );
+      return;
+    }
 
     const eventFor: Record<string, string> = {
       running: 'task.started',
