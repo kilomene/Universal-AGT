@@ -1,10 +1,19 @@
 # Universal-AGT — Implementation Status
 
-**Audit date:** 2026-10-05
-**Method:** full read of actual implementation (not READMEs) across control-plane API + database, host worker, agent SDKs, CLI, dashboard, protocol, docs, examples, scripts. Three independent code auditors + baseline test run.
-**Baseline test results (all green):** control-plane API 77/77 (vitest) · host worker 116/116 (pytest) · JS SDK 16/16 (node:test) · Python SDK 18/18 (pytest) · CLI smoke 12/12.
+**Audit date:** 2026-10-05 (W18 final audit — see bottom)
+**Method:** full read of actual implementation (not READMEs) across control-plane API + database, host worker, agent SDKs, CLI, dashboard, protocol, docs, examples, scripts. Three independent code auditors + baseline test run + W18 flow tracing through real execution paths.
+**Final local test results (all green, run 2026-10-05/06 by the W18 auditor):**
+control-plane API 311/311 (vitest; 1 flaky failure in 1 of 3 full runs —
+`secretsRoutes` GET-keys assertion, green on re-run and 3/3 isolated) ·
+host worker 478/478 (pytest, incl. 6 E2E + 12 new final-acceptance steps) ·
+JS SDK 39/39 (node:test) · Python SDK 38/38 (pytest) · CLI smoke 20/20.
+Dashboard: `index.html` parses, `app.js` passes `node --check` (no
+functional browser test exists).
 
-> Caveat: the API and worker suites test pure functions and logic with fakes. **Zero HTTP route tests exist** — no test boots the Express app. Every finding marked "broken" or "security hole" below sits in untested code.
+> Caveat: the API and worker suites test pure functions, logic with fakes,
+> and real HTTP routes against pg-mem (21 flow tests) plus a fake control
+> plane over real HTTP (worker E2E). No test uses a real Docker daemon, real
+> Postgres, real Cloudflare, or real systemd — those need live infra.
 
 **State legend:** ✅ implemented & working · ⚠️ partial / degraded · ❌ broken or missing · 🔒 security finding · 🧪 untested in code path.
 
@@ -168,8 +177,8 @@ original audit.
 | 3 | Persistent host can authenticate | ✅ |
 | 4 | Host requires no publicly exposed IP | ✅ by design (outbound-only) |
 | 5 | Host connects outbound | ✅ |
-| 6 | Host survives reboot | ✅ (restart policy + post-reboot reconcile in `deployments/reconcile.py`; corrupt `state.json` quarantined; live proof — checklist #10) |
-| 7 | Worker survives crash | ✅ systemd `Restart=always`; reconnect backoff 5s→300s jittered (live proof — checklist #11) |
+| 6 | Host survives reboot | ⚠️ (systemd `Restart=always` + `reconcile()` at boot (main.py:350) + 10 reconcile unit tests; real systemd restart never exercised locally — live proof is checklist #10) |
+| 7 | Worker survives crash | ⚠️ (systemd `Restart=always`, backoff 5s→300s+jitter unit-tested, SIGTERM drain; real crash-through-systemd never exercised locally — live proof is checklist #11) |
 | 8 | Tasks persist | ✅ (DB-backed) |
 | 9 | Tasks are idempotent | ✅ (task `type`+`payload` + deployment 6-field compare; Phase 3 fixed replay) |
 | 10 | Tasks are atomically claimed | ✅ (`FOR UPDATE SKIP LOCKED`) |
@@ -181,7 +190,7 @@ original audit.
 | 16 | Multiple applications work | ✅ (port registry DB+OS+Docker, per-deployment names/dirs/logs; E2E-proven 3-app; live — checklist #9) |
 | 17 | Health checks work | ⚠️ (HTTP-only, exact-200) |
 | 18 | Failed deployment handled | ✅ (broken build fails clean, logs retained, previous version keeps serving) |
-| 19 | Rollback works | ✅ (worker auto-rollback + API endpoint fixed Phase 3, route-tested; never auto-retries) |
+| 19 | Rollback works | ✅ (worker auto-rollback on health-fail ✅ + API endpoint ✅, both route/E2E-tested; the W18 GC-window gap is FIXED — verify-before-teardown + rebuild-from-contract fallback, `tests/test_rollback_gc_window.py` 2/2; `selectRollbackTarget` can still *name* a GC'd target, but the worker now fails cleanly without tearing down the healthy deployment) |
 | 20 | Logs work | ✅ (per-task/deployment, rotation, secret scrubbing) |
 | 21 | Events work | ✅ (append-only + trigger-blocked TRUNCATE + SSE; migration 005 needs superuser) |
 | 22 | Secrets protected | ✅ (AES-256-GCM at rest, names-only reads, host-scoped delivery, env injection, never in state/logs) |
@@ -190,26 +199,35 @@ original audit.
 | 25 | Host disappearance detected | ✅ (stale-host sweeper: `degraded`/`offline`, `host.degraded`/`host.offline`; never flips operator `draining`) |
 | 26 | Host reconnects | ✅ (exponential backoff + jitter; heartbeats revive `offline`/`degraded`) |
 | 27 | Worker updates safely | ✅ (SHA-256 verified tarball + post-restart health gate with rollback; code-signing with an offline key is an explicit, documented trust-model limitation, not a gap) |
-| 28 | Dashboard works | ✅ (hosts/apps/deployments/tasks panels, Approvals dossier + confirmations, service actions, SSE live) |
+| 28 | Dashboard works | ⚠️ (hosts/apps/deployments/tasks panels, Approvals dossier + confirmations, service actions, SSE live — all present in code; `index.html` parses and `app.js` passes `node --check`; **no functional browser test has ever exercised the UI**, and the "dashboard static check" cited in Phase 9 has no runnable artifact) |
 | 29 | CLI works | ✅ (`agent-host`: 20 commands incl. approve/reject/secrets/domains; `--json` global) |
 | 30 | SDK works | ✅ (JS + Python parity: `rotateKey`, `getLogs`/`tailLogs`, `addDomain(..., ingress)`, `streamEvents` since-fix) |
 | 31 | Muse integration works | ✅ (`docs/agent-integration.md` exists; distinct permission sets, no special-casing) |
 | 32 | Instinct integration works | ✅ (same — protocol is agent-neutral) |
 | 33 | Cloudflare works where configured | ⚠️ (idempotent CNAME ensure/delete, mocked; needs live CF test — checklist #12) |
-| 34 | Public ingress works | ✅ (Phase 7: worker-managed `cloudflared` tunnel, outbound-only; live — checklist #12) |
+| 34 | Public ingress works | ⚠️ (Phase 7: worker-managed `cloudflared` tunnel code + 28 ingress unit tests exist; **no test has ever run cloudflared against real Cloudflare** — live proof is checklist #12; dashboard-tunnel hostname caveat documented) |
 | 35 | Domain routing works | ✅ (`ingress: tunnel`/`direct`, CNAME targets, `ingress-sync` tasks; dashboard-tunnel hostname note documented) |
-| 36 | Security tests pass | ✅ (Phase 6 findings resolved; worker 250, API 187, JS 28, Python 27, CLI smoke 20/20 — all green) |
-| 37 | End-to-end tests pass | ✅ (6/6 worker E2E + 21/21 API flow tests green locally; live-infra variants in `docs/e2e-live-checklist.md`) |
-| 38 | Documentation accurate | ✅ (Phase 10: every doc re-verified against code; drift fixed; `deployment.md` + `troubleshooting.md` added) |
+| 36 | Security tests pass | ✅ (Phase 6 findings resolved; worker 478, API 311, JS 39, Python 38, CLI smoke 20/20 — all green; note: 1 flaky API failure in 1 of 3 full runs, `secretsRoutes` GET-keys, green on re-run — worth watching) |
+| 37 | End-to-end tests pass | ✅ (6/6 worker E2E + 21/21 API flow tests + NEW 12/12 final-acceptance chain steps green locally; live-infra variants in `docs/e2e-live-checklist.md`) |
+| 38 | Documentation accurate | ✅ (W18: this document re-verified; stale test counts corrected; new rollback GC-window gap recorded; `deployment.md` + `troubleshooting.md` added in Phase 10) |
 
-**Score: 34 ✅ · 4 ⚠️ · 0 ❌** (of 38)
+**Score: 29 ✅ · 9 ⚠️ · 0 ❌** (of 38)
 
-The 4 ⚠️ are all *known, documented* boundaries, not defects:
-**15** real-Docker proof needs a live host · **17** health checks are
-HTTP-only by design · **23** no aggregate capacity accounting (and
-`environment-update` drops memory/cpus on recreate — see troubleshooting)
-· **33** Cloudflare paths are mocked in tests, live check #12 covers them.
-Every ❌ from the original audit is resolved.
+**Note on "40 criteria":** spec §75 names 40 completion criteria, but the
+spec text is not in this repo — the acceptance list maintained here
+documents 38. The W18 auditor scored all 38; the other 2 could not be
+identified from any repo source. Treat the score as 29/38 fully-met,
+9/38 needs-live-infra-or-known-gap, 0 not-met.
+
+The 9 ⚠️ are *known, documented* boundaries or gaps, not hidden defects:
+**6/7** systemd restart behavior needs a live host (unit/service/reconcile
+logic all tested locally) · **15** real-Docker proof needs a live host ·
+**17** health checks are HTTP-only by design · **19** NEW: rollback fails
+for targets beyond the keep=2 GC window (see above) · **23** no aggregate
+capacity accounting (and `environment-update` drops memory/cpus on
+recreate — see troubleshooting) · **28** dashboard UI never functionally
+tested · **33/34** Cloudflare paths are mocked in tests, live check #12
+covers them.
 
 ---
 
@@ -245,8 +263,9 @@ Every ❌ from the original audit is resolved.
   full env-var table, systemd/Docker, HTTPS reverse-proxy sketch, worker
   install, muse+instinct registration, first deploy, tunnel setup,
   production checklist) and `docs/troubleshooting.md` (symptom→cause→fix
-  for the real failure modes). Acceptance score recomputed: **34 ✅ ·
-  4 ⚠️ · 0 ❌** (was 18·14·6).
+  for the real failure modes). Acceptance score at Phase 10: **34 ✅ ·
+  4 ⚠️ · 0 ❌** (was 18·14·6) — re-audited in W18 below (29·9·0 after
+  stricter evidence rules).
 
 ## What still needs live infrastructure
 
@@ -258,3 +277,175 @@ no code changes were made or needed in Phase 10 (docs-only by rule).
 ## What was NOT rebuilt
 
 The architecture from the original build is preserved: Supabase/PostgreSQL schema, Express API, Python worker, both SDKs, CLI, static dashboard, protocol. This document records gaps to fix in place — no competing design introduced.
+
+---
+
+## W18 final audit (2026-10-05/06) — flow traces, 30-step acceptance, final scores
+
+Scope: read-only. No production behavior changed. One test file added
+(`host-worker/tests/test_final_acceptance.py`), this document updated.
+
+### A. The 7 flow traces (real code, file:line)
+
+**a. agent → deployment → task → worker → Docker**
+`agent-sdk/javascript/src/client.js:494` `deploy()` → `:346`
+`createDeployment()` → `_post("/deployments")` →
+`control-plane/api/src/routes/deployments.ts:85` `POST /v1/deployments`
+(validates; injects `project_name` + verified `artifact_checksum`/`artifact_size`
+from the artifact row — the Phase 9 fix; 422 without them) → INSERTs
+`deployments` row + `type=deploy` task (queued / awaiting_approval) in one
+transaction → worker long-polls `POST /v1/worker/tasks/claim` →
+`routes/worker.ts:183` `tryClaim` (`UPDATE … FOR UPDATE SKIP LOCKED`,
+lease stamped) → `host-worker/executor/dispatcher.py:92` `dispatch()` goes
+straight to `running` (Phase 9 fix — the claim already moved queued→claimed)
+→ `executor/handlers.py:114` `handle_deploy` → `deployments/pipeline.py:470`
+`deploy()` → `docker/client.py` `DockerClient` argv-only `docker run`.
+No gap in the chain; the documented wart is the dispatcher's log-chunk
+streamer 409ing its `running→running` self-reports (swallowed by design,
+best-effort).
+
+**b. agent → artifact → worker → checksum**
+SDK `initArtifact`/`upload_artifact` → `routes/artifacts.ts` two-phase
+init + PUT octet-stream (413 wire cap `ARTIFACT_MAX_BYTES`) → SHA-256
+verified server-side after write → worker `pipeline.py:426`
+`_fetch_verified_artifact` requires `sha256:<hex>` in the task payload and
+verifies with `hmac.compare_digest` (pipeline.py:91-101) **before any
+docker call**; mismatch → bytes quarantined to `<work_dir>/quarantine/`,
+task fails, zero docker calls. Gap: quarantine is unbounded.
+
+**c. agent → secret → encryption → worker → container**
+`POST /v1/projects/:id/secrets` → `lib/secrets.ts` AES-256-GCM encrypt →
+names-only reads everywhere else → worker pulls at deploy time via
+`GET /v1/worker/projects/:id/secrets` (`routes/worker.ts:557`, host token +
+`hostMayReadProjectSecrets` scoping: 403 without live work for the project)
+→ `agent/api.py:252` `get_project_secrets` → pipeline.py:566 injects as
+container env, extends the SecretScrubber, and never persists to
+`state.json` (asserted in E2E). Gap: none in the delivery path; secrets are
+*deliberately not* re-injected by post-reboot reconcile (reconcile.py
+docstring) — a rebooted container runs without secret env until the next
+redeploy.
+
+**d. agent → domain → Cloudflare → application**
+SDK `addDomain` → `POST /v1/domains` (`routes/domains.ts`, hostname regex +
+409 on duplicate hostname, `ingress: tunnel|direct`) → `lib/cloudflare.ts`
+`ensureCnameRecord` (idempotent, proxied, TTL 300; graceful `dns_pending`
+when unconfigured) → tunnel mode: `setRemoteTunnelIngress` writes the
+remote tunnel ingress rule `hostname → http://127.0.0.1:<host port>` →
+tunnel-mode changes queue a `type=ingress-sync` task →
+`executor/handlers.py:627` `handle_ingress_sync` → `ingress/sync.py:32`
+`sync_ingress` pulls `GET /v1/worker/domains` and applies loopback-only
+routes through the `IngressProvider` (`ingress/cloudflared.py:184`
+`CloudflaredTunnelProvider`: supervised outbound-only `cloudflared tunnel
+run`, pinned binary with SHA-256 verification). Gap: for dashboard-created
+tunnels the worker's `config.yml` is only a mirror — the operator must add
+each public hostname in the Cloudflare dashboard (documented).
+
+**e. worker crash → lease → retry**
+Claim stamps `lease_expires_at = now() + TASK_CLAIM_LEASE_S` (worker.ts:183);
+every progress report refreshes it (worker.ts:470), terminal reports clear
+it. `lib/taskSweeper.ts` (every 60s): expired lease → attempts+1 →
+`decideRetryOutcome` (lib/retryPolicy.ts: safe/conditional/never per task
+type) → requeue or terminal fail; `retrying` → `queued`. Failed reports
+also classify inline on the progress route (worker.ts:440). Pure core
+unit-tested; recovery route tests cover lease expiry on pg-mem. No gap.
+
+**f. host reboot → systemd → reconciliation**
+`agent/agent-host-worker.service`: `Restart=always`, `RestartSec=5`,
+`StartLimitBurst=5`, hardened (`NoNewPrivileges`, `ProtectSystem=strict`,
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `MemoryMax=1G`) →
+`agent/main.py:350` `reconcile()` runs BEFORE the heartbeat thread and
+claim loop → `deployments/reconcile.py:39`: desired (state.json) vs actual
+(`docker ps -a`); stopped→`docker.start`; missing→rebuild from the stored
+contract (`run_spec_from_state`); compose stacks matched by project name.
+Corrupt state.json is quarantined, not fatal. Gap: secrets deliberately
+not re-injected (see c); real systemd behavior untestable in this sandbox.
+
+**g. deployment failure → rollback**
+Two paths. (1) Worker-side auto-rollback: `pipeline.py:924`
+`rollback_to_previous` — new container stopped+removed, previous `docker
+start`ed, state updated; the *task still reports failed* ("healthcheck
+failed"). (2) Agent-driven: `POST /v1/deployments/:id/rollback`
+(deployments.ts:349) → `selectRollbackTarget` (lib/rollback.ts) picks newest
+`running`+`healthy` → `type=rollback` task → `handlers.py:211`
+`handle_rollback` → `_verify_target_restorable` (fail-fast BEFORE
+teardown) → `_teardown_current` + `_restore_deployment` (handlers.py) →
+best-effort `POST /v1/deployments/:id/settle-rollback-ports`.
+**FIXED (post-W18):** the W18 acceptance test found that rollback to a
+generation older than the `DEPLOY_KEEP_GENERATIONS=2` GC window tore down
+the healthy current deployment first and then failed ("no such container"),
+leaving the project down. The handler now verifies the target is restorable
+before touching the current deployment, and rebuilds a GC'd container from
+the persisted deployment contract when its image survives
+(`tests/test_rollback_gc_window.py`, 2 tests; `test_final_acceptance.py`
+step 9b now asserts the clean failure + uninterrupted service). If neither
+container nor image survives, rollback fails with "cannot be restored" while
+the current deployment keeps serving. Rollback within the window
+(test_step09a) works end-to-end.
+
+### B. §70 30-step acceptance (local reconstruction — the spec text is not in this repo)
+
+Reconstructed from the spec's scenario description (agent → API → DB →
+task → worker → artifact → Docker → healthcheck → domain → HTTPS, plus
+agent disappearance, worker/host restart, env/secret change, redeploy,
+rollback). Each step: what proved it.
+
+| # | Step | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Agent registers behind provisioning token | PASS | `security.test.ts` / `securityAuditW16.test.ts`: 401 without `X-Provisioning-Token`, 201 with; bootstrap-only first registration |
+| 2 | Agent authenticates (API key, kind isolation) | PASS | `tokens.test.ts` 9 + security tests: constant-time verify, agent/host isolation, suspended→403 |
+| 3 | Host registers, gets `uagh_` token | PASS | Worker E2E `WorkerRig` registers via the real `ControlPlaneClient.register_host` |
+| 4 | Host heartbeat → online + last_seen | PASS | `Rig.cycle` heartbeats; API route tests; sweeper tests |
+| 5 | Agent creates project | PASS | acceptance step 1 (`test_step01`) |
+| 6 | Agent stores secret (AES-256-GCM, names-only) | PASS | `secretsRoutes.test.ts` 11/11; acceptance step 1 |
+| 7 | Artifact init + PUT + SHA-256 verify | PASS | acceptance step 2; artifact route security tests (413 cap) |
+| 8 | Deployment → queued task w/ checksum+project_name | PASS | acceptance step 3; `e2eFlows.test.ts` 21/21 |
+| 9 | Worker claims atomically | PASS | `FOR UPDATE SKIP LOCKED` reviewed in `worker.ts:183` (pg-mem cannot plan it); exactly-once claim behavior proven functionally in worker E2E |
+| 10 | Worker verifies checksum pre-docker | PASS | pipeline unit tests (zero-docker-calls on mismatch); acceptance step 4 |
+| 11 | Secrets pulled scoped, injected as env, never in state | PASS | acceptance step 4 (`env_of` + not-in-state.json asserts) |
+| 12 | Container built + run | PASS | acceptance step 4 (SubprocessDockerClient runs the real `server.py`) |
+| 13 | Health check exact-200 | PASS | acceptance step 4 (`GET /health` → 200 on real HTTP) |
+| 14 | Deployment running, ports registered, events ordered | PASS | acceptance step 4 (exact event sequence asserted) |
+| 15 | Agent polls → completed; full correlation chain | PASS | acceptance step 4 (`assert_correlation`: task↔deployment↔project↔artifact↔host) |
+| 16 | Domain add + hostname uniqueness | PASS | `domains.test.ts` (409 on duplicate); hostname regex in `routes/domains.ts` |
+| 17 | CNAME ensure idempotent (mocked CF) | PASS | `cloudflare.test.ts` + `cloudflareTunnel.test.ts` (fake fetch) |
+| 18 | ingress-sync → worker route sync | PASS | `test_ingress.py` 28 tests; `handle_ingress_sync` wired in policy allowlist |
+| 19 | Public HTTPS through the domain | **BLOCKED** | needs **real Cloudflare credentials + real domain** (checklist #12) |
+| 20 | Agent disappears mid-deploy → completes; reconnect reads state | PASS | acceptance step 5 (disconnect/reconnect around a live deploy) |
+| 21 | Worker crash → lease expiry → sweeper requeue + retry classes | PASS | `recoveryLeases.test.ts`, `taskSweeper.test.ts` 14, `retryPolicy.test.ts` 9 (real routes on pg-mem) |
+| 22 | Host reboot → systemd restart + reconcile | **BLOCKED** (partial) | `reconcile()` logic: 10 unit tests; systemd unit file hardened — but **real systemd + real Docker** needed (checklist #10) |
+| 23 | Secret/env change → redeploy picks up new value | PASS | acceptance step 6 (rotated `API_TOKEN` in container env) |
+| 24 | Redeploy success → previous superseded, GC keeps 2 | PASS | acceptance steps 5–6 (v1/v2 superseded by later deploys; GC removal of old generations demonstrated deterministically in step 9b) |
+| 25 | Broken build → task failed, logs kept, previous serves | PASS | acceptance step 7 |
+| 26 | Health-fail → auto-rollback to previous | PASS | acceptance step 8 (task *failed* per product semantics; v3 restarted) |
+| 27 | Agent-driven rollback (type=rollback task) | PASS | acceptance step 9a (w2→w1, restored on original port) |
+| 28 | Manual approval gate: approve→deploy, reject→never starts | PASS | acceptance step 10 (zero docker calls on reject) |
+| 29 | Multi-app isolation | PASS | `test_multi_app` (3 apps, distinct ports/names/logs; stop one leaves others) |
+| 30 | Task idempotency (duplicate deploy → replay/409) | PASS | `idempotency.test.ts` (task + deployment 6-field compare; 23505 race handling) |
+
+**Result: 28 PASS · 2 BLOCKED-ON-LIVE-INFRA (steps 19, 22).**
+
+### C. Final scores
+
+29 ✅ fully-met · 9 ⚠️ needs-live-infra-or-known-gap · 0 ❌ not-met (of the
+38 documented criteria; spec §75 names 40 but the spec text is not in this
+repo — see note under the criteria table).
+
+### D. What still needs live infrastructure (precise list)
+
+1. **Live Supabase project** (or any real PostgreSQL): migrations 001–005
+   incl. the superuser-only `005_events_truncate_block` trigger; real
+   `FOR UPDATE SKIP LOCKED` contention; sweeper timing against wall clock.
+2. **Real Linux host with Docker daemon**: real image builds, container
+   isolation, `--memory`/`--cpus` enforcement, real `docker ps` for
+   reconcile, systemd unit behavior across reboot (criteria 6/7, step 22).
+3. **Real Cloudflare credentials + real domain**: DNS propagation, CNAME
+   ensure/delete against the real API, `cloudflared` tunnel run, end-to-end
+   HTTPS through the domain (criteria 33/34, step 19) — `docs/e2e-live-checklist.md`
+   checks #10–#12 cover exactly these.
+4. **Human steps that stay human**: Cloudflare tunnel token provisioning,
+   dashboard-tunnel public-hostname entries, the Facebook/Instagram
+   constraints are out of scope for this system.
+
+No code changes were made in this audit (read-only rule); the one new
+artifact is `host-worker/tests/test_final_acceptance.py` (12 steps green,
+2 skips naming their live-infra blockers).
