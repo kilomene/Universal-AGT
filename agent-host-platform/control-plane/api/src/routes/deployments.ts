@@ -20,7 +20,7 @@ import {
   inList,
   listAccessibleProjectIds,
 } from '../lib/authz';
-import { checkHostCapacity, deploymentConstraintsForProject, isHostSchedulable, selectHostForDeployment } from '../lib/scheduler';
+import { checkHostCapacity, deploymentConstraintsForManifest, deploymentConstraintsForProject, isHostSchedulable, selectHostForDeployment } from '../lib/scheduler';
 import { requireAgent, requireHost, requirePermission } from '../middleware/auth';
 import { isUuid, parseLimit } from './_helpers';
 
@@ -156,8 +156,12 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     // plane injects the verified checksum + size from the artifact row.
     let artifactChecksum: string | null = null;
     let artifactSize: number | null = null;
+    // Fix #1: the artifact's validated agent.deploy.json manifest, when
+    // present, is the authoritative scheduling source — it is the exact
+    // definition the worker will deploy.
+    let artifactManifest: unknown = null;
     if (artifact_id) {
-      const art = await pool.query('SELECT id, project_id, status, checksum, size FROM artifacts WHERE id = $1', [artifact_id]);
+      const art = await pool.query('SELECT id, project_id, status, checksum, size, manifest FROM artifacts WHERE id = $1', [artifact_id]);
       if (!art.rows[0]) {
         sendError(res, 404, 'not_found', 'artifact not found');
         return;
@@ -177,6 +181,7 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
       artifactChecksum = art.rows[0].checksum;
       artifactSize = art.rows[0].size === null || art.rows[0].size === undefined
         ? null : Number(art.rows[0].size);
+      artifactManifest = art.rows[0].manifest ?? null;
     }
 
     const incomingBody = deploymentIdempotencyBody({
@@ -196,7 +201,14 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
 
     const deploymentId = randomUUID();
     const taskStatus = deployMode === 'manual' ? 'awaiting_approval' : 'queued';
-    const constraints = deploymentConstraintsForProject(project);
+    // Fix #1: the resource reservation must represent the exact resources
+    // the worker will deploy. The artifact's validated agent.deploy.json
+    // manifest is authoritative when present; projects.configuration is
+    // only the fallback for deployments without an artifact or with a
+    // legacy (manifest-less) artifact.
+    const constraints = artifactManifest !== null && artifactManifest !== undefined
+      ? deploymentConstraintsForManifest(artifactManifest, project.runtime)
+      : deploymentConstraintsForProject(project);
     const taskPayload: Record<string, unknown> = {
       project_id,
       project_name: project.name, // the worker requires project_name
@@ -204,6 +216,11 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
       version,
       artifact_id: artifact_id ?? null,
       deployment_id: deploymentId,
+      // Fix #1: the canonical reserved contract travels with the task so
+      // the worker can enforce "tarball manifest <= reservation" at deploy
+      // time (fail loudly instead of silently over-committing the host).
+      reserved_cpu: constraints.requiredCpuCores,
+      reserved_ram_mb: constraints.requiredRamMb,
     };
     if (requestedHostPort !== null) {
       taskPayload.requested_host_port = requestedHostPort;
