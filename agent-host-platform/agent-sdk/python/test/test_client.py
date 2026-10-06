@@ -319,6 +319,27 @@ def test_get_domain():
     assert out["domain"]["tunnel_configured"] is True
 
 
+def test_get_domain_encodes_hostname():
+    # JS/Python parity: the hostname segment is URL-encoded (mirrors the JS
+    # SDK's encodeURIComponent), so exotic-but-legal names don't corrupt the
+    # path. A plain DNS name must pass through unchanged.
+    client, fake = client_with(
+        {"/v1/domains/api.example.com": lambda: make_response(
+            200, {"domain": {"hostname": "api.example.com", "status": "active"}})}
+    )
+    client.get_domain("api.example.com")
+    _, url, _ = fake.calls[0]
+    assert url == "https://cp.example.com/v1/domains/api.example.com"
+
+    client2, fake2 = client_with(
+        {"/v1/domains/idn%20space.example.com": lambda: make_response(
+            200, {"domain": {"hostname": "idn space.example.com", "status": "active"}})}
+    )
+    client2.get_domain("idn space.example.com")
+    _, url2, _ = fake2.calls[0]
+    assert url2 == "https://cp.example.com/v1/domains/idn%20space.example.com"
+
+
 def test_get_logs_creates_task_and_polls_to_terminal():
     states = [
         {"task": {"id": "t-9", "status": "running", "result": {"logs": "line1\n"}}},
@@ -423,7 +444,7 @@ PARITY_METHODS = [
     "register_agent", "me", "rotate_agent_key",
     "create_task", "get_task", "list_tasks", "cancel_task", "approve_task", "reject_task",
     "get_logs", "tail_logs",
-    "list_hosts", "get_host",
+    "list_hosts", "get_host", "register_host", "rotate_host_token",
     "create_project", "list_projects", "get_project", "update_project",
     "list_artifacts", "get_artifact", "init_artifact", "upload_artifact", "download_artifact",
     "create_deployment", "get_deployment", "list_deployments", "rollback_deployment",
@@ -558,3 +579,76 @@ def test_deploy_helper_passes_host_port():
     deploy_call = [c for c in fake.calls if c[1].endswith("/v1/deployments")][0]
     assert deploy_call[2]["json"]["host_port"] == 9090
     assert deployment["id"] == "d-1"
+
+
+# -- registration & host token rotation ----------------------------------
+
+
+def test_register_agent_sends_provisioning_token_header():
+    session = MagicMock()
+    calls = []
+
+    def fake_request(self, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return make_response(201, {"agent": {"id": "a1"}, "api_key": "fresh"})
+
+    session.request = fake_request.__get__(session, type(session))
+    # no agent key exists before registration: api_key may be omitted
+    client = UahtClient("https://cp.example.com", session=session)
+    res = client.register_agent(name="ci-bot", type="ci", provisioning_token="prov-123")
+    method, url, kwargs = calls[0]
+    assert method == "POST"
+    assert url == "https://cp.example.com/v1/agents/register"
+    assert kwargs["headers"]["X-Provisioning-Token"] == "prov-123"
+    assert "Authorization" not in kwargs["headers"]
+    assert res["api_key"] == "fresh"
+
+
+def test_register_host_posts_with_provisioning_header():
+    client, fake = client_with(
+        {"/v1/hosts/register": lambda: make_response(201, {"host": {"id": "h1"}, "host_token": "uagh_fresh"})}
+    )
+    res = client.register_host(name="edge-01", provisioning_token="prov-123")
+    method, url, kwargs = fake.calls[0]
+    assert method == "POST"
+    assert url == "https://cp.example.com/v1/hosts/register"
+    assert kwargs["headers"]["X-Provisioning-Token"] == "prov-123"
+    assert res["host_token"] == "uagh_fresh"
+
+
+def test_rotate_host_token_posts_grace_and_adopts_new_token():
+    client, fake = client_with(
+        {"/v1/hosts/h1/rotate-token": lambda: make_response(200, {"host_token": "uagh_new"})}
+    )
+    # synthetic fixture, not a real credential: the _not_real suffix keeps
+    # the secrets sweep from flagging it as a leaked api_key value.
+    client.api_key = "uagh_old_not_real"
+    res = client.rotate_host_token("h1", grace_seconds=300)
+    method, url, kwargs = fake.calls[0]
+    assert method == "POST"
+    assert url == "https://cp.example.com/v1/hosts/h1/rotate-token"
+    assert kwargs["headers"]["Authorization"] == "Bearer uagh_old_not_real"
+    assert kwargs["json"] == {"grace_seconds": 300}
+    assert res["host_token"] == "uagh_new"
+    # the client must adopt the new token or later host calls break
+    assert client.api_key == "uagh_new"
+
+
+def test_version_coherence():
+    """§61: one version source — __init__.__version__ == client.__version__
+    == pyproject version, and the default User-Agent derives from it."""
+    import re
+    from pathlib import Path
+    import uaht_sdk
+    from uaht_sdk import client as client_mod
+
+    assert uaht_sdk.__version__ == client_mod.__version__
+    assert re.fullmatch(r"\d+\.\d+\.\d+", uaht_sdk.__version__)
+
+    pyproject = Path(uaht_sdk.__file__).parents[2] / "pyproject.toml"
+    m = re.search(r'^version = "([^"]+)"', pyproject.read_text(), re.M)
+    assert m, "pyproject.toml has no version"
+    assert m.group(1) == uaht_sdk.__version__
+
+    c = uaht_sdk.UahtClient("https://cp.example.com/", "sekret")
+    assert c.user_agent == f"uaht-sdk/{uaht_sdk.__version__}"
