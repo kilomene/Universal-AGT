@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { join, resolve } from 'path';
 import express from 'express';
@@ -8,6 +9,7 @@ import { sendError } from './lib/errors';
 import { startEventBus, stopEventBus } from './lib/events';
 import { startHostSweeper } from './lib/hostSweeper';
 import { startTaskSweeper } from './lib/taskSweeper';
+import { startDomainReconciler } from './lib/domainReconciler';
 import { logger } from './lib/log';
 import { agentsRouter } from './routes/agents';
 import { artifactsRouter, uploadArtifactContent } from './routes/artifacts';
@@ -24,6 +26,16 @@ import { apiErrorHandler, attachAuth, requireAgent, requirePermission } from './
 import { rateLimit } from './middleware/rateLimit';
 import { validateStartupConfig } from './lib/config';
 
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      /** Per-request correlation id (inbound X-Request-Id, else generated). */
+      req_id?: string;
+    }
+  }
+}
+
 function repoRoot(): string {
   // dist layout: <repo>/agent-host-platform/control-plane/api/dist
   return resolve(__dirname, '..', '..', '..', '..');
@@ -33,11 +45,25 @@ export function createApp(): express.Express {
   const app = express();
   app.disable('x-powered-by');
 
+  // Request correlation id (§33 observability): honor an inbound
+  // X-Request-Id when it is a safe token, otherwise generate one. The id
+  // is logged with the request line and echoed back as a response header
+  // so operators can trace a request end to end.
+  const REQ_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+  app.use((req, res, next) => {
+    const inbound = req.header('x-request-id');
+    const reqId = inbound && REQ_ID_RE.test(inbound) ? inbound : randomUUID();
+    req.req_id = reqId;
+    res.setHeader('x-request-id', reqId);
+    next();
+  });
+
   // Structured request log: one JSON line per request.
   app.use((req, res, next) => {
     const start = Date.now();
     res.on('finish', () => {
       logger.info('request', {
+        req_id: req.req_id,
         method: req.method,
         path: req.path,
         status: res.statusCode,
@@ -106,9 +132,12 @@ async function main(): Promise<void> {
   // UAHT_PROVISIONING_TOKEN only (bootstrap mode); production — the default
   // when NODE_ENV is unset — is strict. No insecure fallbacks in any mode.
   try {
-    const { relaxed } = validateStartupConfig();
+    const { relaxed, warnings } = validateStartupConfig();
     for (const note of relaxed) {
       logger.warn(`startup check relaxed (development mode): ${note}`);
+    }
+    for (const note of warnings) {
+      logger.warn(`startup configuration warning: ${note}`);
     }
     logger.info('startup configuration validated');
   } catch (err) {
@@ -121,6 +150,7 @@ async function main(): Promise<void> {
   await startEventBus(pool);
   const stopHostSweeper = startHostSweeper(pool);
   const stopTaskSweeper = startTaskSweeper(pool);
+  const stopDomainReconciler = startDomainReconciler(pool);
 
   const port = Number(process.env.PORT ?? 3000);
   const server = createApp().listen(port, () => {
@@ -132,6 +162,7 @@ async function main(): Promise<void> {
     server.close();
     stopHostSweeper();
     stopTaskSweeper();
+    stopDomainReconciler();
     await stopEventBus().catch(() => {});
     await closePool().catch(() => {});
     process.exit(0);
