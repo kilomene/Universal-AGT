@@ -24,6 +24,9 @@ class FakeDocker:
     def image_exists(self, tag):
         return tag in self.images
 
+    def ps(self, all=False):
+        return []
+
     def start(self, name, timeout=120):
         self.start_calls.append(name)
         if name in self.containers:
@@ -228,3 +231,108 @@ def test_rollback_without_api_session_skips_settle(tmp_path):
 
     assert result["status"] == "rolled_back"
     assert result["ports_settled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Spec §21: host availability is verified BEFORE teardown, and the restored
+# target is health-checked before it is promoted.
+# ---------------------------------------------------------------------------
+def _state_with_port(dep_id, name, port, project="proj-1", status="running"):
+    state = _state(dep_id, name, project=project, status=status)
+    state["host_port"] = port
+    state["ports"] = {str(port): 3000}
+    state["healthcheck_path"] = "/health"
+    return state
+
+
+def test_rollback_refuses_when_target_port_squatted(tmp_path):
+    """The target's recorded host port is held by something else: the
+    rollback is refused BEFORE the healthy current deployment is torn
+    down (spec §21: host availability verified)."""
+    import socket
+    docker = FakeDocker()
+    docker.containers["c-current"] = {"running": True}
+    docker.containers["c-target"] = {"running": False}
+    squat = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squat.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squat.bind(("0.0.0.0", 0))
+    squat.listen(1)
+    port = squat.getsockname()[1]
+    try:
+        ctx = FakeCtx(tmp_path, docker)
+        ctx.deployment_store.save(_state("dep-cur", "c-current"))
+        ctx.deployment_store.save(_state_with_port(
+            "dep-target", "c-target", port, status="superseded"))
+
+        task = {"id": "t1", "type": "rollback",
+                "payload": {"deployment_id": "dep-cur",
+                            "target_deployment_id": "dep-target"}}
+        with pytest.raises(handlers.HandlerError, match="not free"):
+            handlers.handle_rollback(ctx, task)
+
+        # the healthy current deployment was never touched
+        assert docker.stop_calls == []
+        assert docker.rm_calls == []
+        assert "c-target" not in docker.start_calls
+        assert docker.containers["c-current"]["running"] is True
+        assert ctx.deployment_store.load("dep-cur")["status"] == "running"
+        assert ctx.deployment_store.load("dep-target")["status"] == "superseded"
+    finally:
+        squat.close()
+
+
+def test_rollback_healthchecks_restored_target(tmp_path, monkeypatch):
+    """After restore, the target is health-checked and its health_status is
+    recorded honestly (spec §21: health-checked, promoted)."""
+    from health import checker as health_checker
+    docker = FakeDocker()
+    docker.containers["c-current"] = {"running": True}
+    docker.containers["c-target"] = {"running": False}
+    ctx = FakeCtx(tmp_path, docker)
+    ctx.deployment_store.save(_state("dep-cur", "c-current"))
+    ctx.deployment_store.save(_state_with_port(
+        "dep-target", "c-target", 18923, status="superseded"))
+    seen = {}
+
+    def _fake_hc(port, path="/", timeout_secs=60, log=None):
+        seen["port"] = port
+        seen["path"] = path
+        return True
+
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck", _fake_hc)
+
+    result = handlers.handle_rollback(
+        ctx, {"id": "t1", "type": "rollback",
+              "payload": {"deployment_id": "dep-cur",
+                          "target_deployment_id": "dep-target"}})
+
+    assert result["status"] == "rolled_back"
+    assert result["rolled_back_to"] == "dep-target"
+    assert result["target_health_status"] == "healthy"
+    assert seen == {"port": 18923, "path": "/health"}
+    assert ctx.deployment_store.load("dep-target")["health_status"] == "healthy"
+
+
+def test_rollback_reports_unhealthy_target_honestly(tmp_path, monkeypatch):
+    """A restored target that fails its healthcheck is still the promoted
+    deployment — but its health is reported as unhealthy, not hidden."""
+    from health import checker as health_checker
+    docker = FakeDocker()
+    docker.containers["c-current"] = {"running": True}
+    docker.containers["c-target"] = {"running": False}
+    ctx = FakeCtx(tmp_path, docker)
+    ctx.deployment_store.save(_state("dep-cur", "c-current"))
+    ctx.deployment_store.save(_state_with_port(
+        "dep-target", "c-target", 18924, status="superseded"))
+    monkeypatch.setattr(health_checker, "wait_for_healthcheck",
+                        lambda *a, **k: False)
+
+    result = handlers.handle_rollback(
+        ctx, {"id": "t1", "type": "rollback",
+              "payload": {"deployment_id": "dep-cur",
+                          "target_deployment_id": "dep-target"}})
+
+    assert result["status"] == "rolled_back"
+    assert result["target_health_status"] == "unhealthy"
+    assert ctx.deployment_store.load("dep-target")["health_status"] == "unhealthy"
+    assert any("UNHEALTHY" in line for _, line in ctx.logged)
