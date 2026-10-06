@@ -186,6 +186,12 @@ docker ps --filter name=uaht-smoke-app --format '{{.Names}} {{.Status}}'   # Up
 the chain `deployment.requested task.created task.claimed
 task.started deployment.started task.completed deployment.completed`.
 
+**Resource-contract check (Fix #1):** the demo app's `agent.deploy.json`
+declares its `resources`; the deployment row's `reserved_cpu` /
+`reserved_ram_mb` must equal those normalized values (not the project
+configuration's). A deploy whose manifest exceeds remaining host
+capacity is rejected with `no_capacity` before any task is created.
+
 (The remaining steps' `curl`/`docker` commands run **on the host**
 via ssh or console; `<redacted>`/API calls run from your
 workstation.)
@@ -234,6 +240,14 @@ event); restart/stop/start cycle returns the app to `running`;
 `/health` is 200 again. **Verify-before-destroy:** a rollback
 against a bogus target id fails cleanly while the current deployment
 keeps serving.
+
+**Rollback-contract check (Fix #2):** the control plane records
+`rolled_back` only when the worker's report proves all three —
+`status = 'rolled_back'`, `target_health_status = 'healthy'`,
+`rollback_status = 'succeeded'`. An incomplete report (missing or
+unhealthy target, missing `rollback_status`) records
+`deployment.rollback_failed`, never a success. See
+`docs/rollback-contract.md`.
 
 ### Step 7 — Environment update + secrets
 
@@ -596,7 +610,7 @@ File the record next to this doc (e.g.
                        ▼
                 ┌──────────────┐
                 │ PostgreSQL / │  (Supabase, direct/session connection
-                │   Supabase   │   port 5432; migrations 001–012)
+                │   Supabase   │   port 5432; migrations 001–014)
                 └──────────────┘
 ```
 
