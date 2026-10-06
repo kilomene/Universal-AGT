@@ -46,7 +46,7 @@ PROVIDERS: dict[str, str] = {
 
 #: Deployments in these states never get ingress routes.
 TERMINAL_DEPLOYMENT_STATUSES = frozenset(
-    {"removed", "rolled_back", "failed"}
+    {"removed", "rolled_back", "rollback_failed", "failed"}
 )
 
 #: Hostnames are validated before they ever reach a provider config file —
