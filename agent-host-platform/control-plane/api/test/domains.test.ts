@@ -34,6 +34,63 @@ vi.mock('../src/db/pool', () => ({
   closePool: async () => {},
 }));
 
+// §5 SSRF hardening: the HTTPS probe resolves DNS itself and dials via
+// node:https with a pinned lookup — mock both (no real DNS/network).
+const dnsMock = vi.hoisted(() => {
+  let v4: string[] = ['93.184.216.34'];
+  let v6: string[] = [];
+  return {
+    resolve4: vi.fn(async (): Promise<string[]> => v4),
+    resolve6: vi.fn(async (): Promise<string[]> => v6),
+    set: (a: string[], aaaa: string[]) => {
+      v4 = a;
+      v6 = aaaa;
+    },
+  };
+});
+vi.mock('node:dns/promises', () => ({
+  resolve4: dnsMock.resolve4,
+  resolve6: dnsMock.resolve6,
+}));
+
+const httpsMock = vi.hoisted(() => {
+  let respond: number | 'throw' = 200;
+  const calls: Array<{ url: string; opts: any }> = [];
+  const get = vi.fn((url: string, opts: any, cb: (res: any) => void) => {
+    calls.push({ url, opts });
+    const listeners: Record<string, Array<() => void>> = {};
+    const req = {
+      on: (ev: string, fn: () => void) => {
+        (listeners[ev] ??= []).push(fn);
+        return req;
+      },
+      destroy: vi.fn(),
+    };
+    if (respond === 'throw') {
+      queueMicrotask(() => (listeners['error'] ?? []).forEach((fn) => fn()));
+    } else {
+      queueMicrotask(() => cb({ statusCode: respond, resume: () => {} }));
+    }
+    return req;
+  });
+  return {
+    calls,
+    get,
+    setRespond: (r: number | 'throw') => {
+      respond = r;
+    },
+    reset: () => {
+      calls.length = 0;
+      respond = 200;
+      get.mockClear();
+    },
+  };
+});
+vi.mock('node:https', () => ({
+  default: { get: httpsMock.get },
+  get: httpsMock.get,
+}));
+
 import { createApp } from '../src/index';
 import { generateAgentKey, generateHostToken } from '../src/lib/tokens';
 import { startFakeCloudflare, type FakeCloudflare } from './fakeCloudflare';
@@ -246,6 +303,10 @@ beforeEach(async () => {
   fake.reset();
   setCfEnv();
   stubFetch(200);
+  // Probe transport: public DNS answer + answering origin (per-test override
+  // via dnsMock.set / httpsMock.setRespond).
+  dnsMock.set(['93.184.216.34'], []);
+  httpsMock.reset();
 });
 
 afterEach(() => {
@@ -402,7 +463,7 @@ describe('POST /v1/domains — tunnel mode full flow', () => {
 
   it('records https_reachable=false when the probe fails, without blocking active', async () => {
     const { agent, depId } = await seedAll();
-    stubFetch('throw');
+    httpsMock.setRespond('throw');
     const r = await req('POST', '/v1/domains', agent.token, {
       deployment_id: depId, hostname: 'api.example.com', ingress: 'tunnel',
     });
