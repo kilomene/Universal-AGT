@@ -10,6 +10,7 @@ import { startEventBus, stopEventBus } from './lib/events';
 import { startHostSweeper } from './lib/hostSweeper';
 import { startTaskSweeper } from './lib/taskSweeper';
 import { startDomainReconciler } from './lib/domainReconciler';
+import { startArtifactSweeper } from './lib/artifactSweeper';
 import { logger } from './lib/log';
 import { agentsRouter } from './routes/agents';
 import { artifactsRouter, uploadArtifactContent } from './routes/artifacts';
@@ -151,6 +152,7 @@ async function main(): Promise<void> {
   const stopHostSweeper = startHostSweeper(pool);
   const stopTaskSweeper = startTaskSweeper(pool);
   const stopDomainReconciler = startDomainReconciler(pool);
+  const stopArtifactSweeper = startArtifactSweeper(pool);
 
   const port = Number(process.env.PORT ?? 3000);
   const server = createApp().listen(port, () => {
@@ -163,6 +165,7 @@ async function main(): Promise<void> {
     stopHostSweeper();
     stopTaskSweeper();
     stopDomainReconciler();
+    stopArtifactSweeper();
     await stopEventBus().catch(() => {});
     await closePool().catch(() => {});
     process.exit(0);
