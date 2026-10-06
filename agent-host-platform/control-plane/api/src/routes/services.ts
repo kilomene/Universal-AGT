@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import { getPool } from '../db/pool';
-import { sendError, HttpError } from '../lib/errors';
+import { sendError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { requireAgent, requirePermission } from '../middleware/auth';
+import { authorizeDeploymentAccess, inList, listAccessibleProjectIds } from '../lib/authz';
 import { isUuid, parseLimit } from './_helpers';
 
 export const servicesRouter = Router();
@@ -36,6 +37,13 @@ servicesRouter.get('/', requireAgent, requirePermission('read_status'), async (r
     const limit = parseLimit(req.query.limit);
     const conds = [`d.status = ANY($1)`];
     const params: unknown[] = [SERVICE_STATUSES];
+    // §10: only services of projects the agent may access.
+    const accessibleIds = await listAccessibleProjectIds(getPool(), req.auth!.id);
+    if (accessibleIds.length === 0) {
+      res.json({ services: [] });
+      return;
+    }
+    conds.push(inList('d.project_id', accessibleIds, params) as string);
     if (typeof host_id === 'string') {
       if (!isUuid(host_id)) {
         sendError(res, 400, 'bad_request', 'host_id must be a UUID');
@@ -70,12 +78,8 @@ async function controlTask(req: Request, res: Response, next: NextFunction, task
       return;
     }
     const pool = getPool();
-    const { rows } = await pool.query('SELECT * FROM deployments WHERE id = $1', [deploymentId]);
-    const deployment = rows[0];
-    if (!deployment) {
-      next(new HttpError(404, 'not_found', 'service (deployment) not found'));
-      return;
-    }
+    // §10: via deployment -> project -> owner/ACL.
+    const deployment = await authorizeDeploymentAccess(pool, req.auth!.id, deploymentId);
     const taskRows = (
       await pool.query(
         `INSERT INTO tasks (created_by, assigned_to, type, status, payload)
