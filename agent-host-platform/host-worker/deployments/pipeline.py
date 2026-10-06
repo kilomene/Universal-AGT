@@ -55,6 +55,43 @@ from health import collector as health_collector
 
 MANIFEST_FILENAME = "agent.deploy.json"
 QUARANTINE_DIRNAME = "quarantine"
+
+# Archive safety caps (§16). The wire is capped server-side
+# (ARTIFACT_MAX_BYTES, default 500MB), but a small compressed archive can
+# expand to many gigabytes — a decompression bomb that fills the worker
+# disk. The pre-scan in extract_archive() therefore rejects archives whose
+# DECLARED uncompressed size (tar member sizes / zip file_size headers)
+# exceeds MAX_EXTRACT_BYTES, or whose member count exceeds
+# MAX_ARCHIVE_MEMBERS (inode/CPU exhaustion via millions of tiny members).
+#
+# The cap is ABSOLUTE, not a compression-ratio cap: legitimate artifacts
+# are routinely highly compressible (200KB of zeros -> 291 bytes on the
+# wire is a 687x ratio), so a ratio cap would break real deploys. What
+# matters is bounding actual disk writes, and declared sizes bound them:
+# tar reads exactly member.size bytes per member, and zip enforces
+# file_size (a lying header fails CRC and aborts extraction).
+MAX_EXTRACT_BYTES = 8 * 1024**3  # 8 GiB
+MAX_ARCHIVE_MEMBERS = 100_000
+
+# artifact_id values become the path component artifacts/<id>.bin. They are
+# server-minted UUIDs, but the worker builds the path from the task payload
+# (agent-controlled) — validate before any path use so ".." / "/" can never
+# steer the download outside <work_dir>/artifacts (§16).
+_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+
+
+def validate_artifact_id(artifact_id) -> str:
+    """Return artifact_id if it is safe as a filesystem path component.
+
+    Raises ValueError otherwise — callers wrap it in their own fatal error
+    type (DeployError / HandlerError / WorkerAPIError).
+    """
+    if not isinstance(artifact_id, str) or not _ARTIFACT_ID_RE.match(artifact_id):
+        raise ValueError(
+            f"invalid artifact_id {artifact_id!r}; refusing to build a "
+            f"filesystem path from it"
+        )
+    return artifact_id
 STATIC_DOCKERFILE = """\
 FROM nginx:alpine
 COPY . /usr/share/nginx/html
@@ -93,6 +130,12 @@ def verify_checksum(path: str, expected: str) -> bool:
     algo, _, hex_digest = expected.partition(":")
     if algo != "sha256" or not hex_digest:
         raise DeployError(f"unsupported checksum format: {expected!r}")
+    # Reject malformed digests before compare_digest: non-ASCII input
+    # raises TypeError (an unhandled traceback), and a wrong-length digest
+    # can never match. The checksum comes from the task payload
+    # (agent-controlled), so validate it like any other untrusted input.
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", hex_digest):
+        raise DeployError(f"unsupported checksum format: {expected!r}")
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 256), b""):
@@ -121,6 +164,13 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
     always materializes entries as regular files, so symlink-flagged
     zip entries can never become real symlinks.
 
+    Decompression-bomb guard (§16): the declared uncompressed total (tar
+    member sizes / zip file_size — the bytes extraction would actually
+    write) is capped at MAX_EXTRACT_BYTES (8 GiB) and the member count at
+    MAX_ARCHIVE_MEMBERS. The tar header scan is incremental: the running
+    total is checked BEFORE tarfile seeks past each member's data, so a
+    bomb's payload is never even skipped over.
+
     All extraction failures surface as DeployError with a clear message —
     tar/zip library errors are wrapped, never leaked raw.
     """
@@ -133,20 +183,70 @@ def extract_archive(archive_path: str, dest_dir: str) -> str:
             raise DeployError(f"archive member escapes destination: {member!r}")
         return target
 
+    def _check_bomb(members: list[tuple[str, int]], what: str) -> None:
+        # Decompression-bomb guard (§16), zip branch: reject archives whose
+        # declared uncompressed payload exceeds the absolute extraction cap
+        # (infolist() reads the central directory only, so no member data
+        # is touched before this check). Declared sizes are what extraction
+        # writes (zip verifies file_size via CRC), so a lying header fails
+        # closed either here or at extraction.
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise DeployError(
+                f"archive rejected: {len(members)} members exceeds the "
+                f"{MAX_ARCHIVE_MEMBERS} member cap ({what})"
+            )
+        total = sum(size for _, size in members)
+        if total > MAX_EXTRACT_BYTES:
+            raise DeployError(
+                f"archive rejected: declared uncompressed size {total} bytes "
+                f"exceeds the {MAX_EXTRACT_BYTES} byte extraction cap; "
+                f"refusing a probable decompression bomb ({what})"
+            )
+
     try:
         if tarfile.is_tarfile(archive_path):
+            # Header scan, incremental: member names are confinement-checked
+            # and the running uncompressed total is capped BEFORE tarfile
+            # seeks past each member's data — a bomb's payload is never even
+            # skipped over, let alone extracted. (getmembers() would stream
+            # through the whole payload first: CPU burn on a hostile archive.)
+            # Extraction is a second open: the scan consumes the stream.
             with tarfile.open(archive_path, "r") as tf:
-                # Pre-scan every member name: data_filter neutralizes
-                # absolute paths by stripping the leading "/" (extracting
-                # them inside dest), but a malicious archive must FAIL with
-                # a clear error, not silently land renamed files.
-                for member in tf.getnames():
-                    _safe_join(dest, member)
+                count = 0
+                total = 0
+                while True:
+                    member = tf.next()
+                    if member is None:
+                        break
+                    # Pre-scan every member name: data_filter neutralizes
+                    # absolute paths by stripping the leading "/" (extracting
+                    # them inside dest), but a malicious archive must FAIL
+                    # with a clear error, not silently land renamed files.
+                    _safe_join(dest, member.name)
+                    count += 1
+                    total += member.size
+                    if count > MAX_ARCHIVE_MEMBERS:
+                        raise DeployError(
+                            f"archive rejected: more than "
+                            f"{MAX_ARCHIVE_MEMBERS} members (tar)"
+                        )
+                    if total > MAX_EXTRACT_BYTES:
+                        raise DeployError(
+                            f"archive rejected: declared uncompressed size "
+                            f"{total} bytes exceeds the {MAX_EXTRACT_BYTES} "
+                            f"byte extraction cap; refusing a probable "
+                            f"decompression bomb (tar)"
+                        )
+            with tarfile.open(archive_path, "r") as tf:
                 tf.extractall(dest, filter="data")
         elif zipfile.is_zipfile(archive_path):
             with zipfile.ZipFile(archive_path, "r") as zf:
-                for member in zf.namelist():
-                    _safe_join(dest, member)
+                # infolist() reads the central directory only — no member
+                # data is touched before the caps below are enforced.
+                members = [(i.filename, i.file_size) for i in zf.infolist()]
+                _check_bomb(members, "zip")
+                for name, _ in members:
+                    _safe_join(dest, name)
                 zf.extractall(dest)
         else:
             raise DeployError(
@@ -253,6 +353,84 @@ def reserved_port_snapshot() -> set:
 
 
 # ---------------------------------------------------------------------------
+# Process-wide resource admission (spec §11).
+#
+# The capacity check below used to be check-then-act: two deploy() calls on
+# threads in the same worker process could both read the same reserved
+# totals and both admit, over-committing host CPU/RAM. Admission is
+# therefore a reservation, mirroring the port pattern above: the capacity
+# check AND the record of this deployment's own request happen atomically
+# under _resource_alloc_lock. The reservation is held from admission until
+# the deployment's state row is persisted (the row then carries the
+# resources itself, so accounting never double-counts) or until the deploy
+# fails — the section-8 finally releases it on every path.
+# ---------------------------------------------------------------------------
+_resource_alloc_lock = threading.Lock()
+_resource_reservations: dict[str, dict] = {}  # deployment_id -> {"cpu", "ram_mb"}
+
+
+def reserved_resources_snapshot() -> dict:
+    """Currently in-flight resource reservations (test introspection)."""
+    with _resource_alloc_lock:
+        return {dep: dict(r) for dep, r in _resource_reservations.items()}
+
+
+def reserve_resources(deployment_id: str, cpu: float, ram_mb: float,
+                     store, log=None) -> None:
+    """Atomically check host capacity and reserve this deployment's request.
+
+    ``allocated`` = persisted reservations from deployments in reserving
+    states (health.collector.allocated_resources) PLUS in-flight
+    reservations from concurrent deploys that have passed admission but
+    not yet persisted their state row. Raises DeployError when the request
+    does not fit — the reservation is then NOT recorded, so a rejected
+    deploy holds nothing. Release with release_resource_reservation()
+    once the state row is persisted (success) or on any failure path.
+    """
+    with _resource_alloc_lock:
+        allocated = health_collector.allocated_resources(store)
+        for r in _resource_reservations.values():
+            allocated["cpu"] += r["cpu"]
+            allocated["ram_mb"] += r["ram_mb"]
+        if ram_mb:
+            total_mb = health_collector.total_ram_mb()
+            avail_mb = total_mb - allocated["ram_mb"]
+            if log:
+                log(f"resource check: need {ram_mb:g}MB ram, host total "
+                    f"{total_mb}MB, reserved {allocated['ram_mb']}MB, "
+                    f"available {avail_mb:.0f}MB")
+            if total_mb > 0 and ram_mb > avail_mb:
+                raise DeployError(
+                    f"insufficient reservable memory: deployment requests "
+                    f"{ram_mb:g}MB but only {max(avail_mb, 0):.0f}MB is "
+                    f"available (host total {total_mb}MB, "
+                    f"{allocated['ram_mb']}MB already reserved)"
+                )
+        if cpu:
+            total_cpus = health_collector.total_cpu()
+            avail_cpu = total_cpus - allocated["cpu"]
+            if log:
+                log(f"resource check: need {cpu:g} cpu, host total "
+                    f"{total_cpus}, reserved {allocated['cpu']}, "
+                    f"available {avail_cpu:.2f}")
+            if total_cpus > 0 and cpu > avail_cpu:
+                raise DeployError(
+                    f"insufficient reservable CPU: deployment requests "
+                    f"{cpu:g} but only {max(avail_cpu, 0):.2f} is "
+                    f"available (host total {total_cpus}, "
+                    f"{allocated['cpu']} already reserved)"
+                )
+        _resource_reservations[deployment_id] = {
+            "cpu": float(cpu or 0.0), "ram_mb": float(ram_mb or 0.0)}
+
+
+def release_resource_reservation(deployment_id: str) -> None:
+    """Release an admission reservation; safe to call when none exists."""
+    with _resource_alloc_lock:
+        _resource_reservations.pop(deployment_id, None)
+
+
+# ---------------------------------------------------------------------------
 # Per-artifact download lock (spec §42).
 #
 # Two concurrent deploys of the SAME artifact_id write to the same
@@ -334,7 +512,20 @@ def published_host_ports(ports_text) -> list:
     return [int(m.group(1)) for m in re.finditer(r":(\d+)->", ports_text or "")]
 
 
-def verify_host_port_free(docker, host_port: int, log=None) -> None:
+def compose_project_name_for(project_id: str, safe_project: str) -> str:
+    """Compose project name, isolated per project (§18).
+
+    The sanitized project name alone is not a unique key: "My App" and
+    "my-app" sanitize identically, and without the project_id suffix one
+    project's `compose up` would adopt (and tear down) the other's stack.
+    Pure function — unit tested.
+    """
+    pid8 = re.sub(r"[^a-z0-9]+", "", str(project_id).lower())[:8] or "noid"
+    return f"uaht-{safe_project}-{pid8}"
+
+
+def verify_host_port_free(docker, host_port: int, log=None,
+                          exclude_names: Optional[set] = None) -> None:
     """Fail with DeployError unless host_port is free, twice over.
 
     OS level: bind the port ourselves — catches anything listening on the
@@ -342,11 +533,20 @@ def verify_host_port_free(docker, host_port: int, log=None) -> None:
     `docker ps -a` published ports — catches ports docker holds on a
     specific interface that a wildcard bind might miss.
 
+    ``exclude_names`` (optional): container names whose published ports do
+    not count as a collision — used by rollback verification, where the
+    target's own stopped container legitimately still shows its port in
+    `docker ps -a` (`docker start` reuses that mapping).
+
     Called before every `docker run`; a collision fails the task with a
     clear error instead of a cryptic `docker run` failure.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            # SO_REUSEADDR, like docker's own published-port bind: a
+            # stopped container's connections can linger in TIME_WAIT and
+            # must not read as "port in use" — only a live listener does.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("0.0.0.0", host_port))
     except OSError:
         raise DeployError(
@@ -362,6 +562,10 @@ def verify_host_port_free(docker, host_port: int, log=None) -> None:
         )
     used = set()
     for row in rows or []:
+        if exclude_names:
+            name = (row.get("Names") or "").lstrip("/")
+            if name in exclude_names:
+                continue
         used.update(published_host_ports(row.get("Ports")))
     if host_port in used:
         raise DeployError(
@@ -442,6 +646,10 @@ def _fetch_verified_artifact(ctx, log, work_dir: Path, artifact_id: str,
             "refusing to deploy: payload has artifact_id but no "
             "artifact_checksum; unverified artifacts are never executed"
         )
+    try:
+        validate_artifact_id(artifact_id)
+    except ValueError as exc:
+        raise DeployError(str(exc)) from exc
     with artifact_download_lock(artifact_id):
         artifacts_dir = work_dir / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -605,170 +813,185 @@ def deploy(ctx, task: dict) -> dict:
     # Note: the previous deployment of this project (if any) is still
     # 'running' at this point — both containers briefly exist during the
     # healthcheck window, so its reservation correctly counts as allocated.
+    #
+    # TRANSACTIONAL (spec §11): reserve_resources() checks capacity and
+    # records this deployment's own reservation atomically under the
+    # process-wide resource lock, so two simultaneous deploy() calls
+    # cannot both consume the same capacity. The reservation is held until
+    # the deployment's state row is persisted (success) or released by the
+    # section-8 finally on any failure path.
+    resource_reserved = False
     if resources.get("memory") or resources.get("cpu"):
-        allocated = health_collector.allocated_resources(store)
-        if resources.get("memory"):
-            need_mb = parse_memory_mb(resources["memory"])
-            total_mb = health_collector.total_ram_mb()
-            avail_mb = total_mb - allocated["ram_mb"]
-            log(f"resource check: need {need_mb}MB ram, host total "
-                f"{total_mb}MB, reserved {allocated['ram_mb']}MB, "
-                f"available {avail_mb:.0f}MB")
-            if total_mb > 0 and need_mb > avail_mb:
-                raise DeployError(
-                    f"insufficient reservable memory: deployment requests "
-                    f"{need_mb}MB but only {max(avail_mb, 0):.0f}MB is "
-                    f"available (host total {total_mb}MB, "
-                    f"{allocated['ram_mb']}MB already reserved by running "
-                    f"deployments)"
-                )
-        if resources.get("cpu"):
-            need_cpu = float(resources["cpu"])
-            total_cpus = health_collector.total_cpu()
-            avail_cpu = total_cpus - allocated["cpu"]
-            log(f"resource check: need {need_cpu} cpu, host total "
-                f"{total_cpus}, reserved {allocated['cpu']}, "
-                f"available {avail_cpu:.2f}")
-            if total_cpus > 0 and need_cpu > avail_cpu:
-                raise DeployError(
-                    f"insufficient reservable CPU: deployment requests "
-                    f"{need_cpu} but only {max(avail_cpu, 0):.2f} is "
-                    f"available (host total {total_cpus}, "
-                    f"{allocated['cpu']} already reserved by running "
-                    f"deployments)"
-                )
+        need_mb = (parse_memory_mb(resources["memory"])
+                   if resources.get("memory") else 0.0)
+        need_cpu = (float(resources["cpu"])
+                    if resources.get("cpu") else 0.0)
+        reserve_resources(deployment_id, need_cpu, need_mb, store, log=log)
+        resource_reserved = True
 
-    docker = ctx.require_docker()
+    # §4-§5 run under this try/except: they execute after the §3 resource
+    # reservation (and the §5 compose port reservation) is taken but before
+    # the section-6 try/finally is entered. An exception here — docker
+    # build failure, compose validation rejection, compose up failure —
+    # must release those reservations, or they leak for the life of the
+    # worker process and silently shrink all future admission.
+    try:
+        docker = ctx.require_docker()
 
-    # -- 4. previous healthy deployment (rollback target) --------------------
-    previous = store.latest_for_project(project_id, statuses=("running",))
-    if previous:
-        log(f"rollback target: previous deployment {previous['deployment_id']} "
-            f"(container {previous.get('container_name')})")
-    else:
-        log("no previous healthy deployment; rollback target: none")
-
-    # -- 5. build ------------------------------------------------------------
-    # Process-wide port reservations taken below (compose-declared ports,
-    # or the picked / control-plane-requested single-container port) are
-    # held until the deployment's state row is persisted; the finally in
-    # section 8 releases them on every path.
-    reserved_ports: list[int] = []
-    effective_health_port = None  # for compose-discovered ports
-    compose_file = None
-    compose_project_name = None
-    compose_ports = None  # published host ports declared by the compose file
-    image_built = False  # True only when THIS deploy ran docker build
-    if runtime == "docker":
-        if payload.get("image"):
-            log(f"using prebuilt image {built_image}; skipping build")
+        # -- 4. previous healthy deployment (rollback target) --------------------
+        previous = store.latest_for_project(project_id, statuses=("running",))
+        if previous:
+            log(f"rollback target: previous deployment {previous['deployment_id']} "
+                f"(container {previous.get('container_name')})")
         else:
+            log("no previous healthy deployment; rollback target: none")
+
+        # -- 5. build ------------------------------------------------------------
+        # Process-wide port reservations taken below (compose-declared ports,
+        # or the picked / control-plane-requested single-container port) are
+        # held until the deployment's state row is persisted; the finally in
+        # section 8 releases them on every path.
+        reserved_ports: list[int] = []
+        effective_health_port = None  # for compose-discovered ports
+        compose_file = None
+        compose_project_name = None
+        compose_ports = None  # published host ports declared by the compose file
+        image_built = False  # True only when THIS deploy ran docker build
+        if runtime == "docker":
+            if payload.get("image"):
+                log(f"using prebuilt image {built_image}; skipping build")
+            else:
+                if extract_dir is None:
+                    raise DeployError("runtime=docker needs artifact_id with a Dockerfile")
+                build_cfg = manifest_data.get("build") or {}
+                extract_base = Path(extract_dir)
+                dockerfile = str(confined_under(
+                    extract_base, build_cfg.get("dockerfile", "Dockerfile"),
+                    "build.dockerfile"))
+                context_dir = str(confined_under(
+                    extract_base, build_cfg.get("context", "."), "build.context"))
+                if not os.path.isfile(dockerfile):
+                    raise DeployError(f"Dockerfile not found: {dockerfile}")
+                log(f"docker build: tag={built_image} dockerfile={dockerfile}")
+                docker.build(context_dir, dockerfile, built_image,
+                             timeout=int(payload.get("build_timeout", 1200)))
+                image_built = True
+                log("docker build OK")
+        elif runtime == "docker-compose":
+            if not docker.compose_available():
+                raise DeployError("runtime=docker-compose but 'docker compose' is unavailable")
             if extract_dir is None:
-                raise DeployError("runtime=docker needs artifact_id with a Dockerfile")
-            build_cfg = manifest_data.get("build") or {}
+                raise DeployError("runtime=docker-compose needs artifact_id")
             extract_base = Path(extract_dir)
-            dockerfile = str(confined_under(
-                extract_base, build_cfg.get("dockerfile", "Dockerfile"),
-                "build.dockerfile"))
-            context_dir = str(confined_under(
-                extract_base, build_cfg.get("context", "."), "build.context"))
-            if not os.path.isfile(dockerfile):
-                raise DeployError(f"Dockerfile not found: {dockerfile}")
-            log(f"docker build: tag={built_image} dockerfile={dockerfile}")
-            docker.build(context_dir, dockerfile, built_image,
+            compose_file = (
+                str(confined_under(extract_base, payload.get("compose_file"),
+                                   "compose_file"))
+                if payload.get("compose_file")
+                else str(extract_base / "docker-compose.yml")
+            )
+            if not os.path.isfile(compose_file):
+                alt = str(Path(extract_dir) / "compose.yaml")
+                compose_file = alt if os.path.isfile(alt) else compose_file
+            if not os.path.isfile(compose_file):
+                raise DeployError(f"compose file not found: {compose_file}")
+            compose_project_name = compose_project_name_for(project_id,
+                                                              safe_project)
+            # Migration (§18): stacks created before project_id-suffixed names
+            # used the bare "uaht-<project>" name. If the previous RUNNING
+            # deployment of THIS project still owns such a legacy stack, tear
+            # it down first — the new suffixed project replaces it in place.
+            # Without this, the new stack's port check would fail against the
+            # project's own old containers.
+            legacy_project = f"uaht-{safe_project}"
+            if (previous and previous.get("compose_project") == legacy_project
+                    and legacy_project != compose_project_name):
+                legacy_file = previous.get("compose_file")
+                if legacy_file and os.path.isfile(legacy_file):
+                    log(f"removing legacy compose project {legacy_project} "
+                        f"(pre-isolation naming)")
+                    try:
+                        docker.compose_down(legacy_file,
+                                            project_name=legacy_project)
+                    except Exception as exc:
+                        log(f"legacy compose down failed (continuing): {exc}")
+            # Port check for compose too: compose publishes host ports, so the
+            # ports the file declares must be verified free BEFORE `compose up`,
+            # exactly like the pre-`docker run` check. Ports already held by
+            # this project's own stack are skipped (redeploy replaces it).
+            try:
+                compose_model = docker.compose_config_json(compose_file)
+            except Exception as exc:
+                raise DeployError(
+                    f"could not read normalized compose model for {compose_file}: "
+                    f"{exc}"
+                )
+            # W5/W7: explicit DENY-list validation of the compose model BEFORE
+            # `compose up`. A task-controlled compose file must not smuggle
+            # privileged mode, host namespaces, host devices, added
+            # capabilities, custom security options, or bind mounts escaping
+            # the deployment workspace.
+            compose_errors = compose_validate.validate_compose_model(
+                compose_model, workspace=extract_base, compose_file=compose_file)
+            if compose_errors:
+                raise DeployError(
+                    "compose file rejected by security policy: "
+                    + "; ".join(compose_errors))
+            log("compose file passed security validation")
+            wanted_ports = parse_compose_published_ports(compose_model)
+            log(f"compose declares published host ports: {wanted_ports or 'none'}")
+            # Ports held by the previous generation of THIS project are not a
+            # collision (redeploy replaces its own stack in place).
+            previous_ports: set = set()
+            if previous:
+                if previous.get("host_port"):
+                    previous_ports.add(int(previous["host_port"]))
+                for p in previous.get("compose_ports") or []:
+                    try:
+                        previous_ports.add(int(p))
+                    except (TypeError, ValueError):
+                        continue
+            verify_compose_ports_free(docker, compose_project_name, wanted_ports,
+                                      log=log,
+                                      registry_used=(store.used_host_ports()
+                                                     - previous_ports)
+                                      | reserved_port_snapshot())
+            # Reserve the declared ports process-wide: a concurrent
+            # single-container deploy must not pick one of them (spec §42).
+            # Released in the section-8 finally once this deployment's state
+            # row (carrying compose_ports) is persisted.
+            reserved_ports = reserve_declared_ports(wanted_ports, deployment_id)
+            compose_ports = sorted(wanted_ports) or None
+            log(f"docker compose up: {compose_file} (project {compose_project_name})")
+            docker.compose_up(compose_file, project_name=compose_project_name,
+                              build=True)
+            effective_health_port = _discover_compose_port(
+                docker, compose_project_name, log)
+            if not effective_health_port:
+                raise DeployError(
+                    "compose started but no published port found on its "
+                    "containers; cannot healthcheck"
+                )
+            log(f"compose service port discovered: {effective_health_port}")
+        elif runtime == "static":
+            if extract_dir is None:
+                raise DeployError("runtime=static needs artifact_id with static files")
+            df_path = str(Path(extract_dir) / "Dockerfile.uaht-static")
+            with open(df_path, "w", encoding="utf-8") as fh:
+                fh.write(STATIC_DOCKERFILE)
+            container_port = 80
+            log(f"static build: tag={built_image} (nginx)")
+            docker.build(extract_dir, df_path, built_image,
                          timeout=int(payload.get("build_timeout", 1200)))
             image_built = True
-            log("docker build OK")
-    elif runtime == "docker-compose":
-        if not docker.compose_available():
-            raise DeployError("runtime=docker-compose but 'docker compose' is unavailable")
-        if extract_dir is None:
-            raise DeployError("runtime=docker-compose needs artifact_id")
-        extract_base = Path(extract_dir)
-        compose_file = (
-            str(confined_under(extract_base, payload.get("compose_file"),
-                               "compose_file"))
-            if payload.get("compose_file")
-            else str(extract_base / "docker-compose.yml")
-        )
-        if not os.path.isfile(compose_file):
-            alt = str(Path(extract_dir) / "compose.yaml")
-            compose_file = alt if os.path.isfile(alt) else compose_file
-        if not os.path.isfile(compose_file):
-            raise DeployError(f"compose file not found: {compose_file}")
-        compose_project_name = f"uaht-{safe_project}"
-        # Port check for compose too: compose publishes host ports, so the
-        # ports the file declares must be verified free BEFORE `compose up`,
-        # exactly like the pre-`docker run` check. Ports already held by
-        # this project's own stack are skipped (redeploy replaces it).
-        try:
-            compose_model = docker.compose_config_json(compose_file)
-        except Exception as exc:
-            raise DeployError(
-                f"could not read normalized compose model for {compose_file}: "
-                f"{exc}"
-            )
-        # W5/W7: explicit DENY-list validation of the compose model BEFORE
-        # `compose up`. A task-controlled compose file must not smuggle
-        # privileged mode, host namespaces, host devices, added
-        # capabilities, custom security options, or bind mounts escaping
-        # the deployment workspace.
-        compose_errors = compose_validate.validate_compose_model(
-            compose_model, workspace=extract_base, compose_file=compose_file)
-        if compose_errors:
-            raise DeployError(
-                "compose file rejected by security policy: "
-                + "; ".join(compose_errors))
-        log("compose file passed security validation")
-        wanted_ports = parse_compose_published_ports(compose_model)
-        log(f"compose declares published host ports: {wanted_ports or 'none'}")
-        # Ports held by the previous generation of THIS project are not a
-        # collision (redeploy replaces its own stack in place).
-        previous_ports: set = set()
-        if previous:
-            if previous.get("host_port"):
-                previous_ports.add(int(previous["host_port"]))
-            for p in previous.get("compose_ports") or []:
-                try:
-                    previous_ports.add(int(p))
-                except (TypeError, ValueError):
-                    continue
-        verify_compose_ports_free(docker, compose_project_name, wanted_ports,
-                                  log=log,
-                                  registry_used=(store.used_host_ports()
-                                                 - previous_ports)
-                                  | reserved_port_snapshot())
-        # Reserve the declared ports process-wide: a concurrent
-        # single-container deploy must not pick one of them (spec §42).
-        # Released in the section-8 finally once this deployment's state
-        # row (carrying compose_ports) is persisted.
-        reserved_ports = reserve_declared_ports(wanted_ports, deployment_id)
-        compose_ports = sorted(wanted_ports) or None
-        log(f"docker compose up: {compose_file} (project {compose_project_name})")
-        docker.compose_up(compose_file, project_name=compose_project_name,
-                          build=True)
-        effective_health_port = _discover_compose_port(
-            docker, compose_project_name, log)
-        if not effective_health_port:
-            raise DeployError(
-                "compose started but no published port found on its "
-                "containers; cannot healthcheck"
-            )
-        log(f"compose service port discovered: {effective_health_port}")
-    elif runtime == "static":
-        if extract_dir is None:
-            raise DeployError("runtime=static needs artifact_id with static files")
-        df_path = str(Path(extract_dir) / "Dockerfile.uaht-static")
-        with open(df_path, "w", encoding="utf-8") as fh:
-            fh.write(STATIC_DOCKERFILE)
-        container_port = 80
-        log(f"static build: tag={built_image} (nginx)")
-        docker.build(extract_dir, df_path, built_image,
-                     timeout=int(payload.get("build_timeout", 1200)))
-        image_built = True
-        log("static build OK")
-    else:  # pragma: no cover — validator guarantees this is unreachable
-        raise DeployError(f"unsupported runtime: {runtime!r}")
+            log("static build OK")
+        else:  # pragma: no cover — validator guarantees this is unreachable
+            raise DeployError(f"unsupported runtime: {runtime!r}")
+
+    except Exception:
+        release_port_reservations(reserved_ports)
+        if resource_reserved:
+            release_resource_reservation(deployment_id)
+        raise
 
     # -- 6. run new container (compose runtime already running) -------------
     # Sections 6-8 run under the port reservation: it bridges the gap
@@ -847,6 +1070,7 @@ def deploy(ctx, task: dict) -> dict:
                 "project_id": project_id,
                 "project_name": project_name,
                 "version": version,
+                "artifact_id": artifact_id,  # §13: recreate needs the artifact ref
                 "container_name": container_name if new_container_started else None,
                 "compose_project": compose_project_name,
                 "compose_file": compose_file,
@@ -950,6 +1174,7 @@ def deploy(ctx, task: dict) -> dict:
             "project_id": project_id,
             "project_name": project_name,
             "version": version,
+            "artifact_id": artifact_id,  # §13: recreate needs the artifact ref
             "container_name": None,
             "compose_project": None,
             "compose_file": compose_file,
@@ -984,6 +1209,11 @@ def deploy(ctx, task: dict) -> dict:
         )
     finally:
         release_port_reservations(reserved_ports)
+        if resource_reserved:
+            # On success the persisted state row (carrying the resources)
+            # now accounts for this deployment; on failure nothing was
+            # persisted. Either way the in-flight reservation is done.
+            release_resource_reservation(deployment_id)
 
 
 def _discover_compose_port(docker, compose_project: str, log=None) -> Optional[int]:
