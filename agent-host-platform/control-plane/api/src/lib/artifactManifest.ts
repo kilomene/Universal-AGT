@@ -77,7 +77,7 @@ async function fromZip(archivePath: string): Promise<Buffer | null> {
         zipfile.close();
         resolve(v);
       };
-      zipfile.on('error', (e) => done(null) ?? reject(e));
+      zipfile.on('error', () => done(null));
       zipfile.readEntry();
       zipfile.on('entry', (entry: yauzl.Entry) => {
         if (cleanRootName(entry.fileName) === null || entry.uncompressedSize > MAX_MANIFEST_BYTES) {
@@ -91,23 +91,32 @@ async function fromZip(archivePath: string): Promise<Buffer | null> {
           }
           const chunks: Buffer[] = [];
           let size = 0;
+          let destroyed = false;
           stream.on('data', (c: Buffer) => {
+            if (destroyed) return;
             size += c.length;
-            if (size <= MAX_MANIFEST_BYTES) chunks.push(c);
+            // Bomb guard: the zip header's uncompressedSize can lie. Stop
+            // inflating the moment the manifest entry exceeds the cap and
+            // keep scanning — never stream unbounded decompressed bytes.
+            if (size > MAX_MANIFEST_BYTES) {
+              destroyed = true;
+              stream.destroy();
+              zipfile.readEntry();
+              return;
+            }
+            chunks.push(c);
           });
           stream.on('end', () => {
-            done(size <= MAX_MANIFEST_BYTES ? Buffer.concat(chunks) : null);
+            if (!destroyed) done(size <= MAX_MANIFEST_BYTES ? Buffer.concat(chunks) : null);
           });
-          stream.on('error', () => zipfile.readEntry());
+          stream.on('error', () => {
+            if (!destroyed) zipfile.readEntry();
+          });
         });
       });
       zipfile.on('end', () => done(null));
     });
   });
-}
-
-function isZipPath(p: string): boolean {
-  return p.toLowerCase().endsWith('.zip');
 }
 
 export interface ExtractedManifest {
@@ -124,6 +133,10 @@ export interface ExtractedManifest {
  * malformed archives — returns `{ found: false }` / `{ error }` so the
  * caller can decide (finalization treats an unreadable archive as a
  * verification failure, never as a silent pass).
+ *
+ * Format detection is by content, mirroring the worker
+ * (`tarfile.is_tarfile()` then zip): tar is tried first, then zip. The
+ * filename extension is never trusted.
  */
 export async function extractManifestFromArchive(archivePath: string): Promise<ExtractedManifest> {
   try {
@@ -134,12 +147,18 @@ export async function extractManifestFromArchive(archivePath: string): Promise<E
   }
   let raw: Buffer | null = null;
   try {
-    raw = isZipPath(archivePath) ? await fromZip(archivePath) : await fromTar(archivePath);
+    raw = await fromTar(archivePath);
   } catch {
-    // Not a readable tar/zip (or a hostile archive): no manifest found.
-    // tar.list throws on non-tar input — that is a "no manifest" signal,
-    // not a crash.
-    return { found: false };
+    // Not a readable tar — fall through to zip below.
+    raw = null;
+  }
+  if (raw === null) {
+    try {
+      raw = await fromZip(archivePath);
+    } catch {
+      // Not a readable zip either: no manifest found (never a crash).
+      return { found: false };
+    }
   }
   if (!raw) return { found: false };
   try {
