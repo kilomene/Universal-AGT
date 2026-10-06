@@ -58,12 +58,15 @@ export function requiresNoTransaction(sql: string): boolean {
 // out, never mark it applied without running it.
 //
 // Current entries:
-//   005_events_truncate_block.sql — CREATE EVENT TRIGGER needs a true
-//     superuser (service_role is NOT enough). This is the append-only
-//     guarantee for the events journal; skipping it silently would leave
-//     the journal truncatable.
 //   001_initial.sql — CREATE EXTENSION pgcrypto needs superuser UNLESS the
 //     extension is already installed (fresh Supabase projects ship it).
+//
+// Historical note: 005_events_truncate_block.sql USED to install an EVENT
+// TRIGGER (CREATE EVENT TRIGGER needs a true superuser). That approach was
+// removed: PostgreSQL does not support event triggers on TRUNCATE at all
+// (server error "event triggers are not supported for TRUNCATE TABLE",
+// verified on PG 16), so the migration is now a plain REVOKE, which the
+// table owner can run. If you see an old preflight for 005 here, delete it.
 // ---------------------------------------------------------------------------
 
 async function isSuperuser(pool: Pool): Promise<boolean> {
@@ -74,28 +77,6 @@ async function isSuperuser(pool: Pool): Promise<boolean> {
 }
 
 export async function checkMigrationPrivileges(pool: Pool, file: string): Promise<void> {
-  if (file === '005_events_truncate_block.sql') {
-    let superuser = false;
-    try {
-      superuser = await isSuperuser(pool);
-    } catch {
-      // The probe itself is unsupported (exotic PG-compatible backend):
-      // let the migration attempt run so its native error surfaces.
-      return;
-    }
-    if (!superuser) {
-      throw new Error(
-        `migration ${file} requires superuser: it installs an EVENT TRIGGER ` +
-          `(CREATE EVENT TRIGGER needs a true superuser; Supabase service_role is not enough) ` +
-          `that aborts TRUNCATE on the append-only events journal. ` +
-          `Safe path: paste the contents of database/migrations/${file} into the Supabase SQL editor ` +
-          `(it runs as superuser) and execute it, then record it as applied with\n` +
-          `  INSERT INTO schema_migrations (name) VALUES ('${file}');\n` +
-          `and restart the API. Do NOT skip this migration — without it the events journal is truncatable.`,
-      );
-    }
-    return;
-  }
   if (file === '001_initial.sql') {
     let extInstalled = false;
     let superuser = false;
