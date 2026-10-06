@@ -17,7 +17,7 @@ obsolete `001…007` migration claims corrected to `001…010`.
 agent lifecycle (suspend/resume/revoke, §12), project ownership ACLs
 (§10/§11, migration 011), host scheduler (§8/§9), rollback failure
 durability (§§4–7, migration 012), claim `assigned_to` fix (§13),
-6to4 denied range (§2). Migrations corrected to `001…015`; A3, A8,
+6to4 denied range (§2). Migrations corrected to `001…016`; A3, A8,
 A16, A18, A29, A30, C6 updated; new A37–A39; duplicate C2 row removed.
 
 **Last verified evidence:**
@@ -34,7 +34,7 @@ A16, A18, A29, A30, C6 updated; new A37–A39; duplicate C2 row removed.
   real PostgreSQL 16 service container: migration chain 001–010 applied
   via `npm run migrate`, API booted, claim exclusivity proven — that run
   predates migrations 011/012; re-running the CI e2e job against the
-  full 001–015 chain is part of the next CI run, not yet done).
+  full 001–016 chain is part of the next CI run, not yet done).
 - Dashboard: `check.py` + dashboard↔route contract match run in CI;
   `index.html` parses, `app.js` passes `node --check`. **No functional
   browser test has ever exercised the UI.**
@@ -82,7 +82,7 @@ hidden gaps.
 | A27 | Cloudflare DNS | Idempotent CNAME ensure/delete (proxied, TTL 300), hostname regex, scoped token, graceful `dns_pending` when unconfigured | `cloudflare.test.ts` (mocked fetch, 8) |
 | A28 | Tunnel ingress | `IngressProvider` interface; supervised outbound-only `cloudflared tunnel --token run` (pinned 2026.10.0, SHA-256 verified); loopback-only route targets; remote tunnel configuration is the source of truth (local `config.yml` is a diagnostic mirror); `ingress-sync` task type (18th) | 28 ingress tests |
 | A29 | Domains lifecycle | `domains` table (migration 007): `requested → configuring → active → failed`, `degraded` as live-but-unverified (`active → degraded → active|failed`), `removing → removed`; periodic reconciler re-verifies against the remote tunnel config (`domain.reconcile`/`degraded`/`recovered` events); 409 on duplicate hostname; 422 tunnel-without-hostname. (2026-10-06: domain routes enforce the deployment ACL (`authorizeDeploymentAccess`); a `rollback_failed` deployment's domains are marked `failed` like any terminal deployment; the probe's IP classifier additionally denies `2002::/16` (6to4)) | `domains.test.ts` |
-| A30 | Migrations 001–015 | Numbered with no gaps, parse-validated (pglast), schema.sql superset check — all in CI; chain applies cleanly to real PostgreSQL 16 in the CI `e2e` job via `npm run migrate`; runner supports `-- migrate: no-transaction` marker. `011` (project ownership: `owner_agent_id` + backfill + `project_members` + `agent_host_access`), `012` (`rollback_failed` in the `deployments.status` CHECK), `013` (`reserved_cpu`/`reserved_ram_mb` on deployments), `014` (`artifacts.manifest` + tarball-manifest verification at finalization), `015` (`superseded` deployment state, releases the reservation but stays a rollback target) are owner-role-safe DDL (see B1) | `migration-validation` + `e2e` CI jobs |
+| A30 | Migrations 001–016 | Numbered with no gaps, parse-validated (pglast), schema.sql superset check — all in CI; chain applies cleanly to real PostgreSQL 16 in the CI `e2e` job via `npm run migrate`; runner supports `-- migrate: no-transaction` marker. `011` (project ownership: `owner_agent_id` + backfill + `project_members` + `agent_host_access`), `012` (`rollback_failed` in the `deployments.status` CHECK), `013` (`reserved_cpu`/`reserved_ram_mb` on deployments), `014` (`artifacts.manifest` + tarball-manifest verification at finalization), `015` (`superseded` deployment state, releases the reservation but stays a rollback target), `016` (`artifacts.updated_at`, required by the 001 `touch_updated_at()` trigger — found by live-PostgreSQL validation 2026-10-06) are owner-role-safe DDL (see B1) | `migration-validation` + `e2e` CI jobs |
 | A31 | Dashboard | Hosts/apps/deployments/tasks panels, Approvals dossier + confirmations, service actions (restart/stop/start), SSE live, sessionStorage-only key, 401→re-auth; every dashboard-called endpoint contract-matched against real routes in CI | `check.py` + route-match CI job |
 | A32 | CLI | 19 commands (`hosts apps deploy logs restart stop start status rollback domains tasks events agents projects deployments approve reject cancel secrets`), global `--json`, `UAHT_BASE_URL`/`UAHT_API_KEY` or flags, provisioning-token flag for registration | smoke 20/20 |
 | A33 | JS SDK | 42/42 `node:test`; zero-dep; SSE async generator with `since`; `deploy()` helper; `rotateKey`, `tailLogs`, `getLogs`, `addDomain(..., ingress?)` | local run 2026-10-06 |
@@ -203,7 +203,7 @@ documented).
   pre-pass for interrupted rollbacks); `tryClaim` no longer stamps
   `assigned_to`; `2002::/16` (6to4) added to the probe's denied IPv6
   ranges; doc sweep (this document: A3/A8/A16/A18/A29/A30/C6, new
-  A37–A39, migrations `001–015`, duplicate C2 row removed).
+  A37–A39, migrations `001–016`, duplicate C2 row removed).
 
 ---
 
