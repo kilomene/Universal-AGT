@@ -135,6 +135,18 @@ creation: the agent gets a deployment row to watch and a task row that does
 the work. In `mode: "manual"` the task parks in `awaiting_approval` at creation until
 an agent with `approve_deployments` calls `POST /v1/tasks/:id/approve`.
 
+**Host selection (scheduler).** When `host_id` is omitted or `null`, the
+control plane picks the host itself: online, not draining, advertising the
+required capabilities, with enough CPU/RAM headroom, and permitted by the
+requesting agent's host targeting ACL. The pick runs inside the request's
+database transaction with candidate host rows locked (`SELECT … FOR
+UPDATE`), so eligibility check and reservation (deployment row + port
+allocation) commit atomically — concurrent deploy requests serialize on
+the host row instead of racing on stale utilization snapshots. The
+deployment row always ends up with a concrete `host_id`; when no host is
+eligible the request fails fast with 503 `no_capacity` rather than being
+silently placed on an arbitrary host.
+
 **Secrets delivery.** Project secrets (`POST /v1/projects/:id/secrets`,
 AES-256-GCM at rest, names-only reads) reach the host only when it needs
 them: inside the deploy task's payload over the worker's authenticated
@@ -166,7 +178,11 @@ The **task row is the source of truth**, not the agent's session:
   an actively-reporting worker is never swept. The stuck-task sweeper
   requeues tasks stranded in `claimed`/`running` past their lease
   (`task.requeued`, attempt counted) or fails them when the retry budget is
-  exhausted / the retry policy forbids it (`task.failed`).
+  exhausted / the retry policy forbids it (`task.failed`). The claim
+  deliberately does **not** stamp `assigned_to` — that field is the
+  agent-requested host pin from task creation, not the winner of the
+  claim — so a requeued task is claimable by any capable host even when the
+  original host died mid-task.
 - **Zero-downtime same-version redeploy.** Container names are unique per
   deployment attempt (`uaht-<project>-<version>-<deployment[:8]>`), so
   redeploying a version never stop+rms the live container: it keeps serving
@@ -184,8 +200,10 @@ The **task row is the source of truth**, not the agent's session:
   `result.ports` on completion.
 - Deployment rows carry `status` through the full lifecycle
   (`requested → building → starting → healthcheck → running`, with
-  `failed` / `rolled_back` / `stopped` as terminal branches), so a
-  reconnecting dashboard or agent always sees the current truth.
+  `failed` / `rolled_back` / `rollback_failed` / `stopped` as terminal
+  branches), so a reconnecting dashboard or agent always sees the current
+  truth. `rollback_failed` is a failed rollback persisted honestly rather
+  than recorded as `rolled_back` — terminal, non-routable, GC-eligible.
 - Events are append-only and cursor-paginated (`?since=`, `?cursor=`), so a
   consumer that dropped the SSE stream can backfill exactly what it missed.
 
