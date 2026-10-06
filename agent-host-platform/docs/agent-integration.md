@@ -211,11 +211,13 @@ GET /v1/events/stream                        # SSE: "data: {event}\n\n" per even
                                              # then live-pushes; ": ping" keep-alive every 15s
 ```
 
-Canonical event types — the 46 types the server actually emits
+Canonical event types — the 49 types the server actually emits
 (verified against `control-plane/api/src/routes/` + `lib/` +
 `middleware/` 2026-10-06; PROTOCOL §3.8 is the canonical list):
 
-- Agents: `agent.connected`, `agent.key_rotated`
+- Agents: `agent.connected`, `agent.key_rotated`, `agent.suspended`
+  (operator; key rejected immediately), `agent.resumed` (operator),
+  `agent.revoked` (operator; key hash replaced — permanent)
 - Auth: `auth.failed` (bad provisioning token at a registration gate)
 - Tasks: `task.created`, `task.claimed`, `task.started`, `task.retrying`,
   `task.awaiting_approval`, `task.approved`, `task.rejected`,
