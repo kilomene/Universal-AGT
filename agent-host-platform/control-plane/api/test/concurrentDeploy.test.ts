@@ -46,7 +46,8 @@ function setupDb() {
   db.public.none(`
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
-      permissions JSONB, api_key_hash TEXT NOT NULL,
+      permissions JSONB, api_key_hash TEXT,
+      idempotency_key TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TIMESTAMPTZ DEFAULT now()
     );
@@ -54,6 +55,7 @@ function setupDb() {
       id TEXT PRIMARY KEY, name TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'online',
       token_hash TEXT NOT NULL,
+      idempotency_key TEXT,
       created_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
