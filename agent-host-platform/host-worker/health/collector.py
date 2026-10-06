@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import time
 
-from deployments.manifest import parse_memory_mb
+from deployments.manifest import normalize_resources
 
 # Deployment statuses that hold a resource reservation on this host.
 RESERVING_STATUSES = ("running", "starting", "healthcheck")
@@ -111,17 +111,13 @@ def allocated_resources(deployment_store=None) -> dict:
     for state in states or []:
         if state.get("status") not in RESERVING_STATUSES:
             continue
-        resources = state.get("resources") or {}
-        try:
-            if resources.get("cpu") is not None:
-                cpu += float(resources["cpu"])
-        except (TypeError, ValueError):
-            pass
-        try:
-            if resources.get("memory"):
-                ram_mb += parse_memory_mb(resources["memory"])
-        except (TypeError, ValueError):
-            pass
+        # Part 1B: the single authoritative resource parser — identical rule
+        # to the control-plane scheduler's normalizeResources.
+        normalized = normalize_resources(state.get("resources") or {})
+        if normalized["cpu"] is not None:
+            cpu += normalized["cpu"]
+        if normalized["ram_mb"] is not None:
+            ram_mb += normalized["ram_mb"]
     return {"cpu": round(cpu, 3), "ram_mb": round(ram_mb, 1)}
 
 
