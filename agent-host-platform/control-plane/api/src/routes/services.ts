@@ -11,7 +11,9 @@ import { isUuid, parseLimit } from './_helpers';
 export const servicesRouter = Router();
 
 // Service = a deployment in a lifecycle status, presented in a friendly shape.
-const SERVICE_STATUSES = ['running', 'failed', 'building', 'starting', 'healthcheck', 'stopped', 'stopping'];
+// `superseded` is included: it is a previous generation kept as a rollback
+// target, and hiding it would make rollbacks undiscoverable in the UI.
+const SERVICE_STATUSES = ['running', 'failed', 'building', 'starting', 'healthcheck', 'stopped', 'stopping', 'superseded'];
 
 function toServiceView(row: Record<string, any>) {
   return {
