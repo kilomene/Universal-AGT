@@ -4,7 +4,12 @@ import type { Pool } from 'pg';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
-import { decideIdempotency, deploymentIdempotencyBody } from '../lib/idempotency';
+import {
+  decideIdempotency,
+  deploymentIdempotencyBody,
+  findTaskByIdempotencyKey,
+  taskIdempotencyBody,
+} from '../lib/idempotency';
 import { logger } from '../lib/log';
 import { allocatePort, isValidServicePort, settleRollbackPorts } from '../lib/ports';
 import { selectRollbackTarget } from '../lib/rollback';
@@ -348,21 +353,22 @@ deploymentsRouter.get('/:id', requireAgent, requirePermission('read_status'), as
 
 // POST /v1/deployments/:id/rollback — needs deploy.
 //
-// Redesign (2026-10-05, Phase 3 — see PROTOCOL changelog): the old design
-// INSERTed a new deployment row with the previous version, which violated
-// the unique(project_id, host_id, version) constraint and returned 500.
-// Now no deployment row is created. Instead a NEW TASK (type=rollback,
-// payload {deployment_id, target_deployment_id}) is queued, targeting the
-// last healthy deployment of the same project+host. The worker's rollback
-// handler performs the restore and reports; the control plane emits
-// `deployment.rollback_requested` here and `deployment.rolled_back` on
-// worker completion (see mirrorDeploymentState).
+// Idempotent via an optional `idempotency_key` (§7): rollback is a
+// safely-retryable operation, so a retried request (timeout, client retry,
+// agent retry) with the same key replays the original rollback task
+// instead of queueing a second rollback. Same key + different body -> 409.
 deploymentsRouter.post('/:id/rollback', requireAgent, requirePermission('deploy'), async (req, res, next) => {
   try {
     if (!isUuid(req.params.id)) {
       sendError(res, 400, 'bad_request', 'id must be a UUID');
       return;
     }
+    const { idempotency_key } = req.body ?? {};
+    if (idempotency_key !== undefined && typeof idempotency_key !== 'string') {
+      sendError(res, 400, 'bad_request', 'idempotency_key must be a string');
+      return;
+    }
+    const idemKey = typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null;
     const pool = getPool();
     const { rows } = await pool.query('SELECT * FROM deployments WHERE id = $1', [req.params.id]);
     const current = rows[0];
@@ -387,12 +393,61 @@ deploymentsRouter.post('/:id/rollback', requireAgent, requirePermission('deploy'
       deployment_id: current.id,
       target_deployment_id: prev.id,
     };
-    const taskRows = await pool.query(
-      `INSERT INTO tasks (created_by, assigned_to, type, status, payload)
-       VALUES ($1,$2,'rollback','queued',$3) RETURNING *`,
-      [req.auth!.id, current.host_id, JSON.stringify(taskPayload)],
-    );
-    const task = taskRows.rows[0];
+    const incomingBody = taskIdempotencyBody({ type: 'rollback', payload: taskPayload });
+
+    // Idempotency fast path: same key + equal body -> replay the original
+    // task; same key + different body -> 409.
+    if (idemKey) {
+      const existing = await findTaskByIdempotencyKey(pool, idemKey);
+      if (existing) {
+        const decision = decideIdempotency(
+          { body: taskIdempotencyBody(existing) },
+          incomingBody,
+        );
+        if (decision === 'replay') {
+          const { rows: trows } = await pool.query('SELECT * FROM tasks WHERE id = $1', [
+            existing.id,
+          ]);
+          res.status(200).json({ deployment: current, task: trows[0], idempotent_replay: true });
+          return;
+        }
+        sendError(res, 409, 'conflict', 'idempotency key already used with a different payload');
+        return;
+      }
+    }
+
+    let task: Record<string, any>;
+    try {
+      const taskRows = await pool.query(
+        `INSERT INTO tasks (idempotency_key, created_by, assigned_to, type, status, payload)
+         VALUES ($1,$2,$3,'rollback','queued',$4) RETURNING *`,
+        [idemKey, req.auth!.id, current.host_id, JSON.stringify(taskPayload)],
+      );
+      task = taskRows.rows[0];
+    } catch (err) {
+      // Idempotency race: two rollbacks with the same key passed the
+      // pre-check concurrently — the unique constraint picked the winner.
+      // Re-read and replay/conflict instead of 500.
+      if ((err as { code?: string }).code === '23505' && idemKey) {
+        const existing = await findTaskByIdempotencyKey(pool, idemKey);
+        if (existing) {
+          const decision = decideIdempotency(
+            { body: taskIdempotencyBody(existing) },
+            incomingBody,
+          );
+          if (decision === 'replay') {
+            const { rows: trows } = await pool.query('SELECT * FROM tasks WHERE id = $1', [
+              existing.id,
+            ]);
+            res.status(200).json({ deployment: current, task: trows[0], idempotent_replay: true });
+            return;
+          }
+          sendError(res, 409, 'conflict', 'idempotency key already used with a different payload');
+          return;
+        }
+      }
+      throw err;
+    }
 
     await appendEvent(pool, {
       type: 'deployment.rollback_requested',
