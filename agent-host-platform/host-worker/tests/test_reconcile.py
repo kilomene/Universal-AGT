@@ -16,6 +16,23 @@ class FakeDockerClient:
         self.states = {}       # name -> "running" | "exited"
         self.start_calls = []
         self.run_calls = []
+        self.compose_up_calls = []   # (compose_file, project_name, build)
+        self.compose_projects = {}   # project -> set of container names
+
+    def compose_up(self, compose_file, project_name=None, build=False,
+                   timeout=1200):
+        self.compose_up_calls.append((compose_file, project_name, build))
+        names = self.compose_projects.setdefault(project_name, set())
+        names.add(f"{project_name}-web-1")
+        self.existing.add(f"{project_name}-web-1")
+        self.running.add(f"{project_name}-web-1")
+        self.states[f"{project_name}-web-1"] = "running"
+        return "fake compose up"
+
+    def compose_ps(self, project_name, timeout=60):
+        return [{"Name": n, "State": self.states.get(n, "running"),
+                 "Publishers": []}
+                for n in sorted(self.compose_projects.get(project_name, ()))]
 
     def ps(self, all=False):
         self._ps_all = getattr(self, "_ps_all", None)
@@ -137,17 +154,76 @@ def test_non_running_deployments_are_ignored(tmp_path):
     assert docker.start_calls == [] and docker.run_calls == []
 
 
-def test_compose_project_without_containers_is_reported_not_recreated(tmp_path):
+def _free_port() -> int:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_compose_project_without_containers_is_recreated_from_compose_file(
+        tmp_path):
+    """Spec §8/§20 parity: a compose deployment whose containers are all
+    gone is rebuilt via `compose up` from the compose file recorded at
+    deploy time (it lives under the deployment's own state dir, so it
+    survives a worker restart) — the compose analogue of container
+    recreation, and the same call the rollback path uses."""
     store = DeploymentStore(str(tmp_path))
-    _save(store, "dep-1", container_name=None, compose_project="uaht-web")
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  web:\n    image: x\n")
+    _save(store, "dep-1", container_name=None, compose_project="uaht-web",
+          compose_file=str(compose_file), compose_ports=[_free_port()])
+    docker = FakeDockerClient()  # knows nothing: the stack is gone
+
+    summary = reconcile_mod.reconcile(FakeCtx(store, docker))
+
+    assert summary["reconciled"] == 1
+    assert summary["missing"] == 0
+    assert docker.compose_up_calls == [(str(compose_file), "uaht-web", True)]
+    assert any("recreated via compose up" in a for a in summary["actions"])
+
+
+def test_compose_project_without_containers_or_file_is_reported(tmp_path):
+    """No containers AND no compose file: nothing to rebuild from — honest
+    `missing`, left for the operator (redeploy required)."""
+    store = DeploymentStore(str(tmp_path))
+    _save(store, "dep-1", container_name=None, compose_project="uaht-web",
+          compose_file=str(tmp_path / "gone.yml"))
     docker = FakeDockerClient()
 
     summary = reconcile_mod.reconcile(FakeCtx(store, docker))
 
     assert summary["missing"] == 1
     assert summary["reconciled"] == 0
-    assert docker.run_calls == []
-    assert any("compose" in a for a in summary["actions"])
+    assert docker.compose_up_calls == []
+    assert any("compose file" in a and "missing" in a
+               for a in summary["actions"])
+
+
+def test_compose_recreate_refused_when_port_squatted(tmp_path):
+    """A compose stack is NOT recreated over a port something else now
+    holds — reported missing instead of crashing mid-recreate."""
+    store = DeploymentStore(str(tmp_path))
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  web:\n    image: x\n")
+
+    import socket
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)  # a live listener: the bind probe must fail on it
+    held_port = squatter.getsockname()[1]
+    _save(store, "dep-1", container_name=None, compose_project="uaht-web",
+          compose_file=str(compose_file), compose_ports=[held_port])
+    docker = FakeDockerClient()
+    try:
+        summary = reconcile_mod.reconcile(FakeCtx(store, docker))
+    finally:
+        squatter.close()
+
+    assert summary["missing"] == 1
+    assert summary["reconciled"] == 0
+    assert docker.compose_up_calls == []
 
 
 def test_compose_stopped_containers_are_started(tmp_path):
