@@ -21,6 +21,151 @@
 
 ---
 
+## Follow-up hardening pass (2026-10-06, WS4)
+
+After the §81 pass landed, a follow-up hardening pass (workstreams
+WS1–WS4) fixed the remaining production issues and corrected the docs.
+Code changes were verified against the implementation; **no new local
+test runs were executed by WS4** (the counts below are the suites the
+code workstreams ran against their changes). Nothing was pushed —
+the coordinator pushes once at the end.
+
+### Files changed (code)
+
+- `host-worker/deployments/rollback.py` *(new)* — the single rollback
+  implementation both paths now share.
+- `host-worker/deployments/pipeline.py` — automatic rollback (on
+  healthcheck failure) now calls the unified rollback module instead of
+  its own inline logic; build `context_dir` confined under the artifact
+  extract dir.
+- `host-worker/executor/handlers.py` — explicit `handle_rollback` now
+  calls the unified rollback module; `restart`/`stop`/`start`/`logs`/
+  `status` resolve compose deployments (`compose_project`) to the
+  compose equivalents instead of raising.
+- `host-worker/deployments/gc.py` — garbage collection covers compose
+  generations (`compose down` on collected generations).
+- `host-worker/deployments/reconcile.py` — a compose stack missing at
+  boot is recreated with `compose up` from the persisted `compose_file`
+  (a stack whose compose file is also gone is reported missing, never
+  deleted).
+- `host-worker/docker/client.py` — image-tag flag-like guards
+  (dash-led/empty image values rejected).
+- `host-worker/updater/self_update.py` — the advertised version (a
+  path component of `<work>/updates/<version>`) is validated as a
+  single safe component (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`),
+  closing the path-traversal steering vector.
+- `control-plane/api/src/routes/domains.ts` — the domain HTTPS probe
+  (`probeHttps`) now resolves A+AAAA itself, requires **every**
+  resolved address to be public (fail closed), and pins the validated
+  IP into the TLS connection (custom `lookup`; SNI/Host keep the
+  hostname) — closing the DNS-rebinding window. Informational only,
+  never blocks domain creation.
+- `host-worker/deployments/manifest.py` — manifest-level `volumes`
+  explicitly **rejected** with a clear error (compose is the persistence
+  path; accepted-but-inert would be silently misleading).
+
+### Bugs and security issues fixed
+
+- **Divergent rollback paths.** Automatic and explicit rollback had
+  separate implementations with different guarantees. Now one module:
+  verify-before-destroy on both paths, a **real** health check on the
+  restored target (unhealthy recorded honestly, never assumed), and
+  `POST /v1/deployments/:id/settle-rollback-ports` reconciling port
+  reservations on both paths (a settle failure is recorded, never
+  fatal).
+- **SSRF: probe DNS-rebinding.** The pre-fix probe validated the
+  hostname but connected through the system resolver at dial time, so a
+  rebinding DNS answer could steer the probe at a private address.
+  Fixed: fail-closed all-address validation + IP pinning.
+- **Compose lifecycle parity.** `restart`/`stop`/`start`/`logs`/`status`
+  raised on compose deployments; GC ignored compose generations;
+  reconcile never recreated missing compose stacks. All three fixed.
+- **Docker flag-injection re-audit.** `build.context` now confined to
+  the artifact extract dir; image-tag flag-like guards added.
+- **Self-update version path traversal.** The control-plane-advertised
+  version feeds path components; now validated as a single safe
+  component.
+- **Volumes silently ignored.** Manifest-level `volumes` is now an
+  explicit validation error; PROTOCOL §4 documents the rule and the
+  compose persistence path.
+- **Docs typo.** `agent-guide.md`: `UAGT_*` → `UAHT_*` (repo-wide grep
+  confirms no `UAGT_` references remain in docs).
+
+### Tests added
+
+- `host-worker/tests/test_rollback_unified.py` *(new, 10 tests)* —
+  both rollback paths pinned through the common module: real health
+  check on the restored target (healthy AND unhealthy recorded
+  honestly), port settlement on the automatic path, settle failure
+  recorded not fatal, verify-before-destroy on both paths, GC'd target
+  rebuilt from contract.
+- `control-plane/api/test/securityAuditW16.test.ts` — F3 probe tests
+  extended: fail-closed on any non-public A/AAAA answer, pinned lookup
+  dials the validated public IP (DNS-rebinding defense), redirects
+  still not followed.
+- `host-worker/tests/test_handlers_rollback.py` — updated to cover the
+  unified-module delegation in the explicit rollback path.
+
+### Known limitations (documented honestly)
+
+1. **Compose `environment-update` still raises** (`HandlerError:
+   "deployment has no container to update"`) — the handler recreates a
+   container and a compose deployment has none; rewriting the compose
+   file's `environment:` and re-`up`ing the stack is not implemented.
+   Workaround: redeploy with the new env. Tracked as C11 in
+   `docs/implementation-status.md`.
+2. **Live infrastructure still required** for the Category B items:
+   Supabase non-superuser migration-chain execution (CI applies as
+   superuser); real host/Docker/systemd install + reboot recovery;
+   Cloudflare token + zone + domain for the live tunnel and public-HTTPS
+   tests. The coordinator **does not have the Cloudflare token** — it is
+   the operator's prerequisite (`docs/live-acceptance.md` §1).
+
+### Docs changed (WS4, this addendum's author)
+
+- `README.md` — migrations `001…010` (was `001…007`); new
+  `docs/live-acceptance.md` row in the docs table.
+- `agent-sdk/protocol/PROTOCOL.md` — §4 documents the `volumes`
+  rejection and the compose persistence path.
+- `docs/implementation-status.md` — rollback row (A16) rewritten for
+  the unified implementation; new A36 (compose lifecycle parity);
+  C1 defect marked **RESOLVED** by migration `008` (it was a fixed
+  limitation still listed as unresolved); B9 unblocked on the code
+  side (live proof on real PG still outstanding); new C11
+  (compose `environment-update`); A30 migration chain `001–010`.
+- `docs/architecture.md` — rollback section rewritten for the unified
+  module (replaces the old two-path "Compose rollback" paragraph).
+- `docs/deployment.md` — migration table gains `008`/`009`/`010`;
+  verification query and production checklist corrected to `001–010`.
+- `docs/e2e-live-checklist.md` — migrations `001–010`; canonical
+  `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ZONE_ID` names (were
+  `CF_API_TOKEN`/`CF_ZONE_ID`).
+- `docs/security-audit.md` — 2026-10-06 follow-up note: probe
+  fail-closed all-address validation + IP pinning (DNS-rebinding fix).
+- `docs/live-acceptance.md` *(new)* — the §18 production smoke-test
+  procedure (11 steps against real Ubuntu host + Docker + worker +
+  PostgreSQL/Supabase + Cloudflare + domain), every required env var
+  (`DATABASE_URL`, `UAHT_PROVISIONING_TOKEN`, `CLOUDFLARE_API_TOKEN`,
+  `CLOUDFLARE_ZONE_ID`, `TUNNEL_INGRESS_HOSTNAME`, worker config —
+  placeholders only, no credentials), the §19 final acceptance
+  checklist (control plane / host / deployment / agent resilience /
+  networking), and the known limitations.
+- `docs/agent-guide.md` — `UAGT_*` → `UAHT_*` typo fix.
+- `docs/host-install.md` — reviewed; no changes needed.
+
+### Live-infra prerequisites (unchanged from §10, restated)
+
+1. Supabase project (or any Postgres 14+) — blocks non-superuser
+   chain validation, real contention claims, `LISTEN` shape, sweeper
+   timing.
+2. Persistent Linux host with Docker + systemd — blocks real installer
+   run, Docker lifecycle, reboot recovery, self-update end-to-end.
+3. Cloudflare API token + zone + domain — blocks live tunnel route
+   configuration, public HTTPS, DNS lifecycle. **The operator supplies
+   these; the coordinator has no token.**
+
+---
+
 ## 1. Every file changed (111 files this pass)
 
 ### Database (4)
