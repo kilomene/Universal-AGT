@@ -505,7 +505,9 @@ def test_deploy_compose_single_service_success_registers_ports(
     assert result["status"] == "running"
     assert len(docker.compose_up_calls) == 1
     _file, project, _build = docker.compose_up_calls[0]
-    assert project == "uaht-webapp"
+    # §18: project name carries the project_id suffix so two projects whose
+    # names sanitize identically ("My App" vs "my-app") never share a stack.
+    assert project == "uaht-webapp-proj1"  # project_id "proj-1" -> "proj1"
     state = ctx.deployment_store.load("dep-web")
     assert state["compose_ports"] == [port]
     # W7: declared ports go through the port registry.
