@@ -7,11 +7,13 @@ import type { NextFunction, Request, Response } from 'express';
 import { Router } from 'express';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
+import type { ErrorCode } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { requireAgent, requirePermission } from '../middleware/auth';
 import { authorizeArtifactAccess, authorizeProjectAccess, inList, listAccessibleProjectIds } from '../lib/authz';
-import { validateManifest } from '../lib/manifest';
+import { manifestContractOf, manifestContractsEqual, validateManifest } from '../lib/manifest';
+import { extractManifestFromArchive } from '../lib/artifactManifest';
 import { isUuid } from './_helpers';
 
 export const artifactsRouter = Router();
@@ -267,8 +269,113 @@ export async function uploadArtifactContent(req: Request, res: Response, next: N
       return;
     }
 
+    // Fix #1 follow-up: the scheduler reserves from the manifest registered
+    // at init, so the uploaded tarball's embedded agent.deploy.json must be
+    // proven to describe the same contract BEFORE the artifact is marked
+    // ready. Either direction of disagreement corrupts capacity accounting
+    // (under-reservation over-commits the host; over-reservation strands
+    // phantom capacity). A tarball with no manifest at all cannot be
+    // deployed (the worker requires one), so it is rejected here — fail
+    // fast at upload, not mysteriously at deploy.
+    //
+    // Verification runs while the row is still 'pending': on failure the
+    // row moves to 'failed' (terminal, like the checksum path) and the
+    // bytes are removed, so a half-verified artifact can never be picked
+    // up by a concurrent deployment.
+    const failArtifact = async (code: ErrorCode, message: string, eventType: string, eventPayload: Record<string, unknown>) => {
+      await rm(dest, { force: true });
+      await pool.query(`UPDATE artifacts SET status = 'failed' WHERE id = $1`, [id]);
+      await appendEvent(pool, {
+        type: eventType,
+        actor_type: 'agent',
+        actor_id: req.auth!.name,
+        payload: { artifact_id: id, ...eventPayload },
+      });
+      logger.warn('artifact manifest verification failed', { artifact: id, code });
+      sendError(res, 422, code, message);
+    };
+
+    const projectName = (
+      await pool.query('SELECT name FROM projects WHERE id = $1', [artifact.project_id])
+    ).rows[0]?.name;
+    const extracted = await extractManifestFromArchive(dest);
+    const registeredManifest = artifact.manifest ?? null;
+
+    let manifestToStore: string | null = null;
+    if (extracted.error) {
+      await failArtifact(
+        'unprocessable',
+        `artifact verification failed: ${extracted.error}`,
+        'artifact.manifest_invalid',
+        { reason: extracted.error },
+      );
+      return;
+    }
+
+    if (!extracted.found) {
+      // No agent.deploy.json in the archive. When a manifest was
+      // registered at init, the upload disagrees with it (the registered
+      // contract would describe bytes that carry no manifest) — reject.
+      // When nothing was registered either, preserve the legacy path
+      // (ready, manifest NULL): the worker still fails such a deploy
+      // loudly at deploy time, exactly as before.
+      if (registeredManifest) {
+        await failArtifact(
+          'unprocessable',
+          'artifact verification failed: a manifest was registered at init but the uploaded archive contains no agent.deploy.json at its root',
+          'artifact.manifest_missing',
+          { reason: 'no agent.deploy.json in archive despite registered manifest' },
+        );
+        return;
+      }
+    } else {
+      const tarballErrors = validateManifest(
+        extracted.manifest,
+        typeof projectName === 'string' ? projectName : undefined,
+      );
+      if (tarballErrors.length > 0) {
+        await failArtifact(
+          'unprocessable',
+          `artifact verification failed: the archive's agent.deploy.json is invalid: ${tarballErrors[0]}`,
+          'artifact.manifest_invalid',
+          { reason: tarballErrors[0] },
+        );
+        return;
+      }
+
+      if (registeredManifest) {
+        // Both sides validated — now prove they describe the same contract.
+        if (!manifestContractsEqual(registeredManifest, extracted.manifest)) {
+          const want = manifestContractOf(registeredManifest);
+          const got = manifestContractOf(extracted.manifest);
+          await failArtifact(
+            'unprocessable',
+            'artifact verification failed: the uploaded archive\u2019s agent.deploy.json disagrees with the manifest registered at init ' +
+              `(registered: cpu=${String(want.cpu)} ram_mb=${String(want.ram_mb)} runtime=${want.runtime}; ` +
+              `archive: cpu=${String(got.cpu)} ram_mb=${String(got.ram_mb)} runtime=${got.runtime}); ` +
+              're-upload with a matching manifest',
+            'artifact.manifest_mismatch',
+            {
+              reason: 'init manifest disagrees with archive manifest',
+              registered: { cpu: want.cpu, ram_mb: want.ram_mb, runtime: want.runtime },
+              archive: { cpu: got.cpu, ram_mb: got.ram_mb, runtime: got.runtime },
+            },
+          );
+          return;
+        }
+      } else {
+        // No manifest was registered at init: adopt the tarball's validated
+        // manifest so the scheduler still reserves from the exact
+        // definition the worker will deploy.
+        manifestToStore = JSON.stringify(extracted.manifest);
+      }
+    }
+
     const updated = (
-      await pool.query(`UPDATE artifacts SET status = 'ready' WHERE id = $1 RETURNING *`, [id])
+      await pool.query(
+        `UPDATE artifacts SET status = 'ready', manifest = COALESCE($2, manifest) WHERE id = $1 RETURNING *`,
+        [id, manifestToStore],
+      )
     ).rows[0];
     await appendEvent(pool, {
       type: 'artifact.created',
