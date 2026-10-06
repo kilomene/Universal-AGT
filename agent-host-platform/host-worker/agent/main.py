@@ -271,6 +271,7 @@ def heartbeat_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
     config = ctx.config
     api = ctx.api
     failures = 0
+    heartbeats = 0
     while not stop_event.is_set():
         wait_secs = config.heartbeat_interval
         try:
@@ -301,6 +302,17 @@ def heartbeat_loop(ctx: WorkerContext, stop_event: threading.Event) -> None:
             apply_server_state(ctx, resp)
             LOG.info("heartbeat ok (pending_tasks=%s)",
                      (resp or {}).get("pending_tasks"))
+            heartbeats += 1
+            # §34: bounded log retention — prune old task/deployment logs
+            # every 20th heartbeat (~10 min at the default 30s interval).
+            # prune() never raises; deployment logs are only deleted when
+            # the deployment is gone from the store.
+            if heartbeats % 20 == 0 and ctx.log_store is not None:
+                pruned = ctx.log_store.prune(
+                    deployment_store=ctx.deployment_store, log=LOG.debug)
+                if pruned.get("deleted"):
+                    LOG.info("log retention pruned %d file(s)",
+                             len(pruned["deleted"]))
             try:
                 outcome = self_update.check_and_apply(resp or {}, ctx, log=LOG.info)
                 if outcome == "updated":
