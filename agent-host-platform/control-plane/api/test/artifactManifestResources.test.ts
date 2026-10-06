@@ -654,3 +654,44 @@ describe('PUT /v1/artifacts/:id/content — tarball manifest verification', () =
     expect(up.body.artifact.status).toBe('ready');
   });
 });
+
+describe('PUT /v1/artifacts/:id/content — archive hardening', () => {
+  it('detects the archive format by content, not filename (zip named .tar.gz)', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    const m = manifest({ cpu: 1, memory: '512Mi' });
+    // Build a real zip but name it .tar.gz: the worker sniffs content
+    // (tarfile.is_tarfile), so the control plane must too.
+    const dir = mkdtempSync(join(tmpdir(), 'uaht-zip-'));
+    writeFileSync(join(dir, 'agent.deploy.json'), JSON.stringify(m));
+    const { execFileSync } = await import('child_process');
+    execFileSync('python3', ['-c',
+      `import zipfile; z = zipfile.ZipFile(${JSON.stringify(join(dir, 'sneaky.tar.gz'))}, 'w'); ` +
+      `z.write(${JSON.stringify(join(dir, 'agent.deploy.json'))}, 'agent.deploy.json'); z.close()`]);
+    const tarball = readFileSync(join(dir, 'sneaky.tar.gz'));
+    const artifactId = await initArtifact(agent.token, projectId, tarball, m);
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(200);
+    expect(up.body.artifact.status).toBe('ready');
+  });
+
+  it('an oversized agent.deploy.json is treated as absent (bomb guard)', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    const dir = mkdtempSync(join(tmpdir(), 'uaht-big-'));
+    const { execFileSync } = await import('child_process');
+    execFileSync('python3', ['-c',
+      `import zipfile; z = zipfile.ZipFile(${JSON.stringify(join(dir, 'big.zip'))}, 'w'); ` +
+      `z.writestr('agent.deploy.json', '{"a": "' + 'x' * 2000000 + '"}'); z.close()`]);
+    const tarball = readFileSync(join(dir, 'big.zip'));
+    // Registered manifest + tarball whose manifest exceeds the 1MB cap:
+    // the embedded manifest cannot be verified -> rejected, never adopted.
+    const artifactId = await initArtifact(agent.token, projectId, tarball, manifest({ cpu: 1, memory: '512Mi' }));
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(422);
+    const { rows } = await state.pool.query('SELECT status FROM artifacts WHERE id = $1', [artifactId]);
+    expect(rows[0].status).toBe('failed');
+  });
+});
