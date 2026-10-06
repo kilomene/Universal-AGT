@@ -16,7 +16,7 @@ reboots, real network paths.
   (`001_initial.sql` … `012_rollback_failed_status.sql`; only `001`'s
   `pgcrypto` extension needs an elevated privilege on a fresh database —
   allowlisted on Supabase, enable via Dashboard → Database → Extensions
-  or the SQL editor. Migrations `002`–`012` need only table ownership,
+  or the SQL editor. Migrations `002`–`014` need only table ownership,
   no superuser. Prefer the direct connection (port 5432) or a
   session-mode pooler for the API — the SSE event bus holds a persistent
   `LISTEN uag_events`, which transaction-mode poolers do not support.)
