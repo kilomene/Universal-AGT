@@ -33,7 +33,7 @@ DEFAULT_KEEP = 2
 
 # Statuses whose containers/images may be collected. Anything active —
 # running, starting, healthcheck — is never touched.
-GCABLE_STATUSES = ("superseded", "stopped", "failed", "rolled_back", "removed")
+GCABLE_STATUSES = ("superseded", "stopped", "failed", "rolled_back", "rollback_failed", "removed")
 
 _ACTIVE_STATUSES = ("running", "starting", "healthcheck")
 
