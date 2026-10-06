@@ -195,14 +195,22 @@ async function getDeployment(pool: Pool, id: string) {
 }
 
 /** HTTPS reachability probe. Informational only: any HTTP response (even
- *  4xx/5xx) proves the path resolves through the edge to an origin. */
-async function probeHttps(hostname: string): Promise<{ reachable: boolean; status: number | null }> {
+ *  4xx/5xx) proves the path resolves through the edge to an origin.
+ *
+ *  SECURITY (W16 audit): redirects are NOT followed (`redirect: 'manual'`).
+ *  The probe URL is built from an agent-supplied hostname; following a
+ *  redirect could make the control plane issue a request to an
+ *  attacker-chosen internal URL (SSRF). A 3xx is still recorded as a
+ *  response — the probe only needs to know the name resolves to *something*
+ *  answering.
+ */
+export async function probeHttps(hostname: string): Promise<{ reachable: boolean; status: number | null }> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
     const res = await fetch(`https://${hostname}/`, {
       signal: ctrl.signal,
-      redirect: 'follow',
+      redirect: 'manual',
     });
     try {
       await res.body?.cancel();
