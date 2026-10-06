@@ -27,6 +27,7 @@ function setupDb() {
       size BIGINT NOT NULL DEFAULT 0,
       version TEXT NOT NULL DEFAULT 'v1',
       status TEXT NOT NULL DEFAULT 'pending',
+      manifest JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE TABLE events (
