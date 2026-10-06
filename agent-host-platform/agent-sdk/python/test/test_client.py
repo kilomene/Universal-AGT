@@ -168,6 +168,24 @@ def test_init_artifact_computes_sha256():
         assert body["size"] == len(content)
         assert body["filename"] == "app.tar.gz"
         assert body["version"] == "1.0.0"
+        assert "manifest" not in body
+    finally:
+        os.unlink(path)
+
+
+def test_init_artifact_sends_manifest_when_provided():
+    content = b"hello artifact bytes"
+    with tempfile.NamedTemporaryFile(delete=False) as fh:
+        fh.write(content)
+        path = fh.name
+    try:
+        client, fake = client_with(
+            {"/v1/artifacts/init": lambda: make_response(201, {"artifact": {"id": "a1"}, "upload_url": "/v1/artifacts/a1/content"})}
+        )
+        manifest = {"name": "p1", "runtime": "docker", "resources": {"cpu": 2, "memory": "1Gi"}}
+        client.init_artifact("p1", path, version="1.0.0", manifest=manifest)
+        body = fake.calls[0][2]["json"]
+        assert body["manifest"] == manifest
     finally:
         os.unlink(path)
 
