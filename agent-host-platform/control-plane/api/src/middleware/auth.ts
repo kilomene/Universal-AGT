@@ -165,9 +165,18 @@ export function requirePermission(name: string) {
 // gates agent registration (X-Provisioning-Token header) also gates host
 // bootstrap registration (Authorization: Bearer). The old unprefixed name
 // is gone — see docs/CONFIG.md.
+// 2026-10-06: accept the token from EITHER Authorization: Bearer OR the
+// X-Provisioning-Token header. The documented agent-integration convention is
+// the X-Provisioning-Token header (docs/agent-integration.md); the Bearer
+// form is kept for backward compatibility. Both carry the same credential.
+function provisioningTokenFrom(req: Request): string | null {
+  const header = req.header('x-provisioning-token');
+  if (header && header.length > 0) return header;
+  return parseBearer(req);
+}
 export function provisioningOrDeploy(req: Request, _res: Response, next: NextFunction): void {
   const expected = process.env.UAHT_PROVISIONING_TOKEN;
-  const token = parseBearer(req);
+  const token = provisioningTokenFrom(req);
   if (expected && token && verifyToken(token, sha256Hex(expected))) {
     return next();
   }
@@ -175,7 +184,7 @@ export function provisioningOrDeploy(req: Request, _res: Response, next: NextFun
     return next();
   }
   if (!req.auth && !token) {
-    return next(new HttpError(401, 'unauthorized', 'missing or invalid bearer token'));
+    return next(new HttpError(401, 'unauthorized', 'missing or invalid provisioning credential (X-Provisioning-Token header or bearer token)'));
   }
   return next(new HttpError(403, 'forbidden', 'host registration requires a provisioning token or the deploy permission'));
 }
