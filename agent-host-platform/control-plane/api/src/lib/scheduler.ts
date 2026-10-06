@@ -278,17 +278,23 @@ export interface ProjectDeploymentConstraints {
 }
 
 /**
- * Derive scheduling constraints from a project's validated configuration
- * (agent.deploy.json shape): runtime -> required host capability, plus
- * resources.cpu / resources.memory when the manifest declares them, via
- * the single authoritative parser (Part 1B).
+ * Derive scheduling constraints from an agent.deploy.json manifest shape:
+ * runtime -> required host capability, plus resources.cpu /
+ * resources.memory when the manifest declares them, via the single
+ * authoritative parser (Part 1B).
+ *
+ * Fix #1: the manifest passed here must be the artifact's validated
+ * manifest when the deployment references one — the exact definition the
+ * worker will deploy. Callers fall back to the project's configuration
+ * only when no artifact manifest exists (legacy artifacts).
  */
-export function deploymentConstraintsForProject(project: {
-  runtime?: unknown;
-  configuration?: unknown;
-}): ProjectDeploymentConstraints {
-  const cfg = (project.configuration ?? {}) as Record<string, unknown>;
-  const runtime = typeof project.runtime === 'string' ? project.runtime : 'docker';
+export function deploymentConstraintsForManifest(
+  manifest: unknown,
+  fallbackRuntime?: unknown,
+): ProjectDeploymentConstraints {
+  const cfg = (manifest ?? {}) as Record<string, unknown>;
+  const runtime =
+    typeof cfg.runtime === 'string' ? cfg.runtime : typeof fallbackRuntime === 'string' ? fallbackRuntime : 'docker';
   const runtimeCaps =
     runtime === 'docker-compose' ? ['docker-compose'] : runtime === 'docker' ? ['docker'] : [];
   const extraCaps = Array.isArray(cfg.capabilities)
@@ -297,4 +303,16 @@ export function deploymentConstraintsForProject(project: {
   const requiredCapabilities = [...new Set([...runtimeCaps, ...extraCaps])];
   const { cpu, ram_mb } = normalizeResources(cfg.resources);
   return { requiredCapabilities, requiredCpuCores: cpu, requiredRamMb: ram_mb };
+}
+
+/**
+ * Legacy entry point: constraints from a project's stored configuration.
+ * Prefer deploymentConstraintsForManifest with the artifact's validated
+ * manifest (Fix #1); this remains for the no-artifact/legacy path.
+ */
+export function deploymentConstraintsForProject(project: {
+  runtime?: unknown;
+  configuration?: unknown;
+}): ProjectDeploymentConstraints {
+  return deploymentConstraintsForManifest(project.configuration, project.runtime);
 }
