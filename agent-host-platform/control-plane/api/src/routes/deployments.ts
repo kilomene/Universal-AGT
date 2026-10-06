@@ -13,6 +13,14 @@ import {
 import { logger } from '../lib/log';
 import { allocatePort, isValidServicePort, settleRollbackPorts } from '../lib/ports';
 import { selectRollbackTarget } from '../lib/rollback';
+import {
+  authorizeDeploymentAccess,
+  authorizeHostAccess,
+  authorizeProjectAccess,
+  inList,
+  listAccessibleProjectIds,
+} from '../lib/authz';
+import { deploymentConstraintsForProject, selectHostForDeployment } from '../lib/scheduler';
 import { requireAgent, requireHost, requirePermission } from '../middleware/auth';
 import { isUuid, parseLimit } from './_helpers';
 
@@ -55,19 +63,24 @@ async function resolveIdempotencyReplay(
   const alloc = (
     await pool.query('SELECT port FROM port_allocations WHERE deployment_id = $1', [existing.id])
   ).rows[0];
-  const decision = decideIdempotency(
-    {
-      body: deploymentIdempotencyBody({
-        project_id: existing.project_id,
-        host_id: existing.host_id,
-        version: existing.version,
-        artifact_id: existing.artifact_id,
-        mode: existing.mode,
-        host_port: alloc ? alloc.port : null,
-      }),
-    },
-    incomingBody,
-  );
+  const existingBody = deploymentIdempotencyBody({
+    project_id: existing.project_id,
+    host_id: existing.host_id,
+    version: existing.version,
+    artifact_id: existing.artifact_id,
+    mode: existing.mode,
+    host_port: alloc ? alloc.port : null,
+  }) as Record<string, unknown>;
+  const incoming = (incomingBody ?? {}) as Record<string, unknown>;
+  // §8: host_id:null in the request means "any capable host" — the
+  // scheduler's concrete selection is not a requested parameter, so an
+  // unpinned retry must replay instead of 409-ing against the selected
+  // host. An explicitly pinned host_id is still compared strictly.
+  if (incoming.host_id === null || incoming.host_id === undefined) {
+    delete existingBody.host_id;
+    delete incoming.host_id;
+  }
+  const decision = decideIdempotency({ body: existingBody }, incoming);
   if (decision === 'replay') {
     const task = await latestTaskForDeployment(pool, existing);
     res.status(200).json({ deployment: existing, task, idempotent_replay: true });
@@ -125,17 +138,18 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     }
 
     const pool = getPool();
-    const project = await pool.query('SELECT id, name FROM projects WHERE id = $1', [project_id]);
-    if (!project.rows[0]) {
-      sendError(res, 404, 'not_found', 'project not found');
-      return;
-    }
+    // §10: the agent must have access to the project (owner or ACL member).
+    // This also 404s when the project does not exist.
+    await authorizeProjectAccess(pool, req.auth!.id, project_id);
+    const project = (await pool.query(
+      'SELECT id, name, runtime, configuration FROM projects WHERE id = $1',
+      [project_id],
+    )).rows[0];
+    // §10: an explicitly targeted host needs host-targeting access.
+    let requestedHostId: string | null = null;
     if (host_id) {
-      const host = await pool.query('SELECT id FROM hosts WHERE id = $1', [host_id]);
-      if (!host.rows[0]) {
-        sendError(res, 404, 'not_found', 'host not found');
-        return;
-      }
+      await authorizeHostAccess(pool, req.auth!.id, host_id);
+      requestedHostId = host_id;
     }
     // The worker refuses to deploy an artifact without artifact_checksum in
     // the task payload (verified before any docker call), so the control
@@ -182,10 +196,11 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
 
     const deploymentId = randomUUID();
     const taskStatus = deployMode === 'manual' ? 'awaiting_approval' : 'queued';
+    const constraints = deploymentConstraintsForProject(project);
     const taskPayload: Record<string, unknown> = {
       project_id,
-      project_name: project.rows[0].name, // the worker requires project_name
-      host_id: host_id ?? null,
+      project_name: project.name, // the worker requires project_name
+      host_id: null, // filled with the selected host inside the transaction
       version,
       artifact_id: artifact_id ?? null,
       deployment_id: deploymentId,
@@ -205,6 +220,41 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
     let task: Record<string, any>;
     try {
       await client.query('BEGIN');
+      // §8: host_id omitted -> the control plane selects an eligible host.
+      // §9: the selection runs inside this transaction with the candidate
+      // host rows locked FOR UPDATE, so the eligibility check and the
+      // reservation below are atomic.
+      let selectedHostId = requestedHostId;
+      if (!selectedHostId) {
+        selectedHostId = await selectHostForDeployment(client, {
+          agentId: req.auth!.id,
+          requiredCapabilities: constraints.requiredCapabilities,
+          requiredCpuCores: constraints.requiredCpuCores,
+          requiredRamMb: constraints.requiredRamMb,
+        });
+        if (!selectedHostId) {
+          await client.query('ROLLBACK');
+          sendError(
+            res,
+            503,
+            'no_capacity',
+            'no eligible host is available for this deployment (no online host matches status, capabilities, resources, and access)',
+          );
+          return;
+        }
+      } else {
+        // §9: lock the explicitly requested host row too, so the check and
+        // the deployment-row reservation are atomic for targeted deploys.
+        const h = await client.query('SELECT id FROM hosts WHERE id = $1 FOR UPDATE', [
+          selectedHostId,
+        ]);
+        if (!h.rows[0]) {
+          await client.query('ROLLBACK');
+          sendError(res, 404, 'not_found', 'host not found');
+          return;
+        }
+      }
+      taskPayload.host_id = selectedHostId;
       const depRows = await client.query(
         `INSERT INTO deployments (id, idempotency_key, project_id, host_id, version, artifact_id, mode, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,'requested') RETURNING *`,
@@ -212,7 +262,7 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
           deploymentId,
           typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null,
           project_id,
-          host_id ?? null,
+          selectedHostId,
           version,
           artifact_id ?? null,
           deployMode,
@@ -222,7 +272,7 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
       if (requestedHostPort !== null) {
         // host_id is guaranteed non-null here (validated above).
         try {
-          await allocatePort(client, host_id, requestedHostPort, deploymentId);
+          await allocatePort(client, selectedHostId, requestedHostPort, deploymentId);
         } catch (portErr) {
           await client.query('ROLLBACK');
           if ((portErr as { code?: string }).code === '23505') {
@@ -238,7 +288,7 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
         [
           typeof idempotency_key === 'string' && idempotency_key ? `deploy:${idempotency_key}` : null,
           req.auth!.id,
-          host_id ?? null,
+          selectedHostId,
           taskStatus,
           JSON.stringify(taskPayload),
         ],
@@ -278,15 +328,20 @@ deploymentsRouter.post('/', requireAgent, requirePermission('deploy'), async (re
       actor_id: req.auth!.name,
       task_id: task.id,
       deployment_id: deploymentId,
-      host_id: host_id ?? null,
-      payload: { version, mode: deployMode, host_port: requestedHostPort },
+      host_id: deployment.host_id,
+      payload: {
+        version,
+        mode: deployMode,
+        host_port: requestedHostPort,
+        host_selected: !requestedHostId,
+      },
     });
     await appendEvent(pool, {
       type: 'task.created',
       actor_type: 'agent',
       actor_id: req.auth!.name,
       task_id: task.id,
-      host_id: host_id ?? null,
+      host_id: deployment.host_id,
       payload: { type: 'deploy', mode: deployMode },
     });
     logger.info('deployment requested', { deployment: deploymentId, version });
@@ -303,6 +358,13 @@ deploymentsRouter.get('/', requireAgent, requirePermission('read_status'), async
     const limit = parseLimit(req.query.limit);
     const conds: string[] = [];
     const params: unknown[] = [];
+    // §10: only deployments of projects the agent may access.
+    const accessibleIds = await listAccessibleProjectIds(getPool(), req.auth!.id);
+    if (accessibleIds.length === 0) {
+      res.json({ deployments: [] });
+      return;
+    }
+    conds.push(inList('project_id', accessibleIds, params) as string);
     if (typeof project_id === 'string') {
       if (!isUuid(project_id)) { sendError(res, 400, 'bad_request', 'project_id must be a UUID'); return; }
       params.push(project_id);
@@ -338,12 +400,10 @@ deploymentsRouter.get('/:id', requireAgent, requirePermission('read_status'), as
       return;
     }
     const pool = getPool();
+    // §10: via deployment -> project -> owner/ACL.
+    await authorizeDeploymentAccess(pool, req.auth!.id, req.params.id);
     const { rows } = await pool.query('SELECT * FROM deployments WHERE id = $1', [req.params.id]);
     const deployment = rows[0];
-    if (!deployment) {
-      next(new HttpError(404, 'not_found', 'deployment not found'));
-      return;
-    }
     const task = await latestTaskForDeployment(pool, deployment);
     res.json({ deployment, task });
   } catch (err) {
@@ -370,12 +430,10 @@ deploymentsRouter.post('/:id/rollback', requireAgent, requirePermission('deploy'
     }
     const idemKey = typeof idempotency_key === 'string' && idempotency_key ? idempotency_key : null;
     const pool = getPool();
+    // §10: via deployment -> project -> owner/ACL.
+    await authorizeDeploymentAccess(pool, req.auth!.id, req.params.id);
     const { rows } = await pool.query('SELECT * FROM deployments WHERE id = $1', [req.params.id]);
     const current = rows[0];
-    if (!current) {
-      next(new HttpError(404, 'not_found', 'deployment not found'));
-      return;
-    }
     const candidates = (
       await pool.query(
         `SELECT * FROM deployments
