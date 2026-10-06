@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,33 @@ class DeploymentStore:
     def __init__(self, work_dir: str):
         self.root = Path(work_dir) / "deployments"
         self.root.mkdir(parents=True, exist_ok=True)
+        self._seq_lock = threading.Lock()
+
+    def _next_seq(self) -> int:
+        """Monotonic per-store sequence number for total generation ordering.
+
+        ``created_at`` is second-precision, so rapid successive deployments
+        can tie on it; ties made GC keep/collect arbitrary generations
+        (observed as a CI-only flake: the wrong generation survived GC and a
+        beyond-GC-window rollback unexpectedly succeeded). The seq gives
+        every saved generation a total order independent of clock
+        granularity. Computed under a lock from the on-disk max so separate
+        store instances and worker restarts stay consistent.
+        """
+        with self._seq_lock:
+            max_seq = 0
+            if self.root.exists():
+                for child in self.root.iterdir():
+                    if not child.is_dir():
+                        continue
+                    try:
+                        with open(child / "state.json", encoding="utf-8") as fh:
+                            seq = json.load(fh).get("seq", 0)
+                    except (OSError, ValueError):
+                        continue
+                    if isinstance(seq, int) and seq > max_seq:
+                        max_seq = seq
+            return max_seq + 1
 
     def _state_path(self, deployment_id: str) -> Path:
         return self.root / deployment_id / "state.json"
@@ -35,6 +63,11 @@ class DeploymentStore:
         path = self._state_path(deployment_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         state = dict(state)
+        # First save of a generation gets a monotonic sequence number; later
+        # updates (status changes, env updates) keep the original seq so the
+        # generation's position in the ordering never moves.
+        if "seq" not in state:
+            state["seq"] = self._next_seq()
         state.setdefault("updated_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         tmp = path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -75,7 +108,13 @@ class DeploymentStore:
             state = self.load(child.name)
             if state:
                 states.append(state)
-        states.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+        # Newest first. The seq tiebreaker is load-bearing: created_at is
+        # second-precision, so rapid successive deployments tie on it and a
+        # pure-created_at sort degrades to filesystem order — GC would then
+        # keep/collect arbitrary generations. Legacy states without seq sort
+        # by created_at among themselves (seq defaults to 0).
+        states.sort(key=lambda s: (s.get("created_at", ""), s.get("seq", 0)),
+                    reverse=True)
         return states
 
     def for_project(self, project_id: str) -> list:
