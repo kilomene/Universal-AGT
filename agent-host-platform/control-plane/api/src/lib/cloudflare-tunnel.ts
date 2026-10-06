@@ -156,6 +156,21 @@ export async function setRemoteTunnelIngress(
   for (const rule of current) {
     const name = typeof rule.hostname === 'string' ? rule.hostname.toLowerCase() : null;
     if (name && want.has(name)) {
+      // SECURITY (W16 audit): a remote rule this system never managed must
+      // NEVER be silently overwritten — that would let a domain claim
+      // hijack an operator-managed hostname (traffic steal). `managed`
+      // here is the system's ownership record (the domains table); a
+      // first-time claim is NOT in it (collectDesiredRoutes deliberately
+      // excludes the `extra` hostname), so claiming an externally-routed
+      // name is a 409, not a takeover.
+      if (!managed.has(name)) {
+        throw new HttpError(
+          409,
+          'conflict',
+          `refusing to overwrite tunnel route for ${rule.hostname}: ` +
+            'it is managed outside this system',
+        );
+      }
       next.push({ ...rule, hostname: rule.hostname, service: want.get(name)! });
       handled.add(name);
     } else if (name && managed.has(name)) {
@@ -286,12 +301,19 @@ export async function collectDesiredRoutes(db: DbLike, extra?: DesiredRoute): Pr
   // Hostnames this system owns: every tunnel-mode row that is not removed.
   // A managed hostname absent from `desired` (removed domain, dead
   // deployment) has its remote rule dropped by the reconcile.
+  //
+  // SECURITY (W16 audit): `extra` (a hostname being claimed for the first
+  // time) is deliberately EXCLUDED from `managed` even though its domains
+  // row already exists: ownership for the overwrite check in
+  // setRemoteTunnelIngress must mean "the system routed this name before",
+  // otherwise a fresh claim could take over an operator-managed remote
+  // rule. See the 409 there.
   const owned = await db.query(
     `SELECT DISTINCT lower(hostname) AS hostname FROM domains
      WHERE ingress = 'tunnel' AND status <> 'removed'`,
   );
   const managed = new Set<string>(owned.rows.map((r) => r.hostname as string));
-  if (extra) managed.add(extra.hostname.toLowerCase());
+  if (extra) managed.delete(extra.hostname.toLowerCase());
   return { desired, managed, skipped };
 }
 
