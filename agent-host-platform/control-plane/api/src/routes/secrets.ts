@@ -5,17 +5,13 @@ import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { decryptSecret, encryptSecret } from '../lib/secrets';
 import { requireAgent, requirePermission } from '../middleware/auth';
+import { authorizeProjectAccess } from '../lib/authz';
 import { isUuid } from './_helpers';
 
 export const secretsRouter = Router({ mergeParams: true });
 
 // All three routes require the manage_secrets permission.
 // Plaintext values are encrypted before INSERT and never returned by the API.
-
-async function getProject(pool: ReturnType<typeof getPool>, id: string) {
-  const { rows } = await pool.query('SELECT id FROM projects WHERE id = $1', [id]);
-  return rows[0] ?? null;
-}
 
 // POST /v1/projects/:id/secrets {name, value} — upsert, encrypted at rest.
 secretsRouter.post('/', requireAgent, requirePermission('manage_secrets'), async (req, res, next) => {
@@ -35,10 +31,8 @@ secretsRouter.post('/', requireAgent, requirePermission('manage_secrets'), async
       return;
     }
     const pool = getPool();
-    if (!(await getProject(pool, projectId))) {
-      next(new HttpError(404, 'not_found', 'project not found'));
-      return;
-    }
+    // §10: via secret -> project -> project ACL (also 404s on a missing project).
+    await authorizeProjectAccess(pool, req.auth!.id, projectId);
     let encrypted: Buffer;
     try {
       encrypted = encryptSecret(value);
@@ -77,10 +71,8 @@ secretsRouter.get('/', requireAgent, requirePermission('manage_secrets'), async 
       return;
     }
     const pool = getPool();
-    if (!(await getProject(pool, projectId))) {
-      next(new HttpError(404, 'not_found', 'project not found'));
-      return;
-    }
+    // §10: via secret -> project -> project ACL (also 404s on a missing project).
+    await authorizeProjectAccess(pool, req.auth!.id, projectId);
     const { rows } = await pool.query(
       'SELECT name, created_at, updated_at FROM secrets WHERE project_id = $1 ORDER BY name ASC',
       [projectId],
@@ -100,10 +92,8 @@ secretsRouter.delete('/:name', requireAgent, requirePermission('manage_secrets')
       return;
     }
     const pool = getPool();
-    if (!(await getProject(pool, projectId))) {
-      next(new HttpError(404, 'not_found', 'project not found'));
-      return;
-    }
+    // §10: via secret -> project -> project ACL (also 404s on a missing project).
+    await authorizeProjectAccess(pool, req.auth!.id, projectId);
     const { rowCount } = await pool.query('DELETE FROM secrets WHERE project_id = $1 AND name = $2', [
       projectId,
       req.params.name,
