@@ -1,5 +1,5 @@
 import type { Pool } from 'pg';
-import { appendEvent } from './events';
+import { insertEvent, publishEvent } from './events';
 import { logger } from './log';
 
 // Stale-host sweeper: every HEARTBEAT_SWEEP_INTERVAL_S (default 30s) the
@@ -66,21 +66,36 @@ async function sweepOnce(pool: Pool, cfg: SweeperConfig): Promise<void> {
       cfg.offlineAfterS,
     );
     if (!transition) continue;
-    await pool.query(
-      `UPDATE hosts SET status = $2, updated_at = now() WHERE id = $1`,
-      [host.id, transition],
-    );
-    await appendEvent(pool, {
-      type: transition === 'degraded' ? 'host.degraded' : 'host.offline',
-      actor_type: 'system',
-      actor_id: 'host-sweeper',
-      host_id: host.id,
-      payload: {
-        host_name: host.name,
-        previous_status: host.status,
-        last_seen: host.last_seen,
-      },
-    });
+    // The status flip and its audit event commit atomically: an event row
+    // must never exist for a transition that rolled back (misleading
+    // history), and a transition must never land without its event. The
+    // live-bus publish happens only after the commit.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`UPDATE hosts SET status = $2, updated_at = now() WHERE id = $1`, [
+        host.id,
+        transition,
+      ]);
+      const row = await insertEvent(client, {
+        type: transition === 'degraded' ? 'host.degraded' : 'host.offline',
+        actor_type: 'system',
+        actor_id: 'host-sweeper',
+        host_id: host.id,
+        payload: {
+          host_name: host.name,
+          previous_status: host.status,
+          last_seen: host.last_seen,
+        },
+      });
+      await client.query('COMMIT');
+      publishEvent(row);
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
     logger.info('host marked stale', {
       host: host.name,
       from: host.status,
