@@ -32,6 +32,7 @@ import {
   type TunnelIngressRule,
 } from '../lib/cloudflare-tunnel';
 import { isUuid } from './_helpers';
+import { authorizeDeploymentAccess } from '../lib/authz';
 
 export const domainsRouter = Router();
 
@@ -346,7 +347,18 @@ const DENIED_V6: Array<[string, number]> = [
   ['100::', 64], // discard
   ['2001::', 23], // IETF special purpose (Teredo, etc.)
   ['2001:10::', 28], // ORCHIDv2
+  ['2002::', 16], // 6to4: embeds an arbitrary IPv4 address in bits 16-47,
+  // so 2002:a9fe:a9fe::1 can reach 169.254.169.254 through a relay —
+  // the same SSRF class as the NAT64 ranges above
 ];
+
+/**
+ * Upper 96 bits of the IPv4-mapped prefix ::ffff:0:0/96: the first 80
+ * bits are zero and the next 16 are 0xffff. Testing the upper 96 bits
+ * (not the upper 32) is what makes the final 32 bits the embedded IPv4
+ * address.
+ */
+const IPV4_MAPPED_HIGH96 = 0xffffn;
 
 /**
  * True when `ip` is a public, globally-routable address the probe may dial.
@@ -361,8 +373,12 @@ export function isPublicIpAddress(ip: string): boolean {
   }
   const v6 = parseIpv6(ip);
   if (v6 === null) return false;
-  if ((v6 >> 32n) === 0xffffn) {
+  if ((v6 >> 32n) === IPV4_MAPPED_HIGH96) {
     // ::ffff:0:0/96 — IPv4-mapped: judge the embedded IPv4 address.
+    // The embedded IPv4 is the FINAL 32 bits; this covers every textual
+    // form (dotted ::ffff:10.0.0.1, hex ::ffff:a00:1, uppercase,
+    // full-length) because parseIpv6 normalizes them to the same 128-bit
+    // value before this check runs.
     const embedded = Number(v6 & 0xffffffffn);
     return !DENIED_V4.some(([base, bits]) => inCidrV4(embedded, base, bits));
   }
@@ -1037,6 +1053,8 @@ domainsRouter.post('/', requireAgent, requirePermission('manage_domains'), async
       next(new HttpError(404, 'not_found', 'deployment not found'));
       return;
     }
+    // §10: domain -> deployment -> project -> owner/ACL.
+    await authorizeDeploymentAccess(pool, req.auth!.id, deployment_id);
     if (TERMINAL_DEPLOYMENT.has(dep.status)) {
       next(
         new HttpError(
@@ -1234,6 +1252,8 @@ domainsRouter.get('/', requireAgent, requirePermission('manage_domains'), async 
       next(new HttpError(404, 'not_found', 'deployment not found'));
       return;
     }
+    // §10: domain -> deployment -> project -> owner/ACL.
+    await authorizeDeploymentAccess(pool, req.auth!.id, deploymentId);
     const { rows } = await pool.query(
       `SELECT * FROM domains WHERE deployment_id = $1 AND status <> 'removed' ORDER BY created_at ASC`,
       [deploymentId],
@@ -1263,6 +1283,8 @@ domainsRouter.get('/:hostname', requireAgent, requirePermission('manage_domains'
       next(new HttpError(404, 'not_found', 'hostname is not attached to any deployment'));
       return;
     }
+    // §10: domain -> deployment -> project -> owner/ACL.
+    await authorizeDeploymentAccess(pool, req.auth!.id, row.deployment_id);
     const tunnelHost = process.env.TUNNEL_INGRESS_HOSTNAME ?? null;
     res.json({ domain: publicDomain(row, tunnelHost) });
   } catch (err) {
@@ -1285,6 +1307,8 @@ domainsRouter.delete('/', requireAgent, requirePermission('manage_domains'), asy
       next(new HttpError(404, 'not_found', 'hostname not attached to this deployment'));
       return;
     }
+    // §10: domain -> deployment -> project -> owner/ACL.
+    await authorizeDeploymentAccess(pool, req.auth!.id, deployment_id);
     const removed = await removeDomain(pool, domain.id, req.auth!.name);
     let ingressTaskId: string | null = null;
     if (removed.ingress === 'tunnel') {
