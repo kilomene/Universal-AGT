@@ -57,7 +57,8 @@ function setupDb() {
       id TEXT PRIMARY KEY DEFAULT test_gen_id(),
       name TEXT NOT NULL, type TEXT,
       capabilities JSONB, permissions JSONB,
-      api_key_hash TEXT NOT NULL,
+      api_key_hash TEXT,
+      idempotency_key TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       last_seen TIMESTAMPTZ, metadata JSONB,
       created_at TIMESTAMPTZ DEFAULT now(),
@@ -69,12 +70,17 @@ function setupDb() {
       status TEXT NOT NULL DEFAULT 'online',
       capabilities JSONB, worker_version TEXT,
       token_hash TEXT NOT NULL,
+      idempotency_key TEXT,
       previous_token_hash TEXT, previous_token_expires_at TIMESTAMPTZ,
       cpu_pct DOUBLE PRECISION, ram_pct DOUBLE PRECISION,
       disk_pct DOUBLE PRECISION, docker_status TEXT,
       running_apps JSONB, total_cpu DOUBLE PRECISION,
       total_ram_mb DOUBLE PRECISION, total_disk_gb DOUBLE PRECISION,
       last_seen TIMESTAMPTZ, metadata JSONB,
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      worker_status TEXT,
+      ingress JSONB NOT NULL DEFAULT '{}',
+      reported_host_name TEXT,
       created_at TIMESTAMPTZ DEFAULT now(),
       updated_at TIMESTAMPTZ DEFAULT now()
     );
@@ -1040,5 +1046,96 @@ describe('auth endpoint rate limits', () => {
       body: '{}',
     });
     expect(denied.status).toBe(429);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// auth.failed audit events (W-C): a presented-but-rejected credential at a
+// registration gate emits an auditable event; missing-credential 401s do
+// not. The audit is fire-and-forget, so tests poll for the row.
+// ---------------------------------------------------------------------------
+describe('auth.failed audit events', () => {
+  beforeEach(wipe);
+
+  async function authFailedEvents() {
+    const { rows } = await state.pool.query(
+      `SELECT type, actor_type, payload FROM events WHERE type = 'auth.failed' ORDER BY id ASC`,
+    );
+    return rows;
+  }
+
+  async function waitFor(cond: () => Promise<boolean>, label: string) {
+    const deadline = Date.now() + 3000;
+    for (;;) {
+      if (await cond()) return;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  it('audits a wrong X-Provisioning-Token on agent registration', async () => {
+    process.env.UAHT_PROVISIONING_TOKEN = 'prov-token';
+    const res = await fetch(`${base}/v1/agents/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Provisioning-Token': 'wrong-token-value' },
+      body: JSON.stringify({ name: 'agent-x' }),
+    });
+    expect(res.status).toBe(401);
+    await waitFor(async () => (await authFailedEvents()).length === 1, 'auth.failed row');
+    const [row] = await authFailedEvents();
+    expect(row.actor_type).toBe('anonymous');
+    const payload = row.payload as Record<string, unknown>;
+    expect(payload.endpoint).toBe('POST /v1/agents/register');
+    expect(payload.reason).toBe('bad_provisioning_token');
+    // The credential value itself must never reach the journal.
+    expect(JSON.stringify(payload)).not.toContain('wrong-token-value');
+  });
+
+  it('audits a wrong bearer token on host registration', async () => {
+    process.env.UAHT_PROVISIONING_TOKEN = 'prov-token';
+    const res = await fetch(`${base}/v1/hosts/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer wrong-bearer-value' },
+      body: JSON.stringify({ name: 'host-x' }),
+    });
+    expect(res.status).toBe(403);
+    await waitFor(async () => (await authFailedEvents()).length === 1, 'auth.failed row');
+    const [row] = await authFailedEvents();
+    const payload = row.payload as Record<string, unknown>;
+    expect(payload.endpoint).toBe('POST /v1/hosts/register');
+    expect(payload.reason).toBe('bad_provisioning_token');
+    expect(JSON.stringify(payload)).not.toContain('wrong-bearer-value');
+  });
+
+  it('does NOT audit a missing credential (ordinary unauthorized request)', async () => {
+    process.env.UAHT_PROVISIONING_TOKEN = 'prov-token';
+    const res = await fetch(`${base}/v1/agents/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'agent-x' }),
+    });
+    expect(res.status).toBe(401);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(await authFailedEvents()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request correlation ids (§33 observability)
+// ---------------------------------------------------------------------------
+describe('request correlation ids', () => {
+  it('echoes a well-formed inbound X-Request-Id', async () => {
+    const res = await fetch(`${base}/v1/health`, { headers: { 'X-Request-Id': 'trace-123_abc' } });
+    expect(res.headers.get('x-request-id')).toBe('trace-123_abc');
+  });
+  it('generates a UUID when no id is supplied', async () => {
+    const res = await fetch(`${base}/v1/health`);
+    expect(res.headers.get('x-request-id')).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+  it('refuses a malicious inbound id and generates a fresh one', async () => {
+    const res = await fetch(`${base}/v1/health`, { headers: { 'X-Request-Id': '"><script>alert(1)</script>' } });
+    const id = res.headers.get('x-request-id');
+    expect(id).not.toContain('<');
+    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   });
 });
