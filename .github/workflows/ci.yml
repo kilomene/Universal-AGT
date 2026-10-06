@@ -187,7 +187,7 @@ jobs:
       - run: pip install -r requirements.txt
         working-directory: agent-host-platform/host-worker
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - run: bash scripts/test-install.sh
+      - run: bash agent-host-platform/scripts/test-install.sh
         working-directory: agent-host-platform
 
   python-sdk:
