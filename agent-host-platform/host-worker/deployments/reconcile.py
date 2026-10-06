@@ -19,6 +19,12 @@ is the actual state. For every deployment marked ``running`` locally:
     with no containers at all cannot be recreated without its compose file,
     so it is reported as missing and left for the operator.
 
+After the desired-state pass, containers Docker knows that NO deployment
+state claims are reported as ``unexpected`` — never destroyed. Reconcile
+must not blindly destroy containers; strays (crash-mid-deploy leftovers,
+manually started containers, another tool's work) are surfaced for the
+operator instead.
+
 Every action is logged. The returned summary dict is attached to the next
 heartbeat payload so the control plane sees what the reboot recovered.
 """
@@ -44,6 +50,7 @@ def reconcile(ctx, log=None) -> dict:
         "already_running": 0,
         "missing": 0,      # desired-running but could not be restored
         "skipped": 0,      # not in a reconcilable state
+        "unexpected": [],  # containers in Docker claimed by no deployment
         "actions": [],     # human-readable log of what happened
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -91,6 +98,7 @@ def reconcile(ctx, log=None) -> dict:
                      f"stopped container {name}: {exc}")
         else:
             _recreate_container(ctx, state, summary, note)
+    _report_unexpected(ps_all, store, summary, note)
     return summary
 
 
@@ -100,6 +108,40 @@ def _desired_running(store) -> list:
     except Exception as exc:
         LOG.error("reconcile: could not read deployment store: %s", exc)
         return []
+
+
+def _report_unexpected(ps_all: dict, store, summary: dict, note) -> None:
+    """Report containers Docker knows that no deployment state claims.
+
+    NEVER destroys them: reconcile must not blindly destroy containers.
+    Strays — leftovers of a crash mid-deployment, manually started
+    containers, another tool's work on this host — are surfaced in the
+    summary (which rides the heartbeat to the control plane) for the
+    operator instead.
+    """
+    claimed: set = set()
+    compose_projects: list = []
+    try:
+        states = store.list_all()
+    except Exception as exc:
+        LOG.error("reconcile: could not read deployment store: %s", exc)
+        states = []
+    for state in states or []:
+        name = state.get("container_name")
+        if name:
+            claimed.add(name)
+        project = state.get("compose_project")
+        if project:
+            compose_projects.append(project)
+    for name in sorted(ps_all):
+        if name in claimed:
+            continue
+        if any(_compose_name_matches(p, name) for p in compose_projects):
+            continue
+        state_desc = ps_all[name].get("State") or "?"
+        summary["unexpected"].append({"name": name, "state": state_desc})
+        note(f"unexpected container {name} (state={state_desc}) is not "
+             f"claimed by any deployment; left untouched")
 
 
 def _compose_name_matches(compose_project: str, container_name: str) -> bool:
