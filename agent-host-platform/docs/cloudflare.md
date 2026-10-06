@@ -78,8 +78,11 @@ route to the host's container ports.
 
 ## Mode: cloudflare-tunnel (worker-managed, outbound-only)
 
-The worker supervises `cloudflared tunnel --token <TOKEN> run`. The tunnel
-dials **out** to Cloudflare; no inbound ports are opened on the host.
+The worker supervises `cloudflared tunnel run` with the tunnel token handed
+to the child through the `TUNNEL_TOKEN` environment variable — never on the
+command line (argv is world-readable via `ps`; the child environment is
+only readable by the same UID). The tunnel dials **out** to Cloudflare; no
+inbound ports are opened on the host.
 
 ### Setup — the live-credential step (done once, by the operator)
 
@@ -127,8 +130,15 @@ Domains are first-class rows in the `domains` table (migration
 
 ```
 requested → configuring → active → failed
+                            ↘ degraded → active (recovered) | failed
                           ↘ removing → removed
 ```
+
+An `active` domain whose public route stops verifying is moved to
+`degraded` (event `domain.degraded`); the periodic domain reconciler
+retries degraded rows until they converge back to `active` (event
+`domain.recovered`) or to `failed`. Every reconciler pass that changes
+anything emits a summary event `domain.reconcile`.
 
 `POST /v1/domains` runs the full provisioning flow:
 
