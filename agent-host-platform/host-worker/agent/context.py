@@ -26,6 +26,14 @@ class WorkerContext:
     deployment_store: object  # deployments.state.DeploymentStore
     scrub: Callable[[str], str] = field(default=_identity)
     ingress: object = field(default=None)  # ingress.IngressProvider or None
+    # Server-advertised drain state (§37): set when a heartbeat response
+    # carries host.status == "draining" (operator-set at the control plane,
+    # never auto-flipped server-side); cleared when the operator clears it.
+    # While set, the claim loop pauses NEW claims, heartbeats continue, and
+    # in-flight dispatches finish. A locally configured WORKER_DRAINING=true
+    # (config.draining) is sticky and independent of this latch.
+    draining: threading.Event = field(default_factory=threading.Event,
+                                      repr=False, compare=False)
     # Thread-local scrubber override. The production claim loop dispatches
     # tasks on a ThreadPoolExecutor against ONE shared ctx; a per-task
     # scrubber must therefore be thread-local (see scrub_scope) — swapping
