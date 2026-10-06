@@ -4,6 +4,13 @@ import { logger } from './log';
 
 // Append-only event journal. Rows are INSERTed here and SELECTed by readers;
 // the trg_events_no_update_delete trigger in the schema blocks UPDATE/DELETE.
+//
+// insertEvent performs ONLY the INSERT (it accepts a transaction client so
+// state transitions and their events can commit atomically — see
+// hostSweeper). publishEvent fans the row out to the live bus. appendEvent
+// is the common case: insert + publish in one call. Publish must happen
+// AFTER the surrounding transaction commits, or SSE consumers see phantom
+// events for rolled-back rows.
 
 export interface NewEvent {
   type: string;
@@ -21,8 +28,9 @@ export interface DbEvent extends NewEvent {
   created_at: string;
 }
 
-export async function appendEvent(pool: Pool, e: NewEvent): Promise<DbEvent> {
-  const { rows } = await pool.query(
+/** INSERT the event row. Accepts a Pool or a transaction PoolClient. No live publish. */
+export async function insertEvent(client: Pool | PoolClient, e: NewEvent): Promise<DbEvent> {
+  const { rows } = await client.query(
     `INSERT INTO events (type, actor_type, actor_id, task_id, deployment_id, host_id, payload)
      VALUES ($1,$2,$3,$4,$5,$6,$7)
      RETURNING id, type, actor_type, actor_id, task_id, deployment_id, host_id, payload, created_at`,
@@ -36,8 +44,17 @@ export async function appendEvent(pool: Pool, e: NewEvent): Promise<DbEvent> {
       JSON.stringify(e.payload ?? {}),
     ],
   );
-  const row = rows[0] as DbEvent;
+  return rows[0] as DbEvent;
+}
+
+/** Fan a committed event row out to the live bus. Call only after commit. */
+export function publishEvent(row: DbEvent): void {
   eventBus.emit('event', row);
+}
+
+export async function appendEvent(pool: Pool, e: NewEvent): Promise<DbEvent> {
+  const row = await insertEvent(pool, e);
+  publishEvent(row);
   return row;
 }
 
