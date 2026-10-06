@@ -7,6 +7,12 @@ suites that were runnable locally. There is exactly one status presentation
 in this document: the three categories below. Historical phase notes at the
 bottom are narrative only and carry no competing scores.
 
+**2026-10-06 follow-up (WS4):** doc reality re-audit after the
+rollback/SSRF/volumes/compose/docker/security follow-up fixes — C1
+marked resolved (migration 008), B9/A16/A30 updated, compose lifecycle
+parity added (A36), new C11 (compose `environment-update` limitation),
+obsolete `001…007` migration claims corrected to `001…010`.
+
 **Last verified evidence:**
 - Control-plane API: **400/400** vitest (2026-10-06 final pass: 29→30 files).
 - Host worker: **636/636** pytest, 2 skipped (2026-10-06 final pass).
@@ -53,7 +59,7 @@ hidden gaps.
 | A13 | Manual approval | Task created in `awaiting_approval`; approve→`queued` (+ deployment →`approved`, `deployment.approved` event) / reject→`cancelled`; `approve_deployments` permission; dashboard Approvals panel with dossier + confirmation modals | `e2eFlows` approve/reject semantics, acceptance step 10 |
 | A14 | Port registry | Fixed `host_port` reserved in `port_allocations` (unique per host+port → 409); worker bind-tests at OS level and scans `docker ps` published ports before `docker run`/`compose up` | port registry tests |
 | A15 | Health checks | HTTP `GET http://127.0.0.1:{port}{path}`, exact-200, 2s poll, configurable timeout (default 120s). **Design boundary:** HTTP only — no TCP/process/container check types | exercised over real HTTP in worker E2E |
-| A16 | Rollback | Worker auto-rollback on health-fail (new removed, previous restarted); agent-driven `POST /v1/deployments/:id/rollback` → `type=rollback` task; **verify-before-teardown** + **rebuild-from-contract** when the target is past the `DEPLOY_KEEP_GENERATIONS=2` GC window (fails cleanly with "cannot be restored" while the current deployment keeps serving) | pipeline + `test_rollback_gc_window.py` (2), acceptance steps 8/9 |
+| A16 | Rollback | **Unified implementation** (`host-worker/deployments/rollback.py`) used by BOTH paths: automatic (pipeline health-fail) and explicit (`type=rollback` task). Phases: verify-target before any teardown → restore → **real** health check on the restored target (`health_status` recorded honestly, never assumed) → commit. Container targets restore with `docker start`; compose targets with `compose up` from the persisted compose file (also covers targets past the `DEPLOY_KEEP_GENERATIONS=2` GC window via rebuild-from-contract). `POST /v1/deployments/:id/settle-rollback-ports` reconciles port reservations on both paths (settle failure recorded, never fatal); verify-before-destroy preserved on the explicit path | `test_rollback_unified.py` (10), `test_handlers_rollback.py` (10), `test_rollback_gc_window.py` (2), acceptance steps 8/9 |
 | A17 | Logs | Per-task/deployment logs, 10MiB × 3 rotation, `SecretScrubber` on disk and on control-plane sends. **Documented floor:** values < 4 chars not scrubbed | security tests |
 | A18 | Events journal | Append-only (row trigger blocks UPDATE/DELETE; migration `005` = `REVOKE TRUNCATE ON events FROM PUBLIC`, stops non-owner roles, no superuser needed); 46 event types emitted; SSE with pg LISTEN/NOTIFY + 5s backstop poll + keepalive | 005 migration test, SSE tests |
 | A19 | Secrets | AES-256-GCM at rest (`DATA_ENCRYPTION_KEY`, 64 hex); names-only reads; worker pulls decrypted values via host-token-only endpoint scoped to live work; injected as container env; never in `state.json`, logs, or events. **Documented:** payload-carried secrets live in plaintext in the task row — the encrypted store + worker pull is the preferred path | `secretsRoutes` (11), `secretsCrypto` (9), E2E |
@@ -67,12 +73,13 @@ hidden gaps.
 | A27 | Cloudflare DNS | Idempotent CNAME ensure/delete (proxied, TTL 300), hostname regex, scoped token, graceful `dns_pending` when unconfigured | `cloudflare.test.ts` (mocked fetch, 8) |
 | A28 | Tunnel ingress | `IngressProvider` interface; supervised outbound-only `cloudflared tunnel --token run` (pinned 2026.10.0, SHA-256 verified); loopback-only route targets; remote tunnel configuration is the source of truth (local `config.yml` is a diagnostic mirror); `ingress-sync` task type (18th) | 28 ingress tests |
 | A29 | Domains lifecycle | `domains` table (migration 007): `requested → configuring → active → failed`, `degraded` as live-but-unverified (`active → degraded → active|failed`), `removing → removed`; periodic reconciler re-verifies against the remote tunnel config (`domain.reconcile`/`degraded`/`recovered` events); 409 on duplicate hostname; 422 tunnel-without-hostname | `domains.test.ts` |
-| A30 | Migrations 001–007 | Numbered with no gaps, parse-validated (pglast), schema.sql superset check — all in CI; chain applies cleanly to real PostgreSQL 16 in the CI `e2e` job via `npm run migrate`; runner supports `-- migrate: no-transaction` marker | `migration-validation` + `e2e` CI jobs |
+| A30 | Migrations 001–010 | Numbered with no gaps, parse-validated (pglast), schema.sql superset check — all in CI; chain applies cleanly to real PostgreSQL 16 in the CI `e2e` job via `npm run migrate`; runner supports `-- migrate: no-transaction` marker | `migration-validation` + `e2e` CI jobs |
 | A31 | Dashboard | Hosts/apps/deployments/tasks panels, Approvals dossier + confirmations, service actions (restart/stop/start), SSE live, sessionStorage-only key, 401→re-auth; every dashboard-called endpoint contract-matched against real routes in CI | `check.py` + route-match CI job |
 | A32 | CLI | 19 commands (`hosts apps deploy logs restart stop start status rollback domains tasks events agents projects deployments approve reject cancel secrets`), global `--json`, `UAHT_BASE_URL`/`UAHT_API_KEY` or flags, provisioning-token flag for registration | smoke 20/20 |
 | A33 | JS SDK | 42/42 `node:test`; zero-dep; SSE async generator with `since`; `deploy()` helper; `rotateKey`, `tailLogs`, `getLogs`, `addDomain(..., ingress?)` | local run 2026-10-06 |
 | A34 | Python SDK | Parity with JS (`since` forwarded, `on_event` callback, `rotate_agent_key`, `tail_logs`, `add_domain`); 43/43 locally 2026-10-06 | local run 2026-10-06 |
 | A35 | E2E chains | 6/6 worker E2E (fake control plane over real HTTP + subprocess-backed containers: full chain, agent disappearance, manual gate, broken app, health-fail rollback, multi-app) + 21/21 API flow tests + 12/12 final-acceptance steps | local runs 2026-10-05/06 |
+| A36 | Compose lifecycle parity | `restart`/`stop`/`start`/`logs`/`status` handlers resolve a compose deployment (`compose_project`) to `compose restart/stop/up/logs/ps` equivalents; GC collects old compose generations (`compose down`); boot reconcile recreates a missing compose stack from the persisted `compose_file` (stack with no compose file left is reported missing, never deleted) | handler tests, `test_reconcile.py` |
 
 Provisioning facts preserved: one token (`UAHT_PROVISIONING_TOKEN`), two
 gates — agent registration via `X-Provisioning-Token` header, host
@@ -100,7 +107,7 @@ credentials. Each item maps to `docs/e2e-live-checklist.md`.
 | B6 | Supabase connection shape | The API holds a persistent `LISTEN uag_events`; transaction-mode poolers do not support LISTEN (the 5s backstop poll keeps events flowing, at ~5s SSE latency). Use the direct connection or a session-mode pooler — documented in `docs/deployment.md` §1 | #1 |
 | B7 | Dashboard UI in a real browser | Static checks + dashboard↔route contract matching run in CI; **no functional browser test has ever exercised the UI** | — (manual) |
 | B8 | Sweeper wall-clock timing | Lease expiry / degraded / offline transitions are logic-tested; real timing against wall clock needs the live system | #14 |
-| B9 | Domain reconciler on real PG | The reconciler's `degradeDomain` path writes `status='degraded'` — on real PostgreSQL this is currently **blocked by defect C1** (migration 007's CHECK omits `'degraded'`; pg-mem does not enforce CHECKs). Live validation is gated on the C1 fix | #12 |
+| B9 | Domain reconciler on real PG | The `degraded` CHECK defect (old C1) was fixed by migration `008` (the constraint now allows `'degraded'`), so live validation is no longer gated on a code fix. Still needs live proof on real PostgreSQL: pg-mem does not enforce CHECKs, so the local suites cannot prove the CHECK behaves on the real engine | #12 |
 
 **Sign-off rule:** all 14 checks in `docs/e2e-live-checklist.md` green +
 the local suites + 12-job CI green = every acceptance criterion that can
@@ -116,7 +123,8 @@ work.
 
 | # | Item | Status |
 |---|---|---|
-| C1 | **DEFECT (code, reported — not fixed by WS-J):** migration `007_domains_lifecycle.sql` CHECK constraint on `domains.status` omits `'degraded'`, but `routes/domains.ts` `setDomainStatus` transitions to it on the live reconciler path (`degradeDomain`). On real PostgreSQL the UPDATE fails with a check violation; pg-mem doesn't enforce CHECKs, so all suites stay green. Fix: a follow-up migration adding `'degraded'` to the constraint (or the constraint recreated to match `ALLOWED_TRANSITIONS`). **Blocks B9 and any live tunnel-mode domain degradation.** | needs a code-owning workstream |
+| C1 | ~~DEFECT (code, reported — not fixed by WS-J):~~ **RESOLVED (WS-D, migration 008):** migration `007_domains_lifecycle.sql`'s CHECK on `domains.status` omitted `'degraded'` while `routes/domains.ts` transitions to it on the live reconciler path. Migration `008` drops and re-adds the constraint with `'degraded'` included. Live proof on real PostgreSQL (CHECK enforcement) is still outstanding — see B9. | fixed; pending live proof |
+| C2 | Code-signing for self-update (offline key) | Explicitly future work. Current trust model is documented: "the control plane said so, and the SHA-256 matches" — a compromised control plane can push worker code (accepted orchestrator trust boundary) |
 | C2 | Code-signing for self-update (offline key) | Explicitly future work. Current trust model is documented: "the control plane said so, and the SHA-256 matches" — a compromised control plane can push worker code (accepted orchestrator trust boundary) |
 | C3 | HMAC request signing / replay protection | Explicitly future work, deliberately not invented mid-phase; mitigations in place: TLS-everywhere, rotation endpoints |
 | C4 | Aggregate capacity accounting per host | Not implemented; `environment-update` drops memory/cpus on recreate (documented in `docs/troubleshooting.md`) |
@@ -126,6 +134,7 @@ work.
 | C8 | Quarantine unbounded | Mismatched-artifact quarantine dir has no size cap (minor operational gap) |
 | C9 | Manual-approval notification path | Agents must poll `?status=awaiting_approval`; no push/notification channel |
 | C10 | Python SDK suite: 1 failing test | `test_rotate_host_token_posts_grace_and_adopts_new_token` asserts the literal `"Bearer <redacted>"` while the client correctly sends the real token — test-authoring bug, reported to the coordinator |
+| C11 | `environment-update` on compose deployments | `handle_environment_update` recreates a *container*; a compose deployment has no `container_name`, so the handler raises `HandlerError("deployment has no container to update")`. Rewriting the compose file's `environment:` and re-`up`ing the stack is not implemented. **Workaround:** redeploy with the new env. Applies to compose only — single-container deployments update fine. | not implemented |
 
 Out of scope by design (not work): tunnel-token provisioning and
 dashboard-tunnel public-hostname entries stay human steps; the tunnel
@@ -158,13 +167,17 @@ documented).
 - **W18** — final audit: 7 flow traces + 30-step acceptance (28 pass,
   2 blocked on live infra); post-audit rollback GC-window fix
   (verify-before-teardown + rebuild-from-contract).
-- **WS-J (2026-10-06, this pass)** — docs re-verified against code:
-  event list corrected to the 46 actually emitted (the "41" missed
-  `auth.failed`, `host.worker_outdated`, `domain.degraded`,
-  `domain.recovered`, `domain.reconcile`); permission registry corrected
-  to the 7 enforced names; CI described as 12 jobs; backup/restore
-  procedure documented; Supabase project-level setup documented;
-  `degraded`-status CHECK defect found and reported.
+- **WS-J (2026-10-06)** — docs re-verified against code (same pass as the
+  rewrite above).
+- **WS4 follow-up (2026-10-06)** — rollback unified into
+  `deployments/rollback.py` (real post-restore health check, port
+  settlement on both paths); domain-probe SSRF hardened (fail-closed
+  all-address validation + IP pinning); manifest-level `volumes`
+  rejected; compose lifecycle parity (restart/stop/start/logs/status,
+  GC, boot-reconcile); docker re-audit (context_dir confinement,
+  image-tag flag guards, self-update version traversal); new
+  `docs/live-acceptance.md` (smoke procedure + §19 acceptance
+  checklist); docs corrected (migration chain `001–010`, C1 resolved).
 
 ---
 
