@@ -65,7 +65,9 @@ function legacySchema(db: ReturnType<typeof newDb>) {
       id uuid PRIMARY KEY, name TEXT NOT NULL UNIQUE
     );
     CREATE TABLE hosts (
-      id uuid PRIMARY KEY, name TEXT NOT NULL
+      id uuid PRIMARY KEY, name TEXT NOT NULL,
+      worker_draining BOOLEAN NOT NULL DEFAULT false,
+      total_cpu DOUBLE PRECISION, total_ram_mb DOUBLE PRECISION
     );
     CREATE TABLE projects (
       id uuid PRIMARY KEY, name TEXT NOT NULL UNIQUE,
