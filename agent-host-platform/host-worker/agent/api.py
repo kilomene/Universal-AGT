@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Optional
 
 import requests
@@ -192,6 +193,16 @@ class ControlPlaneClient:
     def download_artifact(self, artifact_id: str, dest_path: str,
                           expected_size: Optional[int] = None) -> str:
         """Stream GET /v1/artifacts/:id/download to dest_path. Returns dest_path."""
+        # §16: artifact_id comes from the task payload (agent-controlled).
+        # makedirs() below runs BEFORE the server's UUID check can 400, so
+        # validate here — "../.." must never steer directory creation
+        # outside the work dir.
+        if (not isinstance(artifact_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}",
+                                    artifact_id)):
+            raise WorkerAPIError(
+                f"refusing to download artifact {artifact_id!r}: invalid "
+                f"artifact_id")
         tmp_path = dest_path + ".part"
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
         get = _transport(f"artifact {artifact_id} download", lambda: self.session.get(
