@@ -17,12 +17,16 @@ inside known sections are ignored as well.
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Optional
 
 RUNTIMES = ("docker", "docker-compose", "static")
 RESTART_POLICIES = ("no", "always", "unless-stopped", "on-failure")
-MEMORY_RE = re.compile(r"^\d+[mMgG]$")
+# W16 audit: digit run capped at 6 — a 5000-digit "memory" passed the old
+# ^\d+$ shape and then blew up int() (Python 3.11+ caps str->int at 4300
+# digits) deep in the deploy pipeline. 999999m/999999g is already absurd.
+MEMORY_RE = re.compile(r"^\d{1,6}[mMgG]$")
 
 
 def _is_num(value: Any) -> bool:
@@ -113,6 +117,13 @@ def validate_manifest(data: Any,
                 errors.append(
                     f"resources.cpu: must be a positive number, got {cpu!r}"
                 )
+            # W16 audit: JSON can carry NaN/Infinity (Python's json accepts
+            # them); both pass _is_num and the <= 0 check but are nonsense
+            # as a CPU reservation. Reject non-finite values explicitly.
+            if isinstance(cpu, float) and not math.isfinite(cpu):
+                errors.append(
+                    f"resources.cpu: must be finite, got {cpu!r}"
+                )
 
     # -- restart ---------------------------------------------------------
     restart = data.get("restart")
@@ -143,5 +154,11 @@ def parse_memory_mb(memory: str) -> int:
     """'256m' -> 256, '1g' -> 1024, '2G' -> 2048. Raises ValueError if invalid."""
     if not isinstance(memory, str) or not MEMORY_RE.match(memory):
         raise ValueError(f"invalid memory spec: {memory!r}")
-    amount = int(memory[:-1])
+    try:
+        amount = int(memory[:-1])
+    except ValueError:
+        # Defensive: the regex above already bounds the digit run, but a
+        # direct caller could pass a hostile string on an interpreter with
+        # different int-conversion limits.
+        raise ValueError(f"invalid memory spec: {memory!r}")
     return amount * 1024 if memory[-1].lower() == "g" else amount
