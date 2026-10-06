@@ -191,6 +191,18 @@ export function apiErrorHandler(
     sendError(res, err.status, err.code, err.message);
     return;
   }
+  // W16 audit: express.json() body-parser failures used to fall through to
+  // the generic 500 below. A malformed JSON body is a client error (400);
+  // a body over the 256kb parser limit is 413 — not an internal failure.
+  const bodyErr = err as { type?: string; status?: number };
+  if (err instanceof SyntaxError && bodyErr.type === 'entity.parse.failed') {
+    sendError(res, 400, 'bad_request', 'malformed JSON body');
+    return;
+  }
+  if (bodyErr.type === 'entity.too.large') {
+    sendError(res, 413, 'payload_too_large', 'request body exceeds the 256kb JSON limit');
+    return;
+  }
   // eslint-disable-next-line no-console
   console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', msg: 'unhandled error', err: String(err) }));
   sendError(res, 500, 'internal', 'internal server error');
