@@ -28,8 +28,11 @@ RESTART_POLICIES = ("no", "always", "unless-stopped", "on-failure")
 
 # `--memory` / `--cpus` shapes accepted by run(). Values that do not match
 # are rejected client-side so a malformed payload fails fast with a clear
-# error instead of a cryptic docker CLI failure.
-_MEMORY_RE = re.compile(r"^\d+(\.\d+)?[bkmgBKMG]$")
+# error instead of a cryptic docker CLI failure. The optional `i` suffix
+# is accepted so every manifest-valid memory value (e.g. "512Mi" from the
+# canonical resource grammar — deployments/manifest.py MEMORY_RE) passes
+# through to Docker, whose own parser understands it.
+_MEMORY_RE = re.compile(r"^\d+(\.\d+)?[bkmgBKMG][iI]?$")
 _CPU_RE = re.compile(r"^\d+(\.\d+)?$")
 _BUILD_ARG_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
