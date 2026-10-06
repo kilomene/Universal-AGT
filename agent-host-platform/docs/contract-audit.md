@@ -1,5 +1,19 @@
 # Contract Conformance Audit (W15, 2026-10-05)
 
+> **Note 2026-10-06 (WS-J):** this is the W15 historical record and stands
+> as written, with one correction: the "41 types" event count it records
+> was under-counted — the server actually emits **46** types (the audit
+> missed `auth.failed`, `host.worker_outdated`, `domain.degraded`,
+> `domain.recovered`, `domain.reconcile`). Current docs (`api.md`,
+> `agent-integration.md`, `implementation-status.md`) list the verified
+> 46; PROTOCOL §3.8 still needs the same sync.
+>
+> **Correction 2026-10-06 (WS-H2):** the PROTOCOL §3.8 sync is now done —
+> the canonical list there is 46 (`auth.failed`, `host.worker_outdated`,
+> `domain.degraded`, `domain.recovered`, `domain.reconcile` added, changelog
+> entry dated 2026-10-06), and the stale "still needs the same sync"
+> notes in `docs/api.md` and `docs/agent-integration.md` are removed.
+
 Scope: spec §51 (API contract audit), §52 (DB contract), §46 (Supabase
 privilege reality). The **code is authoritative** — `control-plane/api/src/routes/*.ts`
 plus `middleware/auth.ts` and `lib/stateMachine.ts` define behavior; PROTOCOL.md,
@@ -177,3 +191,78 @@ elevated-privilege requirements (superuser / service_role).
 | CLI smoke (`test/smoke_help.py`) | 20 help / 29 JSON | 20 help / **31** JSON (+2 new invocations) |
 
 TypeScript compiles clean (`npm run build`); all suites green.
+
+## Addendum — WS-H final hardening pass (2026-10-06, spec §44/45/46/47/48/72/75)
+
+SDK/CLI/dashboard surface only; no wire changes, no control-plane edits.
+
+### SDK parity fixes (both SDKs)
+
+- `registerAgent` / `register_agent` sent `Authorization: Bearer <apiKey>`
+  but the control plane gates `POST /v1/agents/register` on the
+  **`X-Provisioning-Token` header** — registration could never succeed
+  through the SDK in gated mode. Both now accept `provisioningToken` /
+  `provisioning_token` and send the header.
+- Constructor `apiKey` is now **optional** in both SDKs (no `Authorization`
+  header when omitted) — bootstrap/registration flows run before any key
+  exists. Existing keyed callers are unaffected.
+- **New** `registerHost` / `register_host` → `POST /v1/hosts/register`
+  (`{host, host_token}`, shown once; provisioning token via
+  `X-Provisioning-Token` header, or the constructor key when it carries
+  `deploy`).
+- **New** `rotateHostToken` / `rotate_host_token` → `POST
+  /v1/hosts/:id/rotate-token` (`{grace_seconds}` → `{host_token}`); the
+  client adopts the new token on success, mirroring `rotateKey`.
+- Parity tables in both test suites extended (`registerHost`,
+  `rotateHostToken` / `register_host`, `rotate_host_token`); 3 new contract
+  tests per SDK covering the provisioning header, the no-key constructor,
+  and host-token adoption.
+
+### CLI fixes
+
+- `agents register` no longer requires `UAHT_API_KEY` (it never worked —
+  the endpoint needs the provisioning token, not an agent key). New global
+  `--provisioning-token` flag / `UAHT_PROVISIONING_TOKEN` env.
+- New `agents rotate` (own API key rotation).
+- `hosts` gained `register` (provisioning token or deploy key) and `get`
+  actions (was list-only).
+- `tasks` gained `status --task <id>` (was list-only).
+- `domains` gained `get --hostname <h>` (lifecycle row).
+- Smoke test extended: FakeClient stubs for the new methods, 6 new JSON
+  invocations (36 total), `_client` stub accepts the new `require_key`
+  kwarg.
+
+### Dashboard (§46/47)
+
+- New **Domains** panel: deployment picker + lifecycle table (hostname,
+  status, ingress, DNS/tunnel/HTTPS flags, error) from the real
+  `GET /v1/domains?deployment_id=` endpoint, on the 10s refresh cadence.
+- New **Logs** panel: deployment picker + Fetch button mints one real
+  `logs` task (`POST /v1/tasks`) and polls it to terminal, mirroring the
+  CLI `logs` command; Stop cancels the poll. User-triggered, not
+  auto-polled (each fetch is one task).
+- New **endpoint-consistency test** in `dashboard/check.py`: parses the
+  backend route table out of `control-plane/api/src` (router mounts,
+  nested mounts, the direct `app.put` for artifact content) and verifies
+  every frontend call site in `js/app.js` (api/apiWrite/get-helper/PANELS
+  paths/EventSource) against it by method + path, with `:param` segment
+  wildcards on both sides. Fails closed on drift.
+
+### §72 worker polling audit (read-only; worker code owned by WS-B)
+
+- Claim loop long-polls `POST /v1/worker/tasks/claim?wait=` (default 25s,
+  server holds ≤30s, 204 on empty); heartbeat every 30s (`HEARTBEAT_INTERVAL`,
+  min 5s). Consecutive failures back off exponentially 5s → 300s cap with
+  ±25% jitter (`agent/backoff.py`); all waits go through `stop_event.wait`
+  (SIGTERM-responsive). Idle per-host load ≈ 5 req/min against a 600
+  req/min host bucket — no fleet request storm. No changes needed.
+
+### §75 agent-neutrality / no-hardcoded-agent checks
+
+- `grep -rni grok` over the repo: matches only vendored `node_modules`
+  binaries (vitest, mime-db); zero source references.
+- SDKs carry no agent-type special-casing (`type` is an opaque label;
+  auth flows from `permissions` only — see `docs/agent-integration.md` §1).
+- §39: `deploy()` / `createDeployment` return `{deployment, task}` with
+  ids, so an agent can go offline after submitting and track work later;
+  `wait` defaults to false.
