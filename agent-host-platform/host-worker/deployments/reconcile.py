@@ -71,6 +71,13 @@ def reconcile(ctx, log=None) -> dict:
         summary["skipped"] = len(_desired_running(store))
         return summary
 
+    # Spec §6 first: a crash mid-rollback leaves transient rollback
+    # phases behind. Settle those rows BEFORE the desired-state pass so
+    # the pass never resurrects a deployment whose teardown was
+    # deliberate, and never mistakes an interrupted rollback for a
+    # completed one.
+    _reconcile_interrupted_rollbacks(ctx, summary, note)
+
     try:
         ps_all = {row.get("Names", "").lstrip("/"): row
                   for row in docker.ps(all=True)}
@@ -113,6 +120,93 @@ def _desired_running(store) -> list:
     except Exception as exc:
         LOG.error("reconcile: could not read deployment store: %s", exc)
         return []
+
+
+#: Rollback phases that must never survive a worker restart (spec §6):
+#: the worker died mid-rollback while one of these was recorded.
+_TRANSIENT_ROLLBACK_PHASES = ("requested", "restoring", "health-checking")
+
+
+def _rollback_source_live(docker, state: dict) -> bool:
+    """True when a rollback-interrupted deployment still has something
+    on the host (container exists, or compose project has containers)."""
+    name = state.get("container_name")
+    if name:
+        try:
+            return bool(docker.container_exists(name))
+        except Exception:
+            return False
+    project = state.get("compose_project")
+    if project:
+        try:
+            return bool(docker.compose_ps(project))
+        except Exception:
+            return False
+    return False
+
+
+def _reconcile_interrupted_rollbacks(ctx, summary, note) -> None:
+    """Spec §6: a worker crash mid-rollback leaves a transient
+    rollback_status (requested/restoring/health-checking) on the rows it
+    touched. Never auto-complete it and never silently resurrect what the
+    rollback was tearing down:
+
+    * a rollback SOURCE (``rollback_target_deployment_id`` set — its
+      teardown was deliberate): if its container/stack is gone, mark the
+      deployment ``rollback_failed`` (DB must not say "running" while the
+      host runs nothing); if it is still there, keep it ``running``. In
+      both cases the operation is marked failed loudly — the operator
+      retries the rollback or redeploys. The gone-source is excluded
+      from the desired-running rebuild below by its new status.
+    * a rollback TARGET row (no ``rollback_target_deployment_id``): the
+      normal desired-running pass already converges it (start the stopped
+      container / rebuild from contract); just clear the stale marker to
+      ``failed`` loudly.
+    """
+    store = ctx.deployment_store
+    docker = ctx.docker
+    try:
+        states = store.list_all()
+    except Exception as exc:
+        LOG.error("reconcile: could not read deployment store: %s", exc)
+        return
+    for state in states or []:
+        if state.get("rollback_status") not in _TRANSIENT_ROLLBACK_PHASES:
+            continue
+        deployment_id = state.get("deployment_id", "?")
+        project = state.get("project_name", "?")
+        if state.get("rollback_target_deployment_id"):
+            # Rollback source: its teardown was deliberate.
+            if _rollback_source_live(docker, state):
+                note(f"{project} ({deployment_id}): rollback to "
+                     f"{state['rollback_target_deployment_id']} was "
+                     f"interrupted by a restart, but the deployment is "
+                     f"still present — rollback marked failed, retry the "
+                     f"rollback or redeploy")
+            else:
+                state["status"] = "rollback_failed"
+                note(f"{project} ({deployment_id}): rollback to "
+                     f"{state['rollback_target_deployment_id']} was "
+                     f"interrupted by a restart after its teardown — "
+                     f"NOT resurrecting it; marked rollback_failed, "
+                     f"operator must retry the rollback or redeploy")
+            state["rollback_status"] = "failed"
+            state["rollback_error"] = ("worker restarted mid-rollback; "
+                                       "marked failed, retry required")
+        else:
+            # Rollback target: the normal pass below converges it; the
+            # stale marker just records that the operation did not finish.
+            note(f"{project} ({deployment_id}): interrupted rollback "
+                 f"detected (phase {state.get('rollback_status')}); the "
+                 f"normal recovery pass applies, marker cleared to failed")
+            state["rollback_status"] = "failed"
+            state["rollback_error"] = ("worker restarted mid-rollback; "
+                                       "marked failed, retry required")
+        try:
+            store.save(state)
+        except Exception as exc:
+            note(f"could not persist interrupted-rollback marker for "
+                 f"{deployment_id}: {exc}")
 
 
 def _report_unexpected(ps_all: dict, store, summary: dict, note) -> None:
