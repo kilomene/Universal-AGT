@@ -302,22 +302,72 @@ def handle_rollback(ctx, task: dict) -> dict:
     # untouched), then teardown of the current deployment, restore,
     # REAL health check of the target, and state commit — with the
     # target's health_status coming from the health check, never assumed.
+    #
+    # Spec §6: the operation is recorded durably on the current
+    # deployment's row — requested -> succeeded / failed /
+    # partially_reconciled — and a rollback is only reported "rolled_back"
+    # when the target was restored AND verified healthy AND the port
+    # registry settled. Anything less persists rollback_failed, never a
+    # false success.
+    current["rollback_status"] = "requested"
+    current["rollback_target_deployment_id"] = target["deployment_id"]
+    current.pop("rollback_error", None)
+    ctx.deployment_store.save(current)
     try:
         outcome = rollback_mod.perform_rollback(
             ctx, docker, log=log, target=target,
             healthcheck_timeout=int(payload.get("healthcheck_timeout", 60)),
-            before_restore=lambda: _teardown_current(ctx, docker, current))
+            before_restore=lambda: _teardown_current(ctx, docker, current),
+            current=current)
     except rollback_mod.RollbackError as exc:
+        current["rollback_status"] = "failed"
+        current["rollback_error"] = str(exc)[:500]
+        ctx.deployment_store.save(current)
         raise HandlerError(str(exc)) from exc
-    current["status"] = "rolled_back"
-    ctx.deployment_store.save(current)
+    target_healthy = outcome["target_health_status"] != "unhealthy"
     # Spec §3: reconcile the control-plane port registry (release the
     # rolled-back deployment's reservations, re-reserve the target's).
     # Never fails the rollback; a failure is logged and reported via
-    # ports_settled instead of silently claimed.
+    # ports_settled instead of silently claimed. A skipped settle (no
+    # control-plane session — tests/doubles only) is not a failure.
     settle = rollback_mod.settle_rollback_ports(
         ctx, log, current["deployment_id"], outcome["rolled_back_to"])
-    return {"deployment_id": current["deployment_id"], "status": "rolled_back",
+    settle_failed = (not settle["settled"]
+                     and settle.get("reason") != "no control-plane session")
+    if target_healthy and not settle_failed:
+        final_status = "rolled_back"
+        rb_status = "succeeded"
+        rb_error = None
+    elif target_healthy:
+        final_status = "rollback_failed"
+        rb_status = "partially_reconciled"
+        rb_error = (f"target restored and healthy but port-registry settle "
+                    f"failed: {settle.get('reason')}")
+    else:
+        final_status = "rollback_failed"
+        rb_status = "failed"
+        rb_error = (f"target {outcome['rolled_back_to']} restored but its "
+                    f"health check failed (health_status="
+                    f"{outcome['target_health_status']})")
+    current["status"] = final_status
+    current["rollback_status"] = rb_status
+    if rb_error:
+        current["rollback_error"] = rb_error[:500]
+    else:
+        current.pop("rollback_error", None)
+    # Recorded for reconciliation/retry (spec §6): the settle outcome
+    # carries everything needed to re-run the registry reconciliation.
+    current["port_settle"] = {"settled": settle["settled"],
+                              "reason": settle.get("reason")}
+    ctx.deployment_store.save(current)
+    if final_status == "rolled_back":
+        # Spec §4.14: the live deployment changed — refresh the local
+        # ingress route mirror so it stops pointing at the torn-down
+        # deployment (best-effort; the control plane re-points domains
+        # from this task's result).
+        _ingress_after_change(ctx, task_id, outcome["rolled_back_to"])
+    return {"deployment_id": current["deployment_id"], "status": final_status,
+            "rollback_status": rb_status,
             "rolled_back_to": outcome["rolled_back_to"],
             "target_health_status": outcome["target_health_status"],
             "ports_settled": settle["settled"]}
