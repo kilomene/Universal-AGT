@@ -65,12 +65,13 @@ The files: `agent-host-platform/database/migrations/`:
 | 013 | `013_reserved_resources.sql` | Persistent resource reservations: `deployments.reserved_cpu` / `reserved_ram_mb`, snapshotted inside the same transaction that selects the host (no privilege issues) |
 | 014 | `014_artifact_manifest.sql` | `artifacts.manifest` jsonb — the artifact's validated `agent.deploy.json`, stored at init; the scheduler reserves from it instead of `projects.configuration` (no privilege issues) |
 | 015 | `015_superseded_status.sql` | Widens the `deployments.status` CHECK to admit `'superseded'`: the previous deployment of the same project+host when a newer one becomes healthy — releases the resource reservation but stays a rollback target (no privilege issues) |
+| 016 | `016_artifacts_updated_at.sql` | Adds the missing `artifacts.updated_at` column required by the `touch_updated_at()` trigger (migration 001): without it, any artifact UPDATE fails on real PostgreSQL (found by live-DB validation 2026-10-06) |
 
 Verify:
 
 ```sql
 -- in the Supabase SQL editor
-select * from schema_migrations order by name;  -- 001…015 present
+select * from schema_migrations order by name;  -- 001…016 present
 ```
 
 ### Privileged migrations — the safe path
@@ -464,7 +465,7 @@ agent-host hosts   # status online, last_seen fresh
 
 ## 11. Production checklist
 
-- [ ] Postgres (Supabase) with migrations 001–015 applied; 001 (pgcrypto)
+- [ ] Postgres (Supabase) with migrations 001–016 applied; 001 (pgcrypto)
       applied as superuser on a fresh database.
 - [ ] `NODE_ENV=production`, `UAHT_PROVISIONING_TOKEN` set (API refuses to
       boot without it), `DATA_ENCRYPTION_KEY` backed up (64 hex chars).
