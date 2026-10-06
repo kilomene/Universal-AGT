@@ -7,16 +7,29 @@ Layout under <work_dir>/logs/:
 Each file is capped at max_bytes; when appending would exceed the cap the
 current file is rotated to .1 (dropping older rotations). tail() reads the
 last N characters for progress chunks / results.
+
+Bounded retention (spec §34): per-file caps bound each file's SIZE, but
+the FILE COUNT grows without bound — every task leaves its
+tasks/<task_id>.log behind. LogStore.prune() deletes log files older than
+WORKER_LOG_RETENTION_DAYS (default 30); deployment logs are only pruned
+when their deployment is gone from the deployment store, so logs of known
+deployments (active or rollback targets) are kept regardless of age.
 """
 from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024   # 10 MiB per log file
 DEFAULT_ROTATIONS = 3
 DEFAULT_TAIL_CHARS = 200_000
+
+# Task logs older than this are pruned (env-overridable). Deployment logs
+# follow the same window but only for deployments no longer in the store.
+DEFAULT_RETENTION_DAYS = 30
+RETENTION_ENV_VAR = "WORKER_LOG_RETENTION_DAYS"
 
 # task_id / deployment_id come from the control plane; never let them
 # become path components. Anything outside [a-zA-Z0-9_-] is stripped.
@@ -26,6 +39,16 @@ _SAFE_LOG_ID = re.compile(r"[^a-zA-Z0-9_-]+")
 def sanitize_log_id(value: object) -> str:
     """Make a network-derived id safe for use as a log file name."""
     return _SAFE_LOG_ID.sub("", str(value)) or "unknown"
+
+
+def retention_days() -> int:
+    """Log retention window in days. Always >= 1 so a misconfigured env
+    can never wipe today's logs."""
+    try:
+        return max(1, int(os.environ.get(RETENTION_ENV_VAR,
+                                         DEFAULT_RETENTION_DAYS)))
+    except (TypeError, ValueError):
+        return DEFAULT_RETENTION_DAYS
 
 
 class LogStore:
@@ -113,3 +136,77 @@ class LogStore:
             if rot.exists():
                 found.append(rot)
         return found
+
+    # -- retention -------------------------------------------------------
+    def prune(self, max_age_days: int | None = None,
+              deployment_store=None, log=None) -> dict:
+        """Delete log files older than the retention window (spec §34).
+
+        Task logs: deleted when older than ``max_age_days`` — a task's log
+        is only useful while the task is recent; the control plane already
+        received the log chunks via progress reports.
+
+        Deployment logs: deleted only when older than the window AND the
+        deployment is gone from ``deployment_store``. Logs of known
+        deployments (running, stopped, or kept as rollback targets) are
+        never pruned by age. When ``deployment_store`` is None, deployment
+        logs are skipped entirely (active set unknown — fail closed).
+
+        Rotation sets are deleted as a unit: the base .log's mtime decides
+        (rotations are always older than their base by construction).
+
+        Returns {"deleted": [...], "kept": [...], "errors": [...]}; never
+        raises — a prune failure must not break the worker loop.
+        """
+        if max_age_days is None:
+            max_age_days = retention_days()
+        max_age_days = max(1, max_age_days)
+        cutoff = time.time() - max_age_days * 86400
+        summary = {"deleted": [], "kept": [], "errors": []}
+
+        def _note(msg: str) -> None:
+            if log:
+                log(msg)
+
+        known_deployments: set | None = None
+        if deployment_store is not None:
+            try:
+                known_deployments = {
+                    sanitize_log_id(s.get("deployment_id"))
+                    for s in deployment_store.list_all()
+                    if s.get("deployment_id")
+                }
+            except Exception as exc:
+                summary["errors"].append(f"deployment store unreadable: {exc}")
+                known_deployments = None
+
+        for base in sorted(self.tasks_dir.glob("*.log")):
+            self._prune_one(base, cutoff, summary, _note)
+        if known_deployments is None:
+            _note("prune: deployment logs skipped (no deployment store)")
+        else:
+            for base in sorted(self.deployments_dir.glob("*.log")):
+                if base.stem in known_deployments:
+                    continue  # known deployment: keep regardless of age
+                self._prune_one(base, cutoff, summary, _note)
+        return summary
+
+    def _prune_one(self, base: Path, cutoff: float, summary: dict,
+                   note) -> None:
+        """Delete one log's rotation set when its base mtime is past cutoff."""
+        try:
+            mtime = base.stat().st_mtime
+        except OSError as exc:
+            summary["errors"].append(f"{base.name}: {exc}")
+            return
+        if mtime >= cutoff:
+            summary["kept"].append(base.name)
+            return
+        for path in self.read_rotations(base):
+            try:
+                path.unlink()
+                summary["deleted"].append(path.name)
+            except OSError as exc:
+                summary["errors"].append(f"{path.name}: {exc}")
+        note(f"prune: deleted {base.name} (+rotations; "
+             f"older than retention window)")
