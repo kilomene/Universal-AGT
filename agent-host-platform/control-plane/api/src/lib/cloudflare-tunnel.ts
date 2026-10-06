@@ -245,13 +245,14 @@ export async function deploymentHostPort(db: DbLike, deploymentId: string): Prom
   return null;
 }
 
-/** Deployments whose domains must not be routed (dead or dying). */
+/** Deployments whose domains must not be routed (dead, dying, or superseded). */
 export const NON_ROUTABLE_DEPLOYMENT_STATUSES = [
   'failed',
   'rolled_back',
   'rollback_failed',
   'stopped',
   'stopping',
+  'superseded',
 ] as const;
 
 export interface ReconcileResult {
