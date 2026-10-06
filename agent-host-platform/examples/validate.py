@@ -6,7 +6,7 @@ Rules (from agent-host-platform/agent-sdk/protocol/PROTOCOL.md §4):
   - runtime: one of docker | docker-compose | static
   - build.dockerfile (if build is present): must exist relative to the example dir
   - service.port: integer in 1..65535
-  - resources.memory: like "256m" or "1g"  (digits + m/M/g/G)
+  - resources.memory: like "256m", "512Mi", "1g" or "1Gi"  (canonical grammar)
   - resources.cpu: a positive number
   - restart: one of no | always | unless-stopped | on-failure
   - env (if present): object mapping string -> string
@@ -21,7 +21,7 @@ from pathlib import Path
 EXAMPLES_DIR = Path(__file__).resolve().parent
 RUNTIMES = {"docker", "docker-compose", "static"}
 RESTARTS = {"no", "always", "unless-stopped", "on-failure"}
-MEMORY_RE = re.compile(r"^\d+[mMgG]$")
+MEMORY_RE = re.compile(r"^\d{1,6}[mMgG][iI]?$")  # canonical resource grammar (one grammar everywhere)
 
 
 def fail(errors, manifest, msg):
@@ -29,16 +29,11 @@ def fail(errors, manifest, msg):
 
 
 def is_positive_number(v):
+    # Canonical contract: cpu is a JSON number, never a string or bool
+    # (matches the worker's deployments/manifest.py _is_num).
     if isinstance(v, bool):
         return False
-    if isinstance(v, (int, float)):
-        return v > 0
-    if isinstance(v, str):
-        try:
-            return float(v) > 0
-        except ValueError:
-            return False
-    return False
+    return isinstance(v, (int, float)) and v > 0
 
 
 def validate_manifest(path: Path, errors: list) -> None:
@@ -96,7 +91,7 @@ def validate_manifest(path: Path, errors: list) -> None:
     else:
         memory = resources.get("memory")
         if not isinstance(memory, str) or not MEMORY_RE.match(memory):
-            fail(errors, label, f"resources.memory must look like '256m' or '1g', got {memory!r}")
+            fail(errors, label, f"resources.memory must look like '256m', '512Mi' or '1g', got {memory!r}")
         cpu = resources.get("cpu")
         if not is_positive_number(cpu):
             fail(errors, label, f"resources.cpu must be a positive number, got {cpu!r}")
