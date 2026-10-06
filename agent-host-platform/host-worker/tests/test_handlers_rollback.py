@@ -206,9 +206,19 @@ def test_rollback_settle_failure_does_not_fail_rollback(tmp_path):
                         "target_deployment_id": "dep-target"}}
     result = handlers.handle_rollback(ctx, task)  # must not raise
 
-    assert result["status"] == "rolled_back"
+    # Spec §6: the physical restore happened, but the port-registry
+    # settle failed — persist rollback_failed (partially_reconciled),
+    # never a false "rolled_back".
+    assert result["status"] == "rollback_failed"
+    assert result["rollback_status"] == "partially_reconciled"
     assert result["rolled_back_to"] == "dep-target"
     assert result["ports_settled"] is False
+    cur = ctx.deployment_store.load("dep-cur")
+    assert cur["status"] == "rollback_failed"
+    assert cur["rollback_status"] == "partially_reconciled"
+    assert "control plane down" in cur["rollback_error"]
+    assert cur["port_settle"] == {"settled": False,
+                                  "reason": "POST failed: control plane down"}
     # the physical restore still happened
     assert "c-target" in docker.start_calls
     assert any("non-fatal" in line for _, line in ctx.logged)
@@ -315,7 +325,9 @@ def test_rollback_healthchecks_restored_target(tmp_path, monkeypatch):
 
 def test_rollback_reports_unhealthy_target_honestly(tmp_path, monkeypatch):
     """A restored target that fails its healthcheck is still the promoted
-    deployment — but its health is reported as unhealthy, not hidden."""
+    deployment — but its health is reported as unhealthy, not hidden, and
+    the rollback itself is recorded as FAILED (spec §6: persist
+    rollback_failed, never a false "rolled_back")."""
     from health import checker as health_checker
     docker = FakeDocker()
     docker.containers["c-current"] = {"running": True}
@@ -332,7 +344,12 @@ def test_rollback_reports_unhealthy_target_honestly(tmp_path, monkeypatch):
               "payload": {"deployment_id": "dep-cur",
                           "target_deployment_id": "dep-target"}})
 
-    assert result["status"] == "rolled_back"
+    assert result["status"] == "rollback_failed"
+    assert result["rollback_status"] == "failed"
     assert result["target_health_status"] == "unhealthy"
     assert ctx.deployment_store.load("dep-target")["health_status"] == "unhealthy"
+    cur = ctx.deployment_store.load("dep-cur")
+    assert cur["status"] == "rollback_failed"
+    assert cur["rollback_status"] == "failed"
+    assert "health check failed" in cur["rollback_error"]
     assert any("UNHEALTHY" in line for _, line in ctx.logged)
