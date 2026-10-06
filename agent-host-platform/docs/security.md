@@ -305,6 +305,24 @@ a registration gate — never the credential value). Events are
 update endpoint — and are cursor-paginated, so an auditor can replay the
 full history of who did what, when, from which actor.
 
+### Event visibility: global by design
+
+The event journal is **globally visible by design**: any agent holding the
+`read_status` permission can read the full journal (`GET /v1/events`,
+`GET /v1/events/stream`) regardless of project ACLs. There is deliberately
+no per-project / per-host / per-agent filtering — the journal is the one
+shared, tamper-evident audit trail, and partitioning it by ACL would let a
+compromised or curious agent hide activity from other agents' auditors.
+System events, project events, host events, and agent-owned events all
+land in the same stream.
+
+The safety invariant that makes global visibility acceptable is absolute:
+**event payloads must never contain secret material** — no API keys, host
+tokens, secret values, provisioning tokens, or ciphertext. Code review and
+`api/test/eventVisibility.test.ts` enforce this: every event type the
+server emits is audited, and a sentinel-sweep test asserts no known secret
+value ever appears in any event row.
+
 `UPDATE`/`DELETE` are blocked by the `trg_events_no_update_delete` row
 trigger. `TRUNCATE` bypasses row triggers, and PostgreSQL event triggers do
 not support `TRUNCATE` at all (verified on PG 16), so there is no
