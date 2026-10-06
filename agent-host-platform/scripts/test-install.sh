@@ -56,7 +56,14 @@ for pkg in $PACKAGES; do
 done
 
 echo "[test-install] 3. worker import graph covered by installer copy list"
-python3 - "$WORKER_SRC" "$PACKAGES" <<'EOF' || true
+# The python exit code IS the gate here: it exits 1 when a first-party
+# package is imported anywhere in the runtime tree but missing from the
+# installer's copy list. Do NOT append `|| true` — it forces $? to 0 and
+# makes the check below a dead branch (the "all imported packages are
+# installed" pass would print even while MISSING-FROM-INSTALLER is
+# reported). An `if <cmd>` condition is exempt from `set -e`, so a
+# nonzero python exit lands in the else branch instead of aborting.
+if python3 - "$WORKER_SRC" "$PACKAGES" <<'PYEOF'
 import ast, os, sys
 src, packages = sys.argv[1], set(sys.argv[2].split())
 local_pkgs = {d for d in os.listdir(src)
@@ -88,9 +95,12 @@ if missing:
 if extra:
     print("note: installer copies but nothing imports:", " ".join(extra))
 sys.exit(0)
-EOF
-if [ $? -eq 0 ]; then pass "all imported packages are installed (incl. ingress)"; \
-else fail "worker imports packages the installer does not copy"; fi
+PYEOF
+then
+  pass "all imported packages are installed (incl. ingress)"
+else
+  fail "worker imports packages the installer does not copy"
+fi
 
 echo "[test-install] 4. all worker modules byte-compile"
 if python3 -m compileall -q "$WORKER_SRC/agent" "$WORKER_SRC/executor" \
@@ -171,6 +181,99 @@ if grep -q '^requests' "$WORKER_SRC/requirements.txt"; then
   pass "requirements.txt provides requests"
 else
   fail "requirements.txt does not provide requests"
+fi
+
+echo "[test-install] 8. reinstall credential reuse (extract + unit-test)"
+# reuse_existing_credentials() is deliberately self-contained (no log/fail
+# dependency) so it can be extracted from the installer and exercised here
+# without root: a reinstall must keep this machine's host_id/host_token
+# (never mint a duplicate host) and must never blank a stored tunnel token.
+# The extracted function is sourced from a temp file (never embedded in a
+# quoted string — its body contains single quotes).
+REUSE_FN="$(sed -n '/^reuse_existing_credentials() {/,/^}/p' "$INSTALLER")"
+TUNNEL_FN="$(sed -n '/^preserve_tunnel_token() {/,/^}/p' "$INSTALLER")"
+if [ -z "$REUSE_FN" ]; then
+  fail "reuse_existing_credentials() not found in installer"
+elif [ -z "$TUNNEL_FN" ]; then
+  fail "preserve_tunnel_token() not found in installer"
+else
+  pass "reuse_existing_credentials() + preserve_tunnel_token() extracted"
+  REUSE_FN_FILE="$TMP_ROOT/reuse_fn.sh"
+  printf '%s\n%s\n' "$REUSE_FN" "$TUNNEL_FN" > "$REUSE_FN_FILE"
+  export REUSE_FN_FILE
+  REUSE_ENV="$TMP_ROOT/reuse-worker.env"
+  cat > "$REUSE_ENV" <<'REUSEEOF'
+WORKER_CONTROL_PLANE_URL=https://cp.example.com
+WORKER_HOST_NAME=reinstall-host
+WORKER_HOST_TOKEN=stored-token-123
+WORKER_HOST_ID=11111111-2222-3333-4444-555555555555
+WORKER_TUNNEL_TOKEN=stored-tunnel-abc
+REUSEEOF
+  export REUSE_ENV
+  # Scenario A: empty caller vars -> stored id/token reused (no duplicate host).
+  REUSE_OUT_A="$(env UAHT_CONTROL_PLANE_URL=https://cp.example.com bash -c '
+      set -u
+      # shellcheck disable=SC1090
+      source "$REUSE_FN_FILE"
+      reuse_existing_credentials "$REUSE_ENV" >/dev/null 2>&1
+      printf "id=%s token=%s" "$UAHT_HOST_ID" "$UAHT_HOST_TOKEN"
+    ' 2>&1)"
+  if [ "$REUSE_OUT_A" = "id=11111111-2222-3333-4444-555555555555 token=stored-token-123" ]; then
+    pass "reinstall reuses stored host_id/host_token (no duplicate host)"
+  else
+    fail "reinstall reuse produced wrong values: $REUSE_OUT_A"
+  fi
+  # Scenario B: empty UAHT_TUNNEL_TOKEN + stored token -> preserved, never blanked.
+  REUSE_OUT_B="$(env UAHT_TUNNEL_TOKEN="" bash -c '
+      set -u
+      # shellcheck disable=SC1090
+      source "$REUSE_FN_FILE"
+      preserve_tunnel_token "$REUSE_ENV" >/dev/null 2>&1
+      printf "tunnel=%s" "$UAHT_TUNNEL_TOKEN"
+    ' 2>&1)"
+  [ "$REUSE_OUT_B" = "tunnel=stored-tunnel-abc" ] \
+    && pass "stored WORKER_TUNNEL_TOKEN preserved when caller omits it" \
+    || fail "tunnel token not preserved: $REUSE_OUT_B"
+  # Scenario C: explicit UAHT_TUNNEL_TOKEN wins over the stored one.
+  REUSE_OUT_C="$(env UAHT_CONTROL_PLANE_URL=https://cp.example.com \
+    UAHT_TUNNEL_TOKEN=explicit-tunnel-xyz bash -c '
+      set -u
+      # shellcheck disable=SC1090
+      source "$REUSE_FN_FILE"
+      reuse_existing_credentials "$REUSE_ENV" >/dev/null 2>&1
+      printf "tunnel=%s" "$UAHT_TUNNEL_TOKEN"
+    ' 2>&1)"
+  [ "$REUSE_OUT_C" = "tunnel=explicit-tunnel-xyz" ] \
+    && pass "explicit UAHT_TUNNEL_TOKEN is not overwritten by the stored one" \
+    || fail "explicit tunnel token lost: $REUSE_OUT_C"
+  # Scenario D: env file without credentials -> return 1, caller vars untouched.
+  printf '# empty\n' > "$REUSE_ENV.empty"
+  REUSE_OUT_D="$(env UAHT_CONTROL_PLANE_URL=https://cp.example.com bash -c '
+      set -u
+      # shellcheck disable=SC1090
+      source "$REUSE_FN_FILE"
+      UAHT_HOST_ID=""; UAHT_HOST_TOKEN=""
+      if reuse_existing_credentials "$REUSE_ENV.empty" >/dev/null 2>&1; then
+        echo "unexpected-0"
+      else
+        echo "rc1 id=$UAHT_HOST_ID"
+      fi
+    ' 2>&1)"
+  [ "$REUSE_OUT_D" = "rc1 id=" ] \
+    && pass "no stored credentials -> return 1, nothing clobbered" \
+    || fail "unexpected reuse result on empty env: $REUSE_OUT_D"
+  # Scenario E: stored credentials provisioned for a different control plane
+  # -> warn loudly on stderr but still reuse (explicit vars override).
+  REUSE_OUT_E="$(env UAHT_CONTROL_PLANE_URL=https://other-cp.example.com bash -c '
+      set -u
+      # shellcheck disable=SC1090
+      source "$REUSE_FN_FILE"
+      reuse_existing_credentials "$REUSE_ENV" 2>&1
+    ' 2>&1)"
+  case "$REUSE_OUT_E" in
+    *"WARNING: existing credentials"*) pass "control-plane URL mismatch warns loudly" ;;
+    *) fail "no mismatch warning: $REUSE_OUT_E" ;;
+  esac
 fi
 
 echo
