@@ -13,15 +13,19 @@ import {
 import { isUuid } from './_helpers';
 import { secretsRouter } from './secrets';
 import { DEPLOYMENT_MANIFEST_VERSION } from '../lib/versions';
+import { MANIFEST_MEMORY_RE, MANIFEST_RESTART_POLICIES, MANIFEST_RUNTIMES } from '../lib/manifest';
 
 export const projectsRouter = Router();
 
 // Nested secrets routes: /v1/projects/:id/secrets
 projectsRouter.use('/:id/secrets', secretsRouter);
 
-const RUNTIMES = ['docker', 'docker-compose', 'static'];
+const RUNTIMES = [...MANIFEST_RUNTIMES] as string[];
 
 // Minimal agent.deploy.json manifest validation (PROTOCOL §4).
+// Lenient shape (fields optional) — this is project *configuration*, not an
+// artifact manifest. The resource grammar is the single shared one from
+// lib/manifest.ts (Fix #1: one grammar everywhere).
 function validateConfiguration(configuration: unknown, projectName: string): string | null {
   if (typeof configuration !== 'object' || configuration === null || Array.isArray(configuration)) {
     return 'configuration must be an object';
@@ -42,15 +46,15 @@ function validateConfiguration(configuration: unknown, projectName: string): str
   }
   const resources = cfg.resources as Record<string, unknown> | undefined;
   if (resources !== undefined) {
-    if (resources.memory !== undefined && !/^(\d+)(m|g)$/i.test(String(resources.memory))) {
-      return "configuration.resources.memory must look like '256m' or '1g'";
+    if (resources.memory !== undefined && !MANIFEST_MEMORY_RE.test(String(resources.memory))) {
+      return "configuration.resources.memory must look like '256m', '512Mi' or '1g'";
     }
-    if (resources.cpu !== undefined && !(typeof resources.cpu === 'number' && resources.cpu > 0)) {
-      return 'configuration.resources.cpu must be a positive number';
+    if (resources.cpu !== undefined && !(typeof resources.cpu === 'number' && Number.isFinite(resources.cpu) && resources.cpu > 0)) {
+      return 'configuration.resources.cpu must be a positive finite number';
     }
   }
-  if (cfg.restart !== undefined && !['no', 'always', 'unless-stopped', 'on-failure'].includes(cfg.restart as string)) {
-    return "configuration.restart must be one of: no, always, unless-stopped, on-failure";
+  if (cfg.restart !== undefined && !(typeof cfg.restart === 'string' && (MANIFEST_RESTART_POLICIES as readonly string[]).includes(cfg.restart))) {
+    return `configuration.restart must be one of: ${MANIFEST_RESTART_POLICIES.join(', ')}`;
   }
   // §61: the deployment manifest schema carries a meaningful version. It is
   // optional (older manifests predate it) but when present it must be a
