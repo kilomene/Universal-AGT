@@ -1,20 +1,76 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
+import type { Pool } from 'pg';
 import { getPool } from '../db/pool';
 import { sendError, HttpError } from '../lib/errors';
 import { appendEvent } from '../lib/events';
 import { logger } from '../lib/log';
 import { generateHostToken } from '../lib/tokens';
+import { MIN_WORKER_VERSION, isSupportedWorkerVersion } from '../lib/versions';
 import { provisioningOrDeploy, requireAgent, requireHost, requirePermission } from '../middleware/auth';
 import { rotationRateLimit } from '../middleware/rateLimit';
+import { decideIdempotency } from '../lib/idempotency';
 import { publicHost } from './_helpers';
 
 export const hostsRouter = Router();
 
+// Columns returned for a freshly registered / replayed host (public shape).
+const HOST_PUBLIC_COLUMNS = `id, name, host_type, status, capabilities, worker_version,
+  cpu_pct, ram_pct, disk_pct, docker_status, running_apps,
+  total_cpu, total_ram_mb, total_disk_gb, last_seen, metadata,
+  created_at, updated_at`;
+
+// §7 registration idempotency: a retried POST /v1/hosts/register carrying the
+// same idempotency_key and equal parameters replays instead of 409ing. The
+// original token is unrecoverable (only its hash is stored), so a replay mints
+// a FRESH token through the rotation path (300s grace covers the
+// spurious-retry race) and returns it — the retrying client recovers working
+// credentials instead of a dead 409. Returns true when the response was sent.
+async function replayHostRegistration(
+  req: Request, res: Response, pool: Pool,
+  idemKey: string, regBody: { name: string; host_type: string; capabilities: unknown },
+): Promise<boolean> {
+  const { rows } = await pool.query(
+    'SELECT id, name, host_type, capabilities FROM hosts WHERE idempotency_key = $1',
+    [idemKey],
+  );
+  const row = rows[0];
+  if (!row) return false;
+  const decision = decideIdempotency(
+    { body: { name: row.name, host_type: row.host_type, capabilities: row.capabilities ?? [] } },
+    regBody,
+  );
+  if (decision === 'conflict') {
+    sendError(res, 409, 'conflict', 'idempotency_key was already used with different registration parameters');
+    return true;
+  }
+  const { token, hash } = generateHostToken();
+  await pool.query(
+    `UPDATE hosts
+       SET previous_token_hash = token_hash,
+           previous_token_expires_at = now() + interval '300 seconds',
+           token_hash = $2, updated_at = now()
+     WHERE id = $1`,
+    [row.id, hash],
+  );
+  await appendEvent(pool, {
+    type: 'host.token_rotated',
+    actor_type: req.auth?.kind ?? 'system',
+    actor_id: req.auth?.name ?? null,
+    host_id: row.id as string,
+    payload: { grace_seconds: 300, reason: 'registration_idempotency_replay' },
+  });
+  const hr = await pool.query(`SELECT ${HOST_PUBLIC_COLUMNS} FROM hosts WHERE id = $1`, [row.id]);
+  logger.info('host registration replayed via idempotency key', { name: row.name });
+  res.status(200).json({ host: publicHost(hr.rows[0]), host_token: token, idempotent_replay: true });
+  return true;
+}
+
 // POST /v1/hosts/register — provisioning token OR agent with deploy permission
 // (see provisioningOrDeploy; choice documented in README).
+// Accepts an optional idempotency_key (§7): same key + equal params replays.
 hostsRouter.post('/register', provisioningOrDeploy, async (req, res, next) => {
   try {
-    const { name, host_type, capabilities, worker_version } = req.body ?? {};
+    const { name, host_type, capabilities, worker_version, idempotency_key } = req.body ?? {};
     if (typeof name !== 'string' || !name.trim()) {
       sendError(res, 400, 'bad_request', 'name is required');
       return;
@@ -23,22 +79,49 @@ hostsRouter.post('/register', provisioningOrDeploy, async (req, res, next) => {
       sendError(res, 400, 'bad_request', 'capabilities must be an array');
       return;
     }
+    // §61: a worker that positively identifies as older than the minimum
+    // supported release is rejected here — incompatible versions never
+    // silently interoperate. Missing/unparseable versions stay accepted
+    // (legacy and custom builds) and visible in the hosts table.
+    if (typeof worker_version === 'string' && !isSupportedWorkerVersion(worker_version)) {
+      sendError(
+        res,
+        426,
+        'worker_outdated',
+        `worker version ${worker_version} is not supported by this control plane ` +
+          `(minimum supported worker version is ${MIN_WORKER_VERSION}); upgrade the host worker and re-register`,
+      );
+      return;
+    }
     const pool = getPool();
+    // §7: optional idempotency key for safe client retries (lost responses).
+    let idemKey: string | null = null;
+    if (idempotency_key !== undefined) {
+      if (typeof idempotency_key !== 'string' || !idempotency_key.trim() || idempotency_key.length > 128) {
+        sendError(res, 400, 'bad_request', 'idempotency_key must be a non-empty string of at most 128 characters');
+        return;
+      }
+      idemKey = idempotency_key.trim();
+    }
+    const regBody = {
+      name: name.trim(),
+      host_type: typeof host_type === 'string' && host_type ? host_type : 'persistent-linux-host',
+      capabilities: capabilities ?? [],
+    };
+    if (idemKey && (await replayHostRegistration(req, res, pool, idemKey, regBody))) return;
     const { token, hash } = generateHostToken();
     try {
       const { rows } = await pool.query(
-        `INSERT INTO hosts (name, host_type, capabilities, worker_version, token_hash)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, name, host_type, status, capabilities, worker_version,
-                   cpu_pct, ram_pct, disk_pct, docker_status, running_apps,
-                   total_cpu, total_ram_mb, total_disk_gb, last_seen, metadata,
-                   created_at, updated_at`,
+        `INSERT INTO hosts (name, host_type, capabilities, worker_version, token_hash, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING ${HOST_PUBLIC_COLUMNS}`,
         [
-          name.trim(),
-          typeof host_type === 'string' && host_type ? host_type : 'persistent-linux-host',
-          JSON.stringify(capabilities ?? []),
+          regBody.name,
+          regBody.host_type,
+          JSON.stringify(regBody.capabilities),
           typeof worker_version === 'string' ? worker_version : null,
           hash,
+          idemKey,
         ],
       );
       const host = publicHost(rows[0]);
@@ -53,6 +136,7 @@ hostsRouter.post('/register', provisioningOrDeploy, async (req, res, next) => {
       res.status(201).json({ host, host_token: token });
     } catch (err: unknown) {
       if ((err as { code?: string }).code === '23505') {
+        if (idemKey && (await replayHostRegistration(req, res, pool, idemKey, regBody))) return;
         sendError(res, 409, 'conflict', `host name '${name.trim()}' already exists`);
         return;
       }
