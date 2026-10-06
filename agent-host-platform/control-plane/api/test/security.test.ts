@@ -870,6 +870,34 @@ describe('permission matrix', () => {
     });
     expect(res.status).toBe(403);
   });
+  it('host registration accepts the provisioning token via X-Provisioning-Token header or Bearer', async () => {
+    // 2026-10-06: the documented agent-integration convention is the
+    // X-Provisioning-Token header (docs/agent-integration.md); the Bearer
+    // form is kept for backward compatibility. Both must work — the CI E2E
+    // smoke test uses the header form for host registration.
+    process.env.UAHT_PROVISIONING_TOKEN = 'prov-token';
+    let res = await fetch(`${base}/v1/hosts/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Provisioning-Token': 'prov-token' },
+      body: JSON.stringify({ name: 'h-header' }),
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json()).host_token).toMatch(/^uagh_/);
+    res = await fetch(`${base}/v1/hosts/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer prov-token' },
+      body: JSON.stringify({ name: 'h-bearer' }),
+    });
+    expect(res.status).toBe(201);
+    // wrong token in either slot is rejected
+    res = await fetch(`${base}/v1/hosts/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Provisioning-Token': 'wrong' },
+      body: JSON.stringify({ name: 'h-bad' }),
+    });
+    expect(res.status).toBe(403);
+    delete process.env.UAHT_PROVISIONING_TOKEN;
+  });
 });
 
 // ---------------------------------------------------------------------------
