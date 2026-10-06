@@ -134,6 +134,7 @@ class FakeControlPlane:
         self.projects = {}     # id -> dict(id, name, secrets)
         self.events = []       # list of dicts, append-only, in order
         self.task_logs = {}    # task_id -> [log chunks]
+        self.settle_calls = []  # POST settle-rollback-ports calls
         self._ids = 0
         self._server = None
         self._thread = None
@@ -252,6 +253,9 @@ class _PlaneHandler(BaseHTTPRequestHandler):
                 return self._approve(path.split("/")[5], True)
             if path.startswith("/v1/test/agent/tasks/") and path.endswith("/reject"):
                 return self._approve(path.split("/")[5], False)
+            if path.startswith("/v1/deployments/") and path.endswith(
+                    "/settle-rollback-ports"):
+                return self._settle_rollback_ports(path.split("/")[3])
             self._send_json(404, {"error": {"code": "not_found", "message": path}})
         except _HttpError as exc:
             self._send_json(exc.code, {"error": {"code": exc.errcode, "message": exc.message}})
@@ -358,6 +362,33 @@ class _PlaneHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             time.sleep(0.1)
+
+    def _settle_rollback_ports(self, dep_id):
+        """Mirror of the real control plane's POST
+        /v1/deployments/:id/settle-rollback-ports (control-plane/api/src/
+        routes/deployments.ts): releases the rolled-back deployment's
+        port reservations and re-reserves the rollback target's host
+        ports. The fake keeps no port registry, so it validates the ids,
+        records the call, and returns the success shape the worker
+        expects."""
+        host = self._host_for(self._bearer())
+        if host is None:
+            raise _HttpError(401, "unauthorized", "bad host token")
+        plane = self.plane
+        body = self._read_json()
+        target_id = (body or {}).get("target_deployment_id")
+        if not target_id:
+            raise _HttpError(400, "bad_request",
+                             "target_deployment_id is required")
+        with plane.lock:
+            if dep_id not in plane.deployments:
+                raise _HttpError(404, "not_found", "deployment not found")
+            if target_id not in plane.deployments:
+                raise _HttpError(404, "not_found",
+                                 "target deployment not found")
+            plane.settle_calls.append({"deployment_id": dep_id,
+                                       "target_deployment_id": target_id})
+        self._send_json(200, {"released": 1, "restored": 1, "skipped": 0})
 
     def _progress(self, task_id):
         host = self._host_for(self._bearer())
@@ -1462,6 +1493,10 @@ def test_health_fail_rollback(plane, rig, agent, tmp_path):
     # Worker-side state: v2 rolled back, v1 running again.
     assert rig.ctx.deployment_store.load(dep2["id"])["status"] == "rolled_back"
     assert rig.ctx.deployment_store.load(dep1["id"])["status"] == "running"
+    # Port-registry reconciliation: the worker settled with the control
+    # plane (released v2's reservation, re-reserved v1's).
+    assert {"deployment_id": dep2["id"],
+            "target_deployment_id": dep1["id"]} in plane.settle_calls
     # Control-plane side: task failed, deployment failed, events recorded.
     assert agent.get_task(task2["id"])["status"] == "failed"
     assert agent.get_deployment(dep2["id"])["status"] == "failed"
