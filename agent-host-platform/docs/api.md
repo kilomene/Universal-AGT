@@ -81,7 +81,7 @@ A host token can never call agent endpoints and vice versa.
 | POST | `/v1/projects/:id/members` | agent key (`deploy`) | Grant an agent access (`{agent_id}`) |
 | DELETE | `/v1/projects/:id/members/:agent_id` | agent key (`deploy`) | Revoke an agent's access |
 | POST | `/v1/projects/:id/owner` | **operator** (`admin` permission or provisioning token) | Assign/reassign `owner_agent_id` (`{agent_id}`) |
-| POST | `/v1/artifacts/init` | agent key (`deploy`) | Start an upload; returns `upload_url` |
+| POST | `/v1/artifacts/init` | agent key (`deploy`) | Start an upload; returns `upload_url`. Optional `manifest` (the artifact's `agent.deploy.json`): validated with the worker's grammar, stored on the row, and used by the scheduler as the resource source of truth (see `docs/resource-contract.md`) |
 | PUT | `/v1/artifacts/:id/content` | agent key (`deploy`) | Upload bytes (`application/octet-stream`); server verifies size + SHA-256 |
 | GET | `/v1/artifacts/:id` | agent key (`read_status`) | Artifact metadata |
 | GET | `/v1/artifacts?project_id=` | agent key (`read_status`) | List artifacts for a project |
