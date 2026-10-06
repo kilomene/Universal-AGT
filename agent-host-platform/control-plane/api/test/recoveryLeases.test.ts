@@ -9,6 +9,8 @@
 // so claims are simulated with the same UPDATE the route performs — the
 // same sanctioned approach as test/e2eFlows.test.ts. Everything else
 // (sweeper, progress ownership check, state machine) is the real route.
+// A structural test below runs the REAL tryClaim SQL against a stub client
+// to prove the claim no longer stamps assigned_to (§13).
 import http from 'http';
 import { randomUUID } from 'crypto';
 import { newDb } from 'pg-mem';
@@ -24,6 +26,7 @@ import { createApp } from '../src/index';
 import { generateHostToken } from '../src/lib/tokens';
 import { sha256Hex } from '../src/lib/tokens';
 import { sweepTasksOnce } from '../src/lib/taskSweeper';
+import { tryClaim } from '../src/routes/worker';
 
 function setupDb() {
   const db = newDb();
@@ -123,16 +126,29 @@ async function seedTask(): Promise<string> {
   return rows[0].id;
 }
 
-/** The same UPDATE routes/worker.ts tryClaim performs (pg-mem cannot run
- *  the real FOR UPDATE SKIP LOCKED claim). */
+/** Mirrors routes/worker.ts tryClaim (pg-mem cannot run the real FOR UPDATE
+ *  SKIP LOCKED claim). §13: the claim sets claimed_by but deliberately does
+ *  NOT stamp assigned_to — assigned_to is the agent-requested host pin only.
+ */
 async function simulateClaim(taskId: string, hostId: string, leasePast = false) {
   await state.pool.query(
-    `UPDATE tasks SET status = 'claimed', claimed_by = $2, assigned_to = $2,
+    `UPDATE tasks SET status = 'claimed', claimed_by = $2,
        attempts = attempts + 1,
        lease_expires_at = now() ${leasePast ? `-` : `+`} interval '1 second'
      WHERE id = $1`,
     [taskId, hostId],
   );
+}
+
+/** The exact claim filter predicate from tryClaim, minus SKIP LOCKED
+ *  (which pg-mem cannot parse): which queued tasks may this host claim? */
+async function claimableBy(hostId: string): Promise<string[]> {
+  const { rows } = await state.pool.query(
+    `SELECT id FROM tasks
+     WHERE status = 'queued' AND (assigned_to IS NULL OR assigned_to = $1)`,
+    [hostId],
+  );
+  return rows.map((r: any) => r.id as string);
 }
 
 async function getTask(taskId: string) {
@@ -247,5 +263,83 @@ describe('§39(a) lease expiry and claim ownership (real API + real sweeper)', (
       [taskId],
     );
     expect(ev[0].payload.reason).toBe('max_attempts_exceeded');
+  });
+});
+
+describe('§13 host disappears mid-task -> lease expires -> another host may claim', () => {
+  it('a requeued task is NOT pinned to the dead host; any eligible host can claim it', async () => {
+    const hostA = await seedHost('w13b-dead-a');
+    const hostB = await seedHost('w13b-alive-b');
+    const taskId = await seedTask(); // assigned_to NULL: no agent pin
+
+    // Host A claims the task, then dies without another progress report.
+    await simulateClaim(taskId, hostA.id, /* leasePast */ true);
+    const claimed = await getTask(taskId);
+    expect(claimed.claimed_by).toBe(hostA.id);
+    // §13: the claim must not stamp assigned_to — it stays NULL.
+    expect(claimed.assigned_to).toBeNull();
+
+    // The REAL sweeper requeues the lease-expired task.
+    await sweepTasksOnce(state.pool);
+    const swept = await getTask(taskId);
+    expect(swept.status).toBe('queued');
+    expect(swept.claimed_by).toBeNull();
+    // The requeued task is not pinned to the dead host...
+    expect(swept.assigned_to).toBeNull();
+
+    // ...so the real claim filter admits host B (this is the exact
+    // predicate from tryClaim; previously assigned_to was still host A and
+    // B could never match it).
+    expect(await claimableBy(hostB.id)).toContain(taskId);
+
+    // Host B claims it for real.
+    await simulateClaim(taskId, hostB.id);
+    const bClaimed = await getTask(taskId);
+    expect(bClaimed.status).toBe('claimed');
+    expect(bClaimed.claimed_by).toBe(hostB.id);
+    expect(bClaimed.assigned_to).toBeNull();
+  });
+
+  it('an agent-requested host pin (assigned_to) is still honored after requeue', async () => {
+    const hostA = await seedHost('w13b-pin-a');
+    const hostB = await seedHost('w13b-pin-b');
+    const { rows } = await state.pool.query(
+      `INSERT INTO tasks (id, type, status, payload, assigned_to, max_attempts)
+       VALUES ($1, 'system-info', 'queued', '{}', $2, 10) RETURNING id`,
+      [randomUUID(), hostA.id],
+    );
+    const taskId: string = rows[0].id;
+
+    // Host A claims its pinned task and dies; the sweeper requeues it.
+    await simulateClaim(taskId, hostA.id, /* leasePast */ true);
+    await sweepTasksOnce(state.pool);
+    const swept = await getTask(taskId);
+    expect(swept.status).toBe('queued');
+    // The agent's pin survives the requeue — it was never the claim stamp.
+    expect(swept.assigned_to).toBe(hostA.id);
+
+    // Host B still cannot take pinned work; host A can.
+    expect(await claimableBy(hostB.id)).not.toContain(taskId);
+    expect(await claimableBy(hostA.id)).toContain(taskId);
+  });
+
+  it('tryClaim SQL never stamps assigned_to and keeps the pin filter (structural)', async () => {
+    const seen: string[] = [];
+    const stubClient = {
+      query: async (sql: string) => {
+        seen.push(sql);
+        return { rows: [] };
+      },
+    };
+    await tryClaim(stubClient as never, 'host-1', 600);
+    expect(seen.length).toBe(1);
+    const sql = seen[0];
+    // The SET clause must not touch assigned_to ...
+    const setClause = sql.slice(sql.indexOf('SET'), sql.indexOf('WHERE id = ('));
+    expect(setClause).toContain('claimed_by = $1');
+    expect(setClause).not.toMatch(/assigned_to/);
+    // ... while the claim filter still honors the agent-requested pin.
+    expect(sql).toContain("(assigned_to IS NULL OR assigned_to = $1)");
+    expect(sql).toContain('FOR UPDATE SKIP LOCKED');
   });
 });
