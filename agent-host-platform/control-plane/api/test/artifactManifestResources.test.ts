@@ -18,7 +18,11 @@
 //   * Unit tests: validateManifest (strict, worker-parity) and
 //     deploymentConstraintsForManifest, incl. the unified memory grammar.
 import http from 'http';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+import { mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import * as tar from 'tar';
 import { newDb } from 'pg-mem';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -214,6 +218,7 @@ async function req(method: string, path: string, token: string, body?: unknown) 
 
 beforeAll(async () => {
   process.env.RATE_LIMIT_UNAUTH_PER_MIN = '10000';
+  process.env.ARTIFACT_DIR = mkdtempSync(join(tmpdir(), 'uaht-manifest-artifacts-'));
   setupDb();
   await startApp();
 });
@@ -478,5 +483,174 @@ describe('validateManifest — strict worker-parity validation', () => {
       `SELECT COUNT(*)::int AS t FROM tasks WHERE payload->>'version' = 'c'`,
     );
     expect(tasks.rows[0].t).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finalization: the tarball's embedded agent.deploy.json is verified
+// against the init-registered manifest BEFORE the artifact is marked ready
+// ---------------------------------------------------------------------------
+async function makeTarball(manifestObj: Record<string, unknown> | null): Promise<Buffer> {
+  const dir = mkdtempSync(join(tmpdir(), 'uaht-tarball-'));
+  const files: string[] = ['app.py'];
+  writeFileSync(join(dir, 'app.py'), 'x = 1\n');
+  if (manifestObj) {
+    writeFileSync(join(dir, 'agent.deploy.json'), JSON.stringify(manifestObj));
+    files.push('agent.deploy.json');
+  }
+  const out = join(dir, 'artifact.tar.gz');
+  await tar.create({ gzip: true, file: out, cwd: dir }, files);
+  return readFileSync(out);
+}
+
+async function putBytes(path: string, token: string, bytes: Buffer) {
+  const res = await fetch(`${base}${path}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(bytes.length),
+    },
+    body: bytes as any,
+    duplex: 'half',
+  } as any);
+  let json: any = null;
+  try {
+    json = await res.json();
+  } catch {
+    /* empty */
+  }
+  return { status: res.status, body: json };
+}
+
+async function initArtifact(
+  token: string,
+  projectId: string,
+  tarball: Buffer,
+  manifestObj?: Record<string, unknown>,
+) {
+  const checksum = 'sha256:' + createHash('sha256').update(tarball).digest('hex');
+  const body: Record<string, unknown> = {
+    project_id: projectId,
+    filename: 'app.tar.gz',
+    size: tarball.length,
+    checksum,
+    version: '1.0.0',
+  };
+  if (manifestObj) body.manifest = manifestObj;
+  const init = await req('POST', '/v1/artifacts/init', token, body);
+  expect(init.status).toBe(201);
+  return init.body.artifact.id as string;
+}
+
+describe('PUT /v1/artifacts/:id/content — tarball manifest verification', () => {
+  it('matching init and tarball manifests -> ready with the manifest stored', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    const m = manifest({ cpu: 2, memory: '1Gi' });
+    const tarball = await makeTarball(m);
+    const artifactId = await initArtifact(agent.token, projectId, tarball, m);
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(200);
+    expect(up.body.artifact.status).toBe('ready');
+    expect(up.body.artifact.manifest).toEqual(m);
+  });
+
+  it('tarball manifest disagreeing with the init manifest -> 422, failed', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    // Registered: 2 CPU / 1Gi. Tarball actually: 8 CPU / 8Gi.
+    const tarball = await makeTarball(manifest({ cpu: 8, memory: '8Gi' }));
+    const artifactId = await initArtifact(agent.token, projectId, tarball, manifest({ cpu: 2, memory: '1Gi' }));
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(422);
+    const { rows } = await state.pool.query('SELECT status FROM artifacts WHERE id = $1', [artifactId]);
+    expect(rows[0].status).toBe('failed');
+    const events = await state.pool.query(
+      `SELECT type FROM events WHERE payload->>'artifact_id' = $1`,
+      [artifactId],
+    );
+    expect(events.rows.map((r: any) => r.type)).toContain('artifact.manifest_mismatch');
+    // A failed artifact can never be deployed from.
+    const dep = await req('POST', '/v1/deployments', agent.token, {
+      project_id: projectId,
+      version: '1.0.0',
+      artifact_id: artifactId,
+    });
+    expect(dep.status).toBe(422);
+  });
+
+  it('over-reservation direction is also rejected (registered 8 CPU, tarball 2 CPU)', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    const tarball = await makeTarball(manifest({ cpu: 2, memory: '1Gi' }));
+    const artifactId = await initArtifact(agent.token, projectId, tarball, manifest({ cpu: 8, memory: '8Gi' }));
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(422);
+    const { rows } = await state.pool.query('SELECT status FROM artifacts WHERE id = $1', [artifactId]);
+    expect(rows[0].status).toBe('failed');
+  });
+
+  it('registered manifest but tarball has none -> 422 (would be a lying registration)', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    const tarball = await makeTarball(null);
+    const artifactId = await initArtifact(agent.token, projectId, tarball, manifest({ cpu: 2, memory: '1Gi' }));
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(422);
+    const { rows } = await state.pool.query('SELECT status FROM artifacts WHERE id = $1', [artifactId]);
+    expect(rows[0].status).toBe('failed');
+  });
+
+  it('no registered manifest + tarball with manifest -> adopted at finalization', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    const m = manifest({ cpu: 2, memory: '1Gi' });
+    const tarball = await makeTarball(m);
+    const artifactId = await initArtifact(agent.token, projectId, tarball);
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(200);
+    expect(up.body.artifact.status).toBe('ready');
+    expect(up.body.artifact.manifest).toEqual(m);
+
+    // The adopted manifest drives scheduling.
+    await seedHost();
+    const dep = await req('POST', '/v1/deployments', agent.token, {
+      project_id: projectId,
+      version: '1.0.0',
+      artifact_id: artifactId,
+    });
+    expect(dep.status).toBe(201);
+    expect(dep.body.deployment.reserved_cpu).toBe(2);
+    expect(dep.body.deployment.reserved_ram_mb).toBe(1024);
+  });
+
+  it('neither registered nor embedded manifest -> legacy ready with NULL manifest', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    const tarball = await makeTarball(null);
+    const artifactId = await initArtifact(agent.token, projectId, tarball);
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(200);
+    expect(up.body.artifact.status).toBe('ready');
+    expect(up.body.artifact.manifest).toBeNull();
+  });
+
+  it('equivalent contract in different notation is accepted (1g == 1024Mi)', async () => {
+    const agent = await seedAgent('a1', AGENT_PERMS);
+    const projectId = await seedProject('p1', agent.id, {});
+    // Registered "1g", tarball "1024Mi": same canonical contract.
+    const tarball = await makeTarball(manifest({ cpu: 1, memory: '1024Mi' }));
+    const artifactId = await initArtifact(agent.token, projectId, tarball, manifest({ cpu: 1, memory: '1g' }));
+
+    const up = await putBytes(`/v1/artifacts/${artifactId}/content`, agent.token, tarball);
+    expect(up.status).toBe(200);
+    expect(up.body.artifact.status).toBe('ready');
   });
 });
