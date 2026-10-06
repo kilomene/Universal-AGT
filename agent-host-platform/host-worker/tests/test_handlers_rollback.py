@@ -13,9 +13,16 @@ from executor import handlers
 class FakeDocker:
     def __init__(self):
         self.containers = {}
+        self.images = {"img:x"}
         self.start_calls = []
         self.stop_calls = []
         self.rm_calls = []
+
+    def container_exists(self, name):
+        return name in self.containers
+
+    def image_exists(self, tag):
+        return tag in self.images
 
     def start(self, name, timeout=120):
         self.start_calls.append(name)
