@@ -50,7 +50,8 @@ function legacyDb() {
       CONSTRAINT deployments_status_check
         CHECK (status IN ('requested','approved','building','starting',
                           'healthcheck','running','failed','rolled_back',
-                          'stopped','stopping'))
+                          'stopped','stopping')),
+      reserved_cpu DOUBLE PRECISION, reserved_ram_mb DOUBLE PRECISION
     );
     INSERT INTO deployments (id, status) VALUES
       ('${randomUUID()}', 'running'),
