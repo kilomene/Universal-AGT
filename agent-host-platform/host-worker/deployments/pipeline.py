@@ -526,22 +526,55 @@ def compose_project_name_for(project_id: str, safe_project: str) -> str:
 
 
 def verify_host_port_free(docker, host_port: int, log=None,
-                          exclude_names: Optional[set] = None) -> None:
+                          exclude_names: Optional[set] = None,
+                          tolerate_bound_by: Optional[set] = None) -> None:
     """Fail with DeployError unless host_port is free, twice over.
 
+    Docker level: scan `docker ps -a` published ports — catches ports
+    docker holds on a specific interface that a wildcard bind might miss.
     OS level: bind the port ourselves — catches anything listening on the
-    host (including docker's own published-port proxy). Docker level: scan
-    `docker ps -a` published ports — catches ports docker holds on a
-    specific interface that a wildcard bind might miss.
+    host (including docker's own published-port proxy).
 
     ``exclude_names`` (optional): container names whose published ports do
     not count as a collision — used by rollback verification, where the
     target's own stopped container legitimately still shows its port in
     `docker ps -a` (`docker start` reuses that mapping).
 
+    ``tolerate_bound_by`` (optional): container names allowed to be the
+    SOLE reason an OS-bind probe fails. Used by rollback verification for
+    the same-port case: the port is bound by the deployment that is about
+    to be torn down, so the bind failure is expected and the port WILL be
+    free by restore time. Only RUNNING tolerated containers explain a
+    bind failure (a stopped container cannot hold a port); a bind failure
+    caused (even partly) by anything else still raises. Never pass this
+    on the deploy path — a new deployment must never tolerate a bound
+    port.
+
     Called before every `docker run`; a collision fails the task with a
     clear error instead of a cryptic `docker run` failure.
     """
+    try:
+        rows = docker.ps(all=True)
+    except Exception as exc:
+        raise DeployError(
+            f"could not list docker containers to verify port "
+            f"{host_port} is free: {exc}"
+        )
+    excluded = set(exclude_names or ())
+    tolerated = set(tolerate_bound_by or ())
+    # Publishers of this port, with their docker state: only a RUNNING
+    # container can actually hold the OS-level bind.
+    publishers: dict = {}
+    for row in rows or []:
+        name = (row.get("Names") or "").lstrip("/")
+        if host_port in published_host_ports(row.get("Ports")):
+            publishers[name] = (row.get("State") or "").lower()
+    foreign = [n for n in publishers if n not in excluded]
+    if foreign:
+        raise DeployError(
+            f"host port {host_port} is already published by another docker "
+            f"container; refusing docker run"
+        )
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             # SO_REUSEADDR, like docker's own published-port bind: a
@@ -550,28 +583,24 @@ def verify_host_port_free(docker, host_port: int, log=None,
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("0.0.0.0", host_port))
     except OSError:
+        # The target's own (stopped) container never binds: the only
+        # legitimate explanation for a live bind is a RUNNING container
+        # the caller is about to tear down (rollback same-port case).
+        own_only = excluded - tolerated
+        bound_by_tolerated = {n for n, s in publishers.items()
+                              if n not in own_only and s == "running"}
+        if tolerated and bound_by_tolerated and \
+                bound_by_tolerated <= tolerated:
+            # The port will be free by restore time. Anything else
+            # holding it still fails below.
+            if log:
+                log(f"host port {host_port} is bound only by "
+                    f"{sorted(bound_by_tolerated)} (being replaced); "
+                    f"treating as free-after-teardown")
+            return
         raise DeployError(
             f"host port {host_port} is already in use on this host "
             f"(OS bind test failed); refusing docker run"
-        )
-    try:
-        rows = docker.ps(all=True)
-    except Exception as exc:
-        raise DeployError(
-            f"could not list docker containers to verify port "
-            f"{host_port} is free: {exc}"
-        )
-    used = set()
-    for row in rows or []:
-        if exclude_names:
-            name = (row.get("Names") or "").lstrip("/")
-            if name in exclude_names:
-                continue
-        used.update(published_host_ports(row.get("Ports")))
-    if host_port in used:
-        raise DeployError(
-            f"host port {host_port} is already published by another docker "
-            f"container; refusing docker run"
         )
     if log:
         log(f"host port {host_port} verified free (OS bind + docker ps)")
@@ -1146,6 +1175,8 @@ def deploy(ctx, task: dict) -> dict:
             docker.rm(container_name, force=True)
         rolled_back_to = None
         port_settle_record = None
+        rollback_status_value = None
+        rollback_error_note = None
         if action == "rollback_to_previous" and previous:
             # Unified rollback (deployments.rollback): verify-target ->
             # restore -> REAL health check -> commit state. The previous
@@ -1163,18 +1194,46 @@ def deploy(ctx, task: dict) -> dict:
                     f"{exc}"
                 ) from exc
             rolled_back_to = outcome["rolled_back_to"]
+            target_healthy = outcome["target_health_status"] != "unhealthy"
             # Port-reservation reconciliation with the control-plane
             # registry (spec §3): after rollback, Docker/OS state ==
             # deployment state == the port_allocations registry. A settle
             # failure never fails the rollback — it is logged and
-            # recorded, not silently claimed.
+            # recorded, not silently claimed. A skipped settle (no
+            # control-plane session — tests/doubles only; production
+            # always has one) is not a failure.
             settle = rollback_mod.settle_rollback_ports(
                 ctx, log, deployment_id, rolled_back_to)
             port_settle_record = {"settled": settle["settled"],
                                   "reason": settle.get("reason")}
+            settle_failed = (not settle["settled"]
+                             and settle.get("reason")
+                             != "no control-plane session")
             if not settle["settled"]:
                 log(f"rollback port registry settle failed "
                     f"({settle.get('reason')}); recorded, not fatal")
+            # Spec §6: a rollback is only "rolled_back" when the target
+            # was restored AND verified healthy AND the port registry
+            # settled. An unhealthy target or a failed settle persists
+            # rollback_failed (partially_reconciled when only the settle
+            # failed) — never a false success.
+            if target_healthy and not settle_failed:
+                rollback_status_value = "succeeded"
+            elif target_healthy:
+                rollback_status_value = "partially_reconciled"
+                rollback_error_note = (
+                    f"target restored and healthy but port-registry "
+                    f"settle failed: {settle.get('reason')}")
+            else:
+                rollback_status_value = "failed"
+                rollback_error_note = (
+                    f"target {rolled_back_to} restored but health check "
+                    f"failed (health_status="
+                    f"{outcome['target_health_status']})")
+        final_status = ("rolled_back"
+                        if rolled_back_to and rollback_status_value == "succeeded"
+                        else "failed" if not rolled_back_to
+                        else "rollback_failed")
         store.save({
             "deployment_id": deployment_id,
             "task_id": task_id,
@@ -1202,9 +1261,15 @@ def deploy(ctx, task: dict) -> dict:
             "manifest": manifest_data,
             "healthcheck_path": healthcheck_path,
             "env": manifest_env,
-            "status": "rolled_back" if rolled_back_to else "failed",
+            "status": final_status,
             "health_status": "unhealthy",
             "rollback_of": rolled_back_to,
+            # §6: the rollback operation's durable outcome — never a false
+            # "rolled_back" when the target is unhealthy or the registry
+            # did not settle. Enough state (target id, settle record,
+            # error note) for reconciliation/retry.
+            "rollback_status": rollback_status_value,
+            "rollback_error": rollback_error_note,
             # §3: port-registry settle outcome (None when no rollback ran);
             # a failed settle is recorded here, never silently claimed.
             "port_settle": port_settle_record,
@@ -1213,12 +1278,16 @@ def deploy(ctx, task: dict) -> dict:
         err = (f"healthcheck failed for {project_name} {version} "
                f"(GET :{host_port}{healthcheck_path} never returned 200); "
                + (f"rolled back to deployment {rolled_back_to}"
-                  if rolled_back_to else "no previous healthy deployment "
-                  "to roll back to"))
-        if (rolled_back_to and port_settle_record
-                and not port_settle_record["settled"]):
-            err += (f"; port registry settle failed "
-                    f"({port_settle_record['reason']})")
+                  if rolled_back_to and rollback_status_value == "succeeded"
+                  else f"rollback to deployment {rolled_back_to} restored "
+                       f"the target but it is UNHEALTHY — rollback FAILED"
+                  if rolled_back_to and rollback_status_value == "failed"
+                  else f"rolled back to deployment {rolled_back_to} but "
+                       f"port registry settle failed "
+                       f"({port_settle_record['reason']}) — rollback "
+                       f"PARTIALLY RECONCILED"
+                  if rolled_back_to
+                  else "no previous healthy deployment to roll back to"))
         raise DeployError(err)
     finally:
         release_port_reservations(reserved_ports)
@@ -1327,7 +1396,10 @@ def _parse_compose_short_port(spec: str) -> list:
 
 def verify_compose_ports_free(docker, compose_project: str,
                               wanted_ports: list, log=None,
-                              registry_used: Optional[set] = None) -> None:
+                              registry_used: Optional[set] = None,
+                              exclude_names: Optional[set] = None,
+                              tolerate_bound_by: Optional[set] = None
+                              ) -> None:
     """Verify every host port a compose file wants to publish is free —
     the same OS-bind + docker-ps check `docker run` gets.
 
@@ -1338,6 +1410,11 @@ def verify_compose_ports_free(docker, compose_project: str,
     ``registry_used`` (optional): host ports the control-plane port
     registry / deployment store has reserved for other deployments.
     Catches the window where a port is allocated but not yet bound.
+
+    ``exclude_names`` / ``tolerate_bound_by`` (optional): passed through
+    to verify_host_port_free — used by rollback verification for the
+    same-port case (the deployment being replaced legitimately holds the
+    target's ports until its teardown).
     """
     own: set = set()
     try:
@@ -1351,7 +1428,9 @@ def verify_compose_ports_free(docker, compose_project: str,
                 f"host port {port} is reserved by another deployment "
                 f"(port registry); refusing compose up"
             )
-        verify_host_port_free(docker, port, log=log)
+        verify_host_port_free(docker, port, log=log,
+                              exclude_names=exclude_names,
+                              tolerate_bound_by=tolerate_bound_by)
     if log and wanted_ports:
         log(f"compose ports verified: wanted={sorted(set(wanted_ports))} "
             f"already-held-by-own-stack={sorted(own)}")
