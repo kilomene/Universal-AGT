@@ -367,12 +367,13 @@ if [ -z "$HEALTH" ]; then
 fi
 echo "       control plane health: $HEALTH"
 
-# tunnel registration (cloudflared -> Cloudflare edge)
+# tunnel registration (cloudflared -> Cloudflare edge).
+# Note: cloudflared logs to stderr, so check the .err.log file.
 for i in $(seq 1 12); do
-  grep -q "Registered tunnel connection" /opt/uaht/supervisor/cloudflared.log 2>/dev/null && break
+  grep -q "Registered tunnel connection" /opt/uaht/supervisor/cloudflared.err.log 2>/dev/null && break
   sleep 5
 done
-if grep -q "Registered tunnel connection" /opt/uaht/supervisor/cloudflared.log 2>/dev/null; then
+if grep -q "Registered tunnel connection" /opt/uaht/supervisor/cloudflared.err.log 2>/dev/null; then
   echo "       cloudflared: tunnel registered with Cloudflare edge."
 else
   echo "FATAL: cloudflared did not register the tunnel (see /opt/uaht/supervisor/cloudflared.err.log)." >&2
