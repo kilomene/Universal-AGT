@@ -223,7 +223,7 @@ stderr_logfile=/opt/uaht/supervisor/control-plane.err.log
 
 [program:host-worker]
 directory=$WORKER_DIR
-command=/usr/bin/python3 -m agent.main --config /etc/uagt/worker.env
+command=sg docker -c "/usr/bin/python3 -m agent.main --config /etc/uagt/worker.env"
 user=$(id -un)
 autostart=true
 autorestart=true
