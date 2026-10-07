@@ -122,6 +122,19 @@ echo "       dockerd: $DOCKERD"
 # box needs docker group membership to talk to the socket (takes effect on next login;
 # the verification below uses sudo as a fallback for the current session)
 sudo usermod -aG docker "$(id -un)" 2>/dev/null || true
+# CRITICAL: group membership only applies to NEW sessions. If this shell doesn't
+# have the docker group, every service started below (especially host-worker)
+# will lack Docker access. Re-exec via sg to guarantee it.
+if ! groups | grep -qw docker; then
+  if [ -z "$UAHT_SG_RETRY" ]; then
+    echo "[install] docker group not active in this shell; re-execing via sg..."
+    export UAHT_SG_RETRY=1
+    exec sg docker -c "bash $0 $*"
+  else
+    echo "FATAL: docker group still not available after sg re-exec" >&2
+    exit 1
+  fi
+fi
 node --version
 python3 --version
 
