@@ -110,9 +110,15 @@ sudo apt-get update -qq || echo "       warning: apt update failed (mirror 500),
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   docker.io python3 python3-pip python3-venv nodejs npm curl cron sudo ca-certificates \
   >/dev/null || echo "       warning: apt install had errors, verifying tools"
-for cmd in dockerd docker python3 node npm curl; do
+for cmd in docker python3 node npm curl; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "FATAL: required command missing after apt install: $cmd" >&2; exit 1; }
 done
+# dockerd lives in /usr/sbin on Debian trixie (not /usr/bin) and /usr/sbin
+# may not be on PATH — locate it explicitly.
+DOCKERD="$(command -v dockerd 2>/dev/null || true)"
+[ -z "$DOCKERD" ] && DOCKERD="/usr/sbin/dockerd"
+[ -x "$DOCKERD" ] || { echo "FATAL: dockerd not found (tried PATH and /usr/sbin/dockerd)" >&2; exit 1; }
+echo "       dockerd: $DOCKERD"
 node --version
 python3 --version
 
@@ -219,7 +225,7 @@ stdout_logfile=/opt/uaht/supervisor/cloudflared.log
 stderr_logfile=/opt/uaht/supervisor/cloudflared.err.log
 
 [program:dockerd]
-command=/usr/bin/sudo /usr/bin/dockerd
+command=/usr/bin/sudo $DOCKERD
 user=$(id -un)
 autostart=true
 autorestart=true
