@@ -61,6 +61,16 @@ CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 CLOUDFLARED_YML="/opt/uaht/supervisor/cloudflared.yml"
 
 # --------------------------------------------------------------------------
+# 0. Normalize /etc/uagt ownership FIRST — it may be root-owned (0700)
+#    from a previous restore, which would make the secrets unreadable.
+#    After this, the invoking user owns it and the checks below work.
+# --------------------------------------------------------------------------
+echo "[install] 0. normalizing /etc/uagt ownership"
+sudo mkdir -p /etc/uagt
+sudo chown -R "$(id -un):$(id -gn)" /etc/uagt
+chmod 700 /etc/uagt
+
+# --------------------------------------------------------------------------
 # 1. Secrets: tunnel token + control-plane env must exist (from dashboards,
 #    restored once). Worker credentials are SELF-HEALING: if worker.env is
 #    missing the installer registers the host itself (step 8b). Never
@@ -140,9 +150,8 @@ sudo systemctl disable --now docker.service docker.socket 2>/dev/null || true
 # 6. Layout: /opt/uaht, secrets perms, artifacts dir
 # --------------------------------------------------------------------------
 echo "[install] 6. creating /opt/uaht layout"
-sudo mkdir -p /opt/uaht/supervisor /opt/uaht/artifacts /opt/uaht/logs /opt/uaht/worker-state /opt/uaht/apps /etc/uagt
+sudo mkdir -p /opt/uaht/supervisor /opt/uaht/artifacts /opt/uaht/logs /opt/uaht/worker-state /opt/uaht/apps
 sudo chown -R "$(id -un):$(id -gn)" /opt/uaht
-chmod 700 /etc/uagt
 for f in /etc/uagt/tunnel.token /etc/uagt/control-plane.env; do
   sudo chmod 600 "$f"; sudo chown "$(id -un):$(id -gn)" "$f"
 done
