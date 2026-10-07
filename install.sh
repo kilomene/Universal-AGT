@@ -308,7 +308,15 @@ fi
 # --------------------------------------------------------------------------
 echo "[install] 10. installing cron @reboot hook"
 CRON_LINE="@reboot $SUPERVISORD_BIN -c $SUPERVISOR_CONF"
-( crontab -l 2>/dev/null | grep -v -F "supervisord -c $SUPERVISOR_CONF" ; echo "$CRON_LINE" ) | crontab -
+CRON_TMP="$(mktemp)"
+( crontab -l 2>/dev/null || true ) | grep -v -F "supervisord -c $SUPERVISOR_CONF" > "$CRON_TMP" || true
+echo "$CRON_LINE" >> "$CRON_TMP"
+if crontab "$CRON_TMP" 2>/dev/null; then
+  echo "       @reboot hook installed."
+else
+  echo "       warning: crontab install failed, @reboot hook not installed"
+fi
+rm -f "$CRON_TMP"
 sudo service cron start 2>/dev/null || sudo systemctl start cron 2>/dev/null || true
 
 # --------------------------------------------------------------------------
