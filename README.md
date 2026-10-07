@@ -181,6 +181,7 @@ python3 agent-host-platform/examples/validate.py
 | [`docs/e2e-live-checklist.md`](agent-host-platform/docs/e2e-live-checklist.md) | 14 live-infrastructure checks (Supabase + real host + real Docker) |
 | [`docs/live-acceptance.md`](agent-host-platform/docs/live-acceptance.md) | **Live acceptance**: production smoke-test procedure, required env vars, and the final acceptance checklist |
 | [`docs/implementation-status.md`](agent-host-platform/docs/implementation-status.md) | Acceptance scorecard + per-phase resolution log |
+| [`RECOVERY_REPORT_2026-10-07.md`](RECOVERY_REPORT_2026-10-07.md) | **Recovery report**: full incident recovery, 11 root causes fixed, install.sh hardening (8 commits), 5-min soak test + public verification — all green |
 
 ## Conventions
 
