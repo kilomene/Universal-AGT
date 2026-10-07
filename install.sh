@@ -367,13 +367,19 @@ done
 sleep 5
 
 echo "[install] 12. verifying services"
-"$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" status
-NOT_RUNNING="$("$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" status | grep -v RUNNING || true)"
-if [ -n "$NOT_RUNNING" ]; then
-  echo "FATAL: not all services are RUNNING:" >&2
-  echo "$NOT_RUNNING" >&2
-  exit 1
-fi
+# Services need time to go from STARTING to RUNNING. Poll for up to 60s.
+for i in $(seq 1 12); do
+  "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" status
+  NOT_RUNNING="$("$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" status | grep -v RUNNING || true)"
+  [ -z "$NOT_RUNNING" ] && break
+  [ "$i" = "12" ] && {
+    echo "FATAL: not all services are RUNNING:" >&2
+    echo "$NOT_RUNNING" >&2
+    exit 1
+  }
+  echo "       waiting for services to start (attempt $i/12)..."
+  sleep 5
+done
 
 # dockerd needs a moment before `docker info` works. Use sudo as fallback
 # in case the docker group membership hasn't taken effect in this session.
