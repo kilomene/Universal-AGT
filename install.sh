@@ -127,7 +127,7 @@ python3 --version
 # --------------------------------------------------------------------------
 echo "[install] 3. installing supervisord"
 if [ ! -x "$SUPERVISORD_BIN" ]; then
-  python3 -m pip install --user --quiet supervisor
+  python3 -m pip install --user --quiet --break-system-packages supervisor
 fi
 "$SUPERVISORD_BIN" --version
 
@@ -251,7 +251,7 @@ npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund 
 npm run build
 echo "[install] 9. installing worker python deps"
 cd "$WORKER_DIR"
-python3 -m pip install --user --quiet -r requirements.txt
+python3 -m pip install --user --quiet --break-system-packages -r requirements.txt
 
 # --------------------------------------------------------------------------
 # 9b. Worker credentials: self-healing registration. If worker.env is
