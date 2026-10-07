@@ -119,6 +119,9 @@ DOCKERD="$(command -v dockerd 2>/dev/null || true)"
 [ -z "$DOCKERD" ] && DOCKERD="/usr/sbin/dockerd"
 [ -x "$DOCKERD" ] || { echo "FATAL: dockerd not found (tried PATH and /usr/sbin/dockerd)" >&2; exit 1; }
 echo "       dockerd: $DOCKERD"
+# box needs docker group membership to talk to the socket (takes effect on next login;
+# the verification below uses sudo as a fallback for the current session)
+sudo usermod -aG docker "$(id -un)" 2>/dev/null || true
 node --version
 python3 --version
 
@@ -341,13 +344,16 @@ if [ -n "$NOT_RUNNING" ]; then
   exit 1
 fi
 
-# dockerd needs a moment before `docker info` works
+# dockerd needs a moment before `docker info` works. Use sudo as fallback
+# in case the docker group membership hasn't taken effect in this session.
+DOCKER_INFO_OK=""
 for i in $(seq 1 12); do
-  docker info >/dev/null 2>&1 && break
+  docker info >/dev/null 2>&1 && { DOCKER_INFO_OK=1; break; }
+  sudo docker info >/dev/null 2>&1 && { DOCKER_INFO_OK=1; break; }
   sleep 5
 done
-docker info >/dev/null 2>&1 || { echo "FATAL: dockerd did not come up (see /opt/uaht/supervisor/dockerd.err.log)." >&2; exit 1; }
-echo "       docker OK: $(docker info --format '{{.ServerVersion}}' 2>/dev/null)"
+[ -n "$DOCKER_INFO_OK" ] || { echo "FATAL: dockerd did not come up (see /opt/uaht/supervisor/dockerd.err.log)." >&2; exit 1; }
+echo "       docker OK: $(docker info --format '{{.ServerVersion}}' 2>/dev/null || sudo docker info --format '{{.ServerVersion}}' 2>/dev/null)"
 
 # local control-plane health
 for i in $(seq 1 12); do
