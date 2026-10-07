@@ -326,14 +326,32 @@ sudo service cron start 2>/dev/null || sudo systemctl start cron 2>/dev/null || 
 # 10. (Re)start supervisord and verify
 # --------------------------------------------------------------------------
 echo "[install] 11. starting supervisord"
+# Kill ALL supervisord instances (there may be stale duplicates not owning the sock)
 "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" shutdown 2>/dev/null || true
 sleep 2
-# belt and suspenders: kill any stale supervisord still holding the socket
-pkill -f "supervisord -c $SUPERVISOR_CONF" 2>/dev/null || true
+for pid in $(pgrep -f "supervisord -c $SUPERVISOR_CONF" 2>/dev/null); do
+  [ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null || true
+done
 sleep 2
+# Kill orphaned service processes the dead supervisords left behind
+# (they hold ports/pidfiles and block fresh starts)
+for pid in $(pgrep -f "/usr/sbin/dockerd" 2>/dev/null); do
+  [ "$pid" != "$$" ] && sudo kill -9 "$pid" 2>/dev/null || true
+done
+for pid in $(sudo ss -tlnp 2>/dev/null | grep ':3000' | grep -oP 'pid=\K[0-9]+'); do
+  [ "$pid" != "$$" ] && sudo kill -9 "$pid" 2>/dev/null || true
+done
+sudo rm -f /var/run/docker.pid
 rm -f /opt/uaht/supervisor/supervisor.sock
+sleep 2
 "$SUPERVISORD_BIN" -c "$SUPERVISOR_CONF"
-sleep 12
+# wait for the sock file to appear (supervisord daemonizes asynchronously)
+for i in $(seq 1 15); do
+  [ -S /opt/uaht/supervisor/supervisor.sock ] && break
+  [ "$i" = "15" ] && { echo "FATAL: supervisord did not create its socket (see /opt/uaht/supervisor/supervisord.log)." >&2; exit 1; }
+  sleep 2
+done
+sleep 5
 
 echo "[install] 12. verifying services"
 "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" status
