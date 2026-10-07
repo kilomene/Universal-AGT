@@ -325,6 +325,10 @@ sudo service cron start 2>/dev/null || sudo systemctl start cron 2>/dev/null || 
 echo "[install] 11. starting supervisord"
 "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" shutdown 2>/dev/null || true
 sleep 2
+# belt and suspenders: kill any stale supervisord still holding the socket
+pkill -f "supervisord -c $SUPERVISOR_CONF" 2>/dev/null || true
+sleep 2
+rm -f /opt/uaht/supervisor/supervisor.sock
 "$SUPERVISORD_BIN" -c "$SUPERVISOR_CONF"
 sleep 12
 
