@@ -10,10 +10,13 @@
 #
 # This script is FULLY NON-INTERACTIVE: it never prompts for anything.
 # Secrets are read from their existing on-host locations (/etc/uagt/) and
-# are NEVER written into the repo, logs, or chat. If a required secret file
-# is missing the script fails loudly with the exact path to restore —
-# it does not ask, because there is nothing to type: the values were set up
-# on the host already.
+# are NEVER written into the repo, logs, or chat. The tunnel token and the
+# control-plane env must already exist (restored once from the Cloudflare
+# and Supabase dashboards). Worker credentials are SELF-HEALING: if
+# worker.env is missing the installer registers the host with the control
+# plane itself. If a required secret file is missing the script fails
+# loudly with the exact source to restore it from — it does not ask,
+# because there is nothing to type.
 #
 # Outbound-only design: nothing here opens an inbound port and nothing uses
 # Tailscale. The host dials out (control plane -> Supabase, worker ->
@@ -58,15 +61,20 @@ CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 CLOUDFLARED_YML="/opt/uaht/supervisor/cloudflared.yml"
 
 # --------------------------------------------------------------------------
-# 1. Secrets must already exist on the host — never prompt, never invent.
+# 1. Secrets: tunnel token + control-plane env must exist (from dashboards,
+#    restored once). Worker credentials are SELF-HEALING: if worker.env is
+#    missing the installer registers the host itself (step 8b). Never
+#    prompts, never invents, never stores secrets in the repo.
 # --------------------------------------------------------------------------
 echo "[install] 1. checking required secrets in /etc/uagt/"
-for f in /etc/uagt/tunnel.token /etc/uagt/control-plane.env /etc/uagt/worker.env; do
+for f in /etc/uagt/tunnel.token /etc/uagt/control-plane.env; do
   if [ ! -s "$f" ]; then
     echo "FATAL: required secret file missing or empty: $f" >&2
-    echo "       Restore it on this host (it was set up here before the update;" >&2
-    echo "       a backup may exist at ~/workspace/.uaht-secrets/). This script" >&2
-    echo "       never prompts for secrets and never stores them in the repo." >&2
+    echo "       tunnel.token: Cloudflare dashboard -> Zero Trust -> Tunnels -> uaht-production" >&2
+    echo "       control-plane.env: DATABASE_URL from Supabase dashboard (uaht-production ->" >&2
+    echo "         Database settings -> connection string, pooler); DATA_ENCRYPTION_KEY and" >&2
+    echo "         UAHT_PROVISIONING_TOKEN are fresh 'openssl rand -hex 32' values." >&2
+    echo "       This script never prompts for secrets and never stores them in the repo." >&2
     exit 1
   fi
 done
@@ -79,10 +87,7 @@ check_key() { # $1=file $2=key
 check_key /etc/uagt/control-plane.env DATABASE_URL
 check_key /etc/uagt/control-plane.env DATA_ENCRYPTION_KEY
 check_key /etc/uagt/control-plane.env UAHT_PROVISIONING_TOKEN
-check_key /etc/uagt/worker.env WORKER_HOST_TOKEN
-check_key /etc/uagt/worker.env WORKER_HOST_ID
-check_key /etc/uagt/worker.env WORKER_CONTROL_PLANE_URL
-echo "       secrets present."
+echo "       core secrets present."
 
 # --------------------------------------------------------------------------
 # 2. System dependencies (apt)
@@ -135,11 +140,13 @@ sudo systemctl disable --now docker.service docker.socket 2>/dev/null || true
 # 6. Layout: /opt/uaht, secrets perms, artifacts dir
 # --------------------------------------------------------------------------
 echo "[install] 6. creating /opt/uaht layout"
-sudo mkdir -p /opt/uaht/supervisor /opt/uaht/artifacts /etc/uagt
+sudo mkdir -p /opt/uaht/supervisor /opt/uaht/artifacts /opt/uaht/logs /opt/uaht/worker-state /opt/uaht/apps /etc/uagt
 sudo chown -R "$(id -un):$(id -gn)" /opt/uaht
 chmod 700 /etc/uagt
-sudo chmod 600 /etc/uagt/tunnel.token /etc/uagt/control-plane.env /etc/uagt/worker.env
-sudo chown "$(id -un):$(id -gn)" /etc/uagt/tunnel.token /etc/uagt/control-plane.env /etc/uagt/worker.env
+for f in /etc/uagt/tunnel.token /etc/uagt/control-plane.env; do
+  sudo chmod 600 "$f"; sudo chown "$(id -un):$(id -gn)" "$f"
+done
+[ -f /etc/uagt/worker.env ] && { sudo chmod 600 /etc/uagt/worker.env; sudo chown "$(id -un):$(id -gn)" /etc/uagt/worker.env; }
 # docker group for the box user (dockerd socket access)
 sudo groupadd docker 2>/dev/null || true
 sudo usermod -aG docker "$(id -un)" || true
@@ -224,6 +231,56 @@ npm run build
 echo "[install] 9. installing worker python deps"
 cd "$WORKER_DIR"
 python3 -m pip install --user --quiet -r requirements.txt
+
+# --------------------------------------------------------------------------
+# 9b. Worker credentials: self-healing registration. If worker.env is
+#     missing (e.g. host was wiped), start the control plane briefly,
+#     register this host via the provisioning token, and write worker.env.
+# --------------------------------------------------------------------------
+need_worker_env=0
+if [ ! -s /etc/uagt/worker.env ]; then need_worker_env=1; else
+  for k in WORKER_HOST_TOKEN WORKER_HOST_ID WORKER_CONTROL_PLANE_URL; do
+    grep -qE "^${k}=[^[:space:]]" /etc/uagt/worker.env || need_worker_env=1
+  done
+fi
+if [ "$need_worker_env" = "1" ]; then
+  echo "[install] 9b. worker credentials missing — registering host with control plane"
+  ( set -a; source /etc/uagt/control-plane.env; set +a
+    cd "$API_DIR"; /usr/bin/node dist/index.js >/tmp/uagt-cp-bootstrap.log 2>&1 &
+    echo $! > /tmp/uagt-cp-bootstrap.pid )
+  for i in $(seq 1 24); do
+    curl -sf -m 5 http://127.0.0.1:3000/v1/health >/dev/null 2>&1 && break
+    sleep 5
+  done
+  curl -sf -m 10 http://127.0.0.1:3000/v1/health >/dev/null 2>&1 \
+    || { echo "FATAL: control plane did not start for registration (see /tmp/uagt-cp-bootstrap.log)." >&2; kill "$(cat /tmp/uagt-cp-bootstrap.pid)" 2>/dev/null; exit 1; }
+  PROV_TOKEN="$(grep -E '^UAHT_PROVISIONING_TOKEN=' /etc/uagt/control-plane.env | cut -d= -f2- | tr -d "\"'")"
+  REG_JSON="$(curl -sf -m 30 -X POST http://127.0.0.1:3000/v1/hosts/register \
+    -H "Authorization: Bearer $PROV_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"name":"grok-vm-prod-01","host_type":"persistent-linux-host","capabilities":["docker","docker-compose"],"worker_version":"1.0.0"}')" \
+    || { echo "FATAL: host registration failed." >&2; kill "$(cat /tmp/uagt-cp-bootstrap.pid)" 2>/dev/null; exit 1; }
+  read -r HOST_ID HOST_TOKEN <<<"$(printf '%s' "$REG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); h=d.get("host") or {}; print(h.get("id") or d.get("id") or d.get("host_id") or "", d.get("host_token") or d.get("token") or "")')"
+  kill "$(cat /tmp/uagt-cp-bootstrap.pid)" 2>/dev/null || true
+  rm -f /tmp/uagt-cp-bootstrap.pid
+  if [ -z "$HOST_ID" ] || [ -z "$HOST_TOKEN" ]; then
+    echo "FATAL: registration returned empty host id/token." >&2; exit 1
+  fi
+  cat > /etc/uagt/worker.env <<EOF
+WORKER_CONTROL_PLANE_URL=http://127.0.0.1:3000
+WORKER_HOST_NAME=grok-vm-prod-01
+WORKER_HOST_ID=$HOST_ID
+WORKER_HOST_TOKEN=$HOST_TOKEN
+WORKER_POLL_WAIT=25
+WORKER_HEARTBEAT_INTERVAL=30
+WORKER_WORK_DIR=/opt/uaht/worker-state
+WORKER_APPS_DIR=/opt/uaht/apps
+WORKER_WORKER_VERSION=1.0.0
+EOF
+  chmod 600 /etc/uagt/worker.env
+  echo "       host registered."
+else
+  echo "[install] 9b. worker credentials present."
+fi
 
 # --------------------------------------------------------------------------
 # 9. cron @reboot hook (the fix for the update-reboot outage)
