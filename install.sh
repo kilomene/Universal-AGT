@@ -100,13 +100,19 @@ check_key /etc/uagt/control-plane.env UAHT_PROVISIONING_TOKEN
 echo "       core secrets present."
 
 # --------------------------------------------------------------------------
-# 2. System dependencies (apt)
+# 2. System dependencies (apt). The Debian mirror sometimes 500s on
+#    `apt-get update`; that must not kill the install — cached lists are
+#    fine (proven by the manual openssh install). We verify every required
+#    tool exists afterward and fail loudly naming the missing one.
 # --------------------------------------------------------------------------
 echo "[install] 2. installing system packages"
-sudo apt-get update -qq
+sudo apt-get update -qq || echo "       warning: apt update failed (mirror 500), continuing with cached lists"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   docker.io python3 python3-pip python3-venv nodejs npm curl cron sudo ca-certificates \
-  >/dev/null
+  >/dev/null || echo "       warning: apt install had errors, verifying tools"
+for cmd in dockerd docker python3 node npm curl; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "FATAL: required command missing after apt install: $cmd" >&2; exit 1; }
+done
 node --version
 python3 --version
 
