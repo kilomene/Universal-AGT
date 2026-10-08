@@ -257,7 +257,7 @@ stderr_logfile=$UAHT_BASE/supervisor/dockerd.err.log
 [program:watchdog]
 command=/usr/bin/python3 $UAHT_BASE/watchdog.py
 user=$(id -un)
-environment=UAHT_BASE="$UAHT_BASE"
+environment=UAHT_BASE="$UAHT_BASE",UAHT_PUBLIC_URL="https://uaht.novamail.store/v1/health"
 autostart=true
 autorestart=true
 startsecs=10
@@ -300,10 +300,10 @@ import time
 import urllib.request
 import os
 
-PUBLIC_URL = "https://uaht.novamail.store/v1/health"
+PUBLIC_URL = os.environ.get("UAHT_PUBLIC_URL", "https://uaht.novamail.store/v1/health")
 UAHT_BASE = os.environ.get("UAHT_BASE", "/opt/uaht")
 SUPERVISOR_CONF = f"{UAHT_BASE}/supervisor/supervisord.conf"
-SUPERVISORCTL = "/home/box/.local/bin/supervisorctl"
+SUPERVISORCTL = os.path.join(os.environ.get("HOME", "/home/box"), ".local/bin/supervisorctl")
 INTERVAL = 5
 FAIL_THRESHOLD = 3
 EXPECTED_SERVICES = ["cloudflared", "control-plane", "dockerd", "host-worker"]
@@ -441,9 +441,13 @@ if [ "$need_worker_env" = "1" ]; then
   curl -sf -m 10 http://127.0.0.1:3000/v1/health >/dev/null 2>&1 \
     || { echo "FATAL: control plane did not start for registration (see /tmp/uagt-cp-bootstrap.log)." >&2; kill "$(cat /tmp/uagt-cp-bootstrap.pid)" 2>/dev/null; exit 1; }
   PROV_TOKEN="$(grep -E '^UAHT_PROVISIONING_TOKEN=' /etc/uagt/control-plane.env | cut -d= -f2- | tr -d "\"'")"
+  # Worker identity: configurable via env, defaults to hostname. Version is
+  # read from the worker source so it can never drift.
+  WORKER_HOST_NAME="${UAHT_WORKER_NAME:-$(hostname -s)}"
+  WORKER_VERSION="$(grep -oP 'worker_version:\s*str\s*=\s*"\K[^"]+' "$WORKER_DIR/agent/config.py" 2>/dev/null || echo "0.1.0")"
   REG_JSON="$(curl -sf -m 30 -X POST http://127.0.0.1:3000/v1/hosts/register \
     -H "Authorization: Bearer $PROV_TOKEN" -H 'Content-Type: application/json' \
-    -d '{"name":"grok-vm-prod-01","host_type":"persistent-linux-host","capabilities":["docker","docker-compose"],"worker_version":"1.0.0"}')" \
+    -d "{\"name\":\"$WORKER_HOST_NAME\",\"host_type\":\"persistent-linux-host\",\"capabilities\":[\"docker\",\"docker-compose\"],\"worker_version\":\"$WORKER_VERSION\"}")" \
     || { echo "FATAL: host registration failed." >&2; kill "$(cat /tmp/uagt-cp-bootstrap.pid)" 2>/dev/null; exit 1; }
   read -r HOST_ID HOST_TOKEN <<<"$(printf '%s' "$REG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); h=d.get("host") or {}; print(h.get("id") or d.get("id") or d.get("host_id") or "", d.get("host_token") or d.get("token") or "")')"
   kill "$(cat /tmp/uagt-cp-bootstrap.pid)" 2>/dev/null || true
@@ -453,14 +457,14 @@ if [ "$need_worker_env" = "1" ]; then
   fi
   cat > /etc/uagt/worker.env <<EOF
 WORKER_CONTROL_PLANE_URL=http://127.0.0.1:3000
-WORKER_HOST_NAME=grok-vm-prod-01
+WORKER_HOST_NAME=$WORKER_HOST_NAME
 WORKER_HOST_ID=$HOST_ID
 WORKER_HOST_TOKEN=$HOST_TOKEN
 WORKER_POLL_WAIT=25
 WORKER_HEARTBEAT_INTERVAL=30
 WORKER_WORK_DIR=$UAHT_BASE/worker-state
 WORKER_APPS_DIR=$UAHT_BASE/apps
-WORKER_WORKER_VERSION=1.0.0
+WORKER_WORKER_VERSION=$WORKER_VERSION
 EOF
   chmod 600 /etc/uagt/worker.env
   echo "       host registered."
@@ -488,7 +492,7 @@ rm -f "$CRON_TMP"
 # and restarts cloudflared after 3 consecutive failures.
 cat > $UAHT_BASE/tunnel-watchdog.sh << 'WATCHDOG_EOF'
 #!/bin/bash
-PUBLIC_URL="https://uaht.novamail.store/v1/health"
+PUBLIC_URL="${UAHT_PUBLIC_URL:-https://uaht.novamail.store/v1/health}"
 FAIL_FILE="/tmp/tunnel-watchdog.failcount"
 if curl -s -m 20 "$PUBLIC_URL" | grep -q '"ok":true'; then
   echo 0 > "$FAIL_FILE"
@@ -499,7 +503,7 @@ COUNT=$((COUNT + 1))
 echo $COUNT > "$FAIL_FILE"
 if [ $COUNT -ge 3 ]; then
   echo "$(date): tunnel down 15m, restarting cloudflared" >> $UAHT_BASE/supervisor/cloudflared-watchdog.log
-  /home/box/.local/bin/supervisorctl -c $UAHT_BASE/supervisor/supervisord.conf restart cloudflared
+  "$HOME/.local/bin/supervisorctl" -c $UAHT_BASE/supervisor/supervisord.conf restart cloudflared
   echo 0 > "$FAIL_FILE"
 fi
 WATCHDOG_EOF
@@ -515,12 +519,14 @@ echo "[install] 11. starting supervisord"
 "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONF" shutdown 2>/dev/null || true
 sleep 2
 for pid in $(pgrep -f "supervisord -c $SUPERVISOR_CONF" 2>/dev/null); do
-  # Graceful TERM first (lets supervisord shut down children cleanly),
-  # SIGKILL only as a last resort after 5s.
+  # Graceful TERM only — SIGKILL can corrupt supervisor state.
+  # Wait up to 15s for the process to exit on its own.
   if [ "$pid" != "$$" ]; then
     kill "$pid" 2>/dev/null || true
-    sleep 5
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
   fi
 done
 sleep 2
@@ -529,15 +535,19 @@ sleep 2
 for pid in $(pgrep -f "/usr/sbin/dockerd" 2>/dev/null); do
   if [ "$pid" != "$$" ]; then
     sudo kill "$pid" 2>/dev/null || true
-    sleep 5
-    sudo kill -0 "$pid" 2>/dev/null && sudo kill -9 "$pid" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      sudo kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
   fi
 done
 for pid in $(sudo ss -tlnp 2>/dev/null | grep ':3000' | grep -oP 'pid=\K[0-9]+'); do
   if [ "$pid" != "$$" ]; then
     sudo kill "$pid" 2>/dev/null || true
-    sleep 5
-    sudo kill -0 "$pid" 2>/dev/null && sudo kill -9 "$pid" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      sudo kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
   fi
 done
 sudo rm -f /var/run/docker.pid
