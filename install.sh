@@ -333,6 +333,29 @@ else
   echo "       warning: crontab install failed, @reboot hook not installed"
 fi
 rm -f "$CRON_TMP"
+
+# Tunnel watchdog: keeps cloudflared from idling out (QUIC "no recent network
+# activity" timeout) by hitting the public health endpoint every 5 minutes,
+# and restarts cloudflared after 3 consecutive failures.
+cat > /opt/uaht/tunnel-watchdog.sh << 'WATCHDOG_EOF'
+#!/bin/bash
+PUBLIC_URL="https://uaht.novamail.store/v1/health"
+FAIL_FILE="/tmp/tunnel-watchdog.failcount"
+if curl -s -m 20 "$PUBLIC_URL" | grep -q '"ok":true'; then
+  echo 0 > "$FAIL_FILE"
+  exit 0
+fi
+COUNT=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+COUNT=$((COUNT + 1))
+echo $COUNT > "$FAIL_FILE"
+if [ $COUNT -ge 3 ]; then
+  echo "$(date): tunnel down 15m, restarting cloudflared" >> /opt/uaht/supervisor/cloudflared-watchdog.log
+  /home/box/.local/bin/supervisorctl -c /opt/uaht/supervisor/supervisord.conf restart cloudflared
+  echo 0 > "$FAIL_FILE"
+fi
+WATCHDOG_EOF
+chmod +x /opt/uaht/tunnel-watchdog.sh
+( crontab -l 2>/dev/null | grep -v 'tunnel-watchdog'; echo '*/5 * * * * /opt/uaht/tunnel-watchdog.sh >> /opt/uaht/supervisor/cloudflared-watchdog.log 2>&1' ) | crontab - 2>/dev/null && echo "       tunnel watchdog installed (every 5m)." || echo "       warning: watchdog cron install failed"
 sudo service cron start 2>/dev/null || sudo systemctl start cron 2>/dev/null || true
 
 # --------------------------------------------------------------------------
