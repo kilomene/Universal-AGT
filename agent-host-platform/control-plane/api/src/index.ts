@@ -111,7 +111,7 @@ export function createApp(): express.Express {
   // Dashboard static files (dashboard team builds into DASHBOARD_DIR).
   const dashboardDir = process.env.DASHBOARD_DIR
     ? resolve(process.env.DASHBOARD_DIR)
-    : join(repoRoot(), 'dashboard');
+    : join(repoRoot(), 'agent-host-platform', 'dashboard');
   if (existsSync(dashboardDir)) {
     app.use('/', express.static(dashboardDir));
     logger.info('serving dashboard', { dir: dashboardDir });
