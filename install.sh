@@ -248,8 +248,138 @@ autorestart=true
 startsecs=10
 stdout_logfile=/opt/uaht/supervisor/dockerd.log
 stderr_logfile=/opt/uaht/supervisor/dockerd.err.log
+
+[program:watchdog]
+command=/usr/bin/python3 /opt/uaht/watchdog.py
+user=$(id -un)
+autostart=true
+autorestart=true
+startsecs=10
+stdout_logfile=/opt/uaht/supervisor/watchdog.log
+stderr_logfile=/opt/uaht/supervisor/watchdog.err.log
 EOF
 chmod 600 "$SUPERVISOR_CONF"
+
+# Advanced watchdog: 5-second heartbeat + self-healing (see watchdog.py header)
+cat > /opt/uaht/watchdog.py << 'WATCHDOG_PY_EOF'
+#!/usr/bin/env python3
+"""
+Universal-AGT Advanced Watchdog — 5-second heartbeat + self-healing.
+
+Runs as a supervisord-managed service. Every 5 seconds:
+  1. Pings the public health endpoint THROUGH the tunnel (keepalive —
+     prevents Cloudflare's QUIC "no recent network activity" idle timeout).
+  2. Checks all 4 supervisord services are RUNNING (restarts any that died).
+  3. Verifies the control-plane answers locally (worker heartbeat path).
+
+Failure policy: 3 consecutive failures of any check triggers a targeted
+restart of the failed component. All actions are logged.
+"""
+import json
+import logging
+import subprocess
+import sys
+import time
+import urllib.request
+
+PUBLIC_URL = "https://uaht.novamail.store/v1/health"
+SUPERVISOR_CONF = "/opt/uaht/supervisor/supervisord.conf"
+SUPERVISORCTL = "/home/box/.local/bin/supervisorctl"
+INTERVAL = 5
+FAIL_THRESHOLD = 3
+EXPECTED_SERVICES = ["cloudflared", "control-plane", "dockerd", "host-worker"]
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s watchdog: %(message)s",
+    handlers=[
+        logging.FileHandler("/opt/uaht/supervisor/watchdog.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger()
+
+def run(cmd, timeout=15):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception as e:
+        return -1, "", str(e)
+
+def supervisor_status():
+    rc, out, _ = run([SUPERVISORCTL, "-c", SUPERVISOR_CONF, "status"])
+    states = {}
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                states[parts[0]] = parts[1]
+    return states
+
+def restart_service(name):
+    log.warning("restarting service: %s", name)
+    run([SUPERVISORCTL, "-c", SUPERVISOR_CONF, "restart", name], timeout=30)
+
+def check_public_tunnel():
+    try:
+        req = urllib.request.Request(PUBLIC_URL, headers={"User-Agent": "uaht-watchdog/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return bool(json.loads(resp.read().decode()).get("ok"))
+    except Exception as e:
+        log.debug("public ping failed: %s", e)
+        return False
+
+def check_local_health():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:3000/v1/health", timeout=10) as resp:
+            return bool(json.loads(resp.read().decode()).get("ok"))
+    except Exception:
+        return False
+
+def main():
+    log.info("watchdog starting — 5s interval, fail threshold %d", FAIL_THRESHOLD)
+    fails = {"tunnel": 0, "services": 0, "health": 0}
+    while True:
+        try:
+            if check_public_tunnel():
+                fails["tunnel"] = 0
+            else:
+                fails["tunnel"] += 1
+                log.warning("public tunnel ping failed (%d/%d)", fails["tunnel"], FAIL_THRESHOLD)
+                if fails["tunnel"] >= FAIL_THRESHOLD:
+                    log.error("tunnel dark — restarting cloudflared")
+                    restart_service("cloudflared")
+                    fails["tunnel"] = 0
+                    time.sleep(10)
+            states = supervisor_status()
+            dead = [s for s in EXPECTED_SERVICES if states.get(s) != "RUNNING"]
+            if not dead:
+                fails["services"] = 0
+            else:
+                fails["services"] += 1
+                log.warning("services not RUNNING: %s (%d/%d)", dead, fails["services"], FAIL_THRESHOLD)
+                if fails["services"] >= FAIL_THRESHOLD:
+                    for s in dead:
+                        restart_service(s)
+                    fails["services"] = 0
+                    time.sleep(10)
+            if check_local_health():
+                fails["health"] = 0
+            else:
+                fails["health"] += 1
+                log.warning("control-plane local health failed (%d/%d)", fails["health"], FAIL_THRESHOLD)
+                if fails["health"] >= FAIL_THRESHOLD:
+                    restart_service("control-plane")
+                    fails["health"] = 0
+                    time.sleep(10)
+        except Exception as e:
+            log.exception("watchdog loop error: %s", e)
+        time.sleep(INTERVAL)
+
+if __name__ == "__main__":
+    main()
+WATCHDOG_PY_EOF
+chmod +x /opt/uaht/watchdog.py
 
 cat > "$CLOUDFLARED_YML" <<'EOF'
 # cloudflared tunnel client config. Ingress rules live in the Cloudflare
