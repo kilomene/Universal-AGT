@@ -250,9 +250,14 @@ tasksRouter.get('/', requireAgent, requirePermission('read_status'), async (req,
     const params: unknown[] = [];
     // §10: a task is visible when the agent created it, or when its
     // deployment's project is accessible to the agent.
+    // NOTE: d.project_id is UUID; cast the text params to avoid
+    // "operator does not exist: uuid = text".
     const accessibleIds = await listAccessibleProjectIds(getPool(), req.auth!.id);
     params.push(req.auth!.id);
-    const projectCond = inList('d.project_id', accessibleIds, params);
+    const projectCond = accessibleIds.length
+      ? `d.project_id IN (${accessibleIds.map((_, i) => `$${params.length + 1 + i}::uuid`).join(', ')})`
+      : null;
+    accessibleIds.forEach((id) => params.push(id));
     conds.push(
       projectCond ? `(t.created_by = $1 OR ${projectCond})` : `t.created_by = $1`,
     );
@@ -285,7 +290,7 @@ tasksRouter.get('/', requireAgent, requirePermission('read_status'), async (req,
     const pool = getPool();
     const { rows } = await pool.query(
       `SELECT t.* FROM tasks t
-       LEFT JOIN deployments d ON d.id = (t.payload->>'deployment_id')
+       LEFT JOIN deployments d ON d.id = (t.payload->>'deployment_id')::uuid
        ${where} ORDER BY t.created_at DESC, t.id DESC LIMIT $${params.length}`,
       params,
     );
