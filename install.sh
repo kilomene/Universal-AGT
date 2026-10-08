@@ -126,7 +126,7 @@ sudo usermod -aG docker "$(id -un)" 2>/dev/null || true
 # have the docker group, every service started below (especially host-worker)
 # will lack Docker access. Re-exec via sg to guarantee it.
 if ! groups | grep -qw docker; then
-  if [ -z "$UAHT_SG_RETRY" ]; then
+  if [ -z "${UAHT_SG_RETRY:-}" ]; then
     echo "[install] docker group not active in this shell; re-execing via sg..."
     export UAHT_SG_RETRY=1
     exec sg docker -c "bash $0 $*"
