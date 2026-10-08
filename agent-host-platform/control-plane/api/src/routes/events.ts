@@ -61,12 +61,25 @@ eventsRouter.get('/', requireAgent, requirePermission('read_status'), async (req
   }
 });
 
-// GET /v1/events/stream — SSE. Agent auth. Replays the last ?limit=N events,
-// then live-pushes new ones ("data: {event}\n\n" per event).
+// GET /v1/events/stream — SSE. Agent auth. Replays history (optionally
+// filtered by ?since= ISO-8601 and ?limit=N), then live-pushes new ones
+// ("data: {event}\n\n" per event).
 eventsRouter.get('/stream', requireAgent, requirePermission('read_status'), async (req, res, next) => {
   try {
     const limit = Math.min(parseLimit(req.query.limit), 500);
     const pool = getPool();
+
+    // Optional since filter for the replay, mirroring GET /v1/events.
+    let sinceIso: string | null = null;
+    const { since } = req.query;
+    if (typeof since === 'string' && since) {
+      const d = new Date(since);
+      if (Number.isNaN(d.getTime())) {
+        sendError(res, 400, 'bad_request', 'since must be an ISO-8601 timestamp');
+        return;
+      }
+      sinceIso = d.toISOString();
+    }
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -80,10 +93,18 @@ eventsRouter.get('/stream', requireAgent, requirePermission('read_status'), asyn
       res.write(`data: ${JSON.stringify(event)}\n\n`);
     };
 
-    // Replay history first.
+    // Replay history first (filtered by since when provided).
+    const conds: string[] = [];
+    const params: unknown[] = [];
+    if (sinceIso) {
+      params.push(sinceIso);
+      conds.push(`created_at >= $${params.length}`);
+    }
+    const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+    params.push(limit);
     const { rows } = await pool.query(
-      `SELECT ${EVENT_COLUMNS} FROM events ORDER BY id DESC LIMIT $1`,
-      [limit],
+      `SELECT ${EVENT_COLUMNS} FROM events ${where} ORDER BY id DESC LIMIT $${params.length}`,
+      params,
     );
     for (const row of [...rows].reverse()) send(row as DbEvent);
 
