@@ -223,7 +223,7 @@ stderr_logfile=/opt/uaht/supervisor/control-plane.err.log
 
 [program:host-worker]
 directory=$WORKER_DIR
-command=/usr/bin/python3 -m agent.main --config /etc/uagt/worker.env
+command=/opt/uaht/run-worker.sh
 user=$(id -un)
 autostart=true
 autorestart=true
@@ -259,6 +259,17 @@ stdout_logfile=/opt/uaht/supervisor/watchdog.log
 stderr_logfile=/opt/uaht/supervisor/watchdog.err.log
 EOF
 chmod 600 "$SUPERVISOR_CONF"
+
+# Worker wrapper: guarantees docker group (104) regardless of how supervisord
+# was started. supervisord drops supplementary groups on daemonize/setuid, so
+# we wrap via sg inside a bash script (sg works reliably in shell context,
+# but not when supervisord execs it directly).
+cat > /opt/uaht/run-worker.sh << 'WRAPPER_EOF'
+#!/bin/bash
+# Universal-AGT host-worker launcher. Ensures the docker group is active.
+exec /usr/bin/sg docker -c "/usr/bin/python3 -m agent.main --config /etc/uagt/worker.env"
+WRAPPER_EOF
+chmod +x /opt/uaht/run-worker.sh
 
 # Advanced watchdog: 5-second heartbeat + self-healing (see watchdog.py header)
 cat > /opt/uaht/watchdog.py << 'WATCHDOG_PY_EOF'
