@@ -237,13 +237,22 @@ stdout_logfile=$UAHT_BASE/supervisor/host-worker.log
 stderr_logfile=$UAHT_BASE/supervisor/host-worker.err.log
 
 [program:cloudflared]
-command=/bin/bash -c 'exec $CLOUDFLARED_BIN tunnel --config $CLOUDFLARED_YML --no-autoupdate run --token \$(cat /etc/uagt/tunnel.token)'
+command=/bin/bash -c 'exec env TUNNEL_TRANSPORT_PROTOCOL=http2 $CLOUDFLARED_BIN tunnel --config $CLOUDFLARED_YML --no-autoupdate run --token \$(cat /etc/uagt/tunnel.token)'
 user=$(id -un)
 autostart=true
 autorestart=true
 startsecs=10
 stdout_logfile=$UAHT_BASE/supervisor/cloudflared.log
 stderr_logfile=$UAHT_BASE/supervisor/cloudflared.err.log
+
+[program:cloudflared-2]
+command=/bin/bash -c 'exec env TUNNEL_TRANSPORT_PROTOCOL=http2 $CLOUDFLARED_BIN tunnel --config $UAHT_BASE/supervisor/cloudflared-2.yml --no-autoupdate run --token \$(cat /etc/uagt/tunnel.token)'
+user=$(id -un)
+autostart=true
+autorestart=true
+startsecs=10
+stdout_logfile=$UAHT_BASE/supervisor/cloudflared-2.log
+stderr_logfile=$UAHT_BASE/supervisor/cloudflared-2.err.log
 
 [program:dockerd]
 command=/usr/bin/sudo $DOCKERD
@@ -263,8 +272,44 @@ autorestart=true
 startsecs=10
 stdout_logfile=$UAHT_BASE/supervisor/watchdog.log
 stderr_logfile=$UAHT_BASE/supervisor/watchdog.err.log
+
+[program:watchdog-realtime]
+command=/usr/bin/python3 $UAHT_BASE/watchdog_realtime.py
+user=$(id -un)
+autostart=true
+autorestart=true
+startsecs=10
+stdout_logfile=$UAHT_BASE/supervisor/watchdog_realtime.log
+stderr_logfile=$UAHT_BASE/supervisor/watchdog_realtime.err.log
 EOF
 chmod 600 "$SUPERVISOR_CONF"
+
+# Dual-tunnel: copy primary config for the second replica (same token = HA)
+cp "$CLOUDFLARED_YML" "$UAHT_BASE/supervisor/cloudflared-2.yml"
+
+# Hardened cloudflared config: retries + aggressive heartbeat
+cat > "$CLOUDFLARED_YML" << 'CLOUDFLARED_YML_EOF'
+# cloudflared tunnel client config. Ingress rules live in the Cloudflare
+# dashboard for this token tunnel (public hostname -> http://127.0.0.1:3000).
+no-autoupdate: true
+protocol: http2
+retries: 10
+heartbeat-interval: 5s
+heartbeat-count: 5
+CLOUDFLARED_YML_EOF
+cp "$CLOUDFLARED_YML" "$UAHT_BASE/supervisor/cloudflared-2.yml"
+
+# Aggressive TCP keepalive: prevents provider NAT/firewall from killing
+# idle tunnel connections (default 7200s is far too long)
+echo 600 > /proc/sys/net/ipv4/tcp_keepalive_time
+echo 30 > /proc/sys/net/ipv4/tcp_keepalive_intvl
+echo 5 > /proc/sys/net/ipv4/tcp_keepalive_probes
+# Persist across reboots
+grep -q 'tcp_keepalive_time' /etc/sysctl.conf 2>/dev/null || cat >> /etc/sysctl.conf << 'SYSCTL_EOF'
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+SYSCTL_EOF
 
 # Worker wrapper: guarantees docker group (104) regardless of how supervisord
 # was started. supervisord drops supplementary groups on daemonize/setuid, so
@@ -400,12 +445,56 @@ if __name__ == "__main__":
 WATCHDOG_PY_EOF
 chmod +x $UAHT_BASE/watchdog.py
 
-cat > "$CLOUDFLARED_YML" <<'EOF'
-# cloudflared tunnel client config. Ingress rules live in the Cloudflare
-# dashboard for this token tunnel (public hostname -> http://127.0.0.1:3000).
-no-autoupdate: true
-EOF
-chmod 600 "$CLOUDFLARED_YML"
+# Realtime watchdog: tails both cloudflared logs, restarts instantly on fatal errors
+cat > $UAHT_BASE/watchdog_realtime.py << 'WATCHDOG_RT_EOF'
+#!/usr/bin/env python3
+"""Realtime watchdog: monitors BOTH cloudflared instances, restarts whichever dies instantly."""
+import subprocess, time, re, logging, os, threading
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[logging.FileHandler(os.path.join(os.environ.get('UAHT_BASE', '/opt/uaht'), 'supervisor/watchdog_realtime.log'))]
+)
+log = logging.getLogger('watchdog-rt')
+UAHT_BASE = os.environ.get('UAHT_BASE', '/opt/uaht')
+SUPERVISORCTL = os.path.join(os.environ.get('HOME', '/home/box'), '.local/bin/supervisorctl') + f' -c {UAHT_BASE}/supervisor/supervisord.conf'
+FATAL_PATTERNS = [
+    r'no more connections active and exiting',
+    r'Initiating shutdown.*context deadline exceeded',
+    r'initial tunnel connection failed',
+]
+last_restart = {}
+
+def restart_service(svc, reason):
+    now = time.time()
+    if now - last_restart.get(svc, 0) < 30:
+        return
+    last_restart[svc] = now
+    log.error(f'{svc} FAILURE: {reason[:100]} — restarting NOW')
+    os.system(f'{SUPERVISORCTL} restart {svc} > /dev/null 2>&1')
+
+def watch_log(logfile, svc):
+    log.info(f'Watching {logfile} for {svc}')
+    proc = subprocess.Popen(['tail', '-F', '-n', '0', logfile],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    for line in proc.stdout:
+        for pattern in FATAL_PATTERNS:
+            if re.search(pattern, line):
+                restart_service(svc, line.strip())
+                break
+
+def main():
+    log.info('Dual-tunnel realtime watchdog starting')
+    t1 = threading.Thread(target=watch_log, args=(f'{UAHT_BASE}/supervisor/cloudflared.err.log', 'cloudflared'), daemon=True)
+    t2 = threading.Thread(target=watch_log, args=(f'{UAHT_BASE}/supervisor/cloudflared-2.err.log', 'cloudflared-2'), daemon=True)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+if __name__ == '__main__':
+    main()
+WATCHDOG_RT_EOF
+chmod +x $UAHT_BASE/watchdog_realtime.py
 
 # --------------------------------------------------------------------------
 # 8. Build control plane + worker deps
